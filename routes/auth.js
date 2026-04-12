@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { sql, queryOne, query } = require('../db/connection');
+const { requireAuth } = require('../middleware/auth');
 const router = express.Router();
 
 router.post('/login', async (req, res) => {
@@ -39,6 +40,29 @@ router.post('/set-password', async (req, res) => {
     res.json({ message: 'Password updated' });
   } catch (e) {
     res.status(500).json({ message: 'Failed', detail: e.message });
+  }
+});
+
+router.post('/change-password', requireAuth, async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password) return res.status(400).json({ message: 'Both fields required' });
+  if (new_password.length < 6) return res.status(400).json({ message: 'New password must be at least 6 characters' });
+  try {
+    const user = await queryOne(
+      `SELECT PasswordHash AS password_hash FROM Employee WHERE EmpNo = @id`,
+      { id: { type: sql.Int, value: req.user.id } }
+    );
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    const valid = await bcrypt.compare(current_password, user.password_hash);
+    if (!valid) return res.status(401).json({ message: 'Current password is incorrect' });
+    const hash = await bcrypt.hash(new_password, 12);
+    await query(
+      `UPDATE Employee SET PasswordHash = @hash WHERE EmpNo = @id`,
+      { hash: { type: sql.NVarChar(255), value: hash }, id: { type: sql.Int, value: req.user.id } }
+    );
+    res.json({ message: 'Password changed successfully' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to change password', detail: e.message });
   }
 });
 
