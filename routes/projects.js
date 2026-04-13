@@ -123,21 +123,43 @@ router.get('/:id/photos', requireAuth, async (req, res) => {
   const dir = `uploads/jobs/${req.params.id}`;
   try {
     if (!fs.existsSync(dir)) return res.json([]);
-    const files = fs.readdirSync(dir).map(f => ({
+    const files = fs.readdirSync(dir);
+    // Get gallery info from DB for this job
+    const dbPhotos = await query(
+      `SELECT Filename, GalleryInclude, GalleryCategory FROM Photos WHERE ProjectNo = @id`,
+      { id: { type: sql.Int, value: parseInt(req.params.id) } }
+    );
+    const dbMap = {};
+    dbPhotos.forEach(p => { dbMap[p.Filename] = p; });
+    const result = files.map(f => ({
       filename: f,
       url: `/uploads/jobs/${req.params.id}/${f}`,
-      uploaded: fs.statSync(`${dir}/${f}`).mtime
+      uploaded: fs.statSync(`${dir}/${f}`).mtime,
+      gallery_include: dbMap[f]?.GalleryInclude === true || dbMap[f]?.GalleryInclude === 1,
+      gallery_category: dbMap[f]?.GalleryCategory || null
     }));
-    res.json(files);
+    res.json(result);
   } catch (e) { res.status(500).json({ message: 'Failed to load photos', detail: e.message }); }
 });
 
 router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req, res) => {
   try {
+    const projectId = parseInt(req.params.id);
     const files = req.files.map(f => ({
       filename: f.filename,
       url: `/uploads/jobs/${req.params.id}/${f.filename}`
     }));
+    // Save to Photos table
+    for (const f of files) {
+      await query(
+        `INSERT INTO Photos (ProjectNo, Filename, URL) VALUES (@projectId, @filename, @url)`,
+        {
+          projectId: { type: sql.Int, value: projectId },
+          filename: { type: sql.NVarChar(255), value: f.filename },
+          url: { type: sql.NVarChar(500), value: f.url }
+        }
+      );
+    }
     res.status(201).json({ message: `${files.length} photo(s) uploaded`, files });
   } catch (e) { res.status(500).json({ message: 'Failed to upload photos', detail: e.message }); }
 });
@@ -146,8 +168,70 @@ router.delete('/:id/photos/:filename', requireStaff, async (req, res) => {
   const filePath = `uploads/jobs/${req.params.id}/${req.params.filename}`;
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    await query(
+      `DELETE FROM Photos WHERE ProjectNo = @projectId AND Filename = @filename`,
+      {
+        projectId: { type: sql.Int, value: parseInt(req.params.id) },
+        filename: { type: sql.NVarChar(255), value: req.params.filename }
+      }
+    );
     res.json({ message: 'Photo deleted' });
   } catch (e) { res.status(500).json({ message: 'Failed to delete photo', detail: e.message }); }
+});
+
+// Update gallery settings for a photo
+router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
+  const { gallery_include, gallery_category } = req.body;
+  const projectId = parseInt(req.params.id);
+  const filename = req.params.filename;
+  try {
+    // Upsert — update if exists, insert if not
+    const existing = await queryOne(
+      `SELECT ID FROM Photos WHERE ProjectNo = @projectId AND Filename = @filename`,
+      { projectId: { type: sql.Int, value: projectId }, filename: { type: sql.NVarChar(255), value: filename } }
+    );
+    if (existing) {
+      await query(
+        `UPDATE Photos SET GalleryInclude = @include, GalleryCategory = @category WHERE ProjectNo = @projectId AND Filename = @filename`,
+        {
+          include: { type: sql.Bit, value: gallery_include ? 1 : 0 },
+          category: { type: sql.NVarChar(50), value: gallery_category || null },
+          projectId: { type: sql.Int, value: projectId },
+          filename: { type: sql.NVarChar(255), value: filename }
+        }
+      );
+    } else {
+      await query(
+        `INSERT INTO Photos (ProjectNo, Filename, URL, GalleryInclude, GalleryCategory) VALUES (@projectId, @filename, @url, @include, @category)`,
+        {
+          projectId: { type: sql.Int, value: projectId },
+          filename: { type: sql.NVarChar(255), value: filename },
+          url: { type: sql.NVarChar(500), value: `/uploads/jobs/${req.params.id}/${filename}` },
+          include: { type: sql.Bit, value: gallery_include ? 1 : 0 },
+          category: { type: sql.NVarChar(50), value: gallery_category || null }
+        }
+      );
+    }
+    res.json({ message: 'Gallery settings updated' });
+  } catch (e) { res.status(500).json({ message: 'Failed to update gallery settings', detail: e.message }); }
+});
+
+// Public gallery endpoint — no auth required
+router.get('/gallery/public', async (req, res) => {
+  try {
+    const { category } = req.query;
+    let where = 'GalleryInclude = 1';
+    const params = {};
+    if (category) {
+      where += ' AND GalleryCategory = @category';
+      params.category = { type: sql.NVarChar(50), value: category };
+    }
+    const photos = await query(
+      `SELECT p.Filename, p.URL, p.GalleryCategory, p.UploadedAt, CAST(pr.Description AS NVARCHAR(500)) AS project_name FROM Photos p LEFT JOIN Projects pr ON p.ProjectNo = pr.JobNo WHERE ${where} ORDER BY p.UploadedAt DESC`,
+      params
+    );
+    res.json(photos);
+  } catch (e) { res.status(500).json({ message: 'Failed to load gallery', detail: e.message }); }
 });
 
 router.put('/:id/folder', requireStaff, async (req, res) => {
