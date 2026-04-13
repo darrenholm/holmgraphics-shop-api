@@ -8,12 +8,10 @@ const FormData = require('form-data');
 const fetch = require('node-fetch');
 const router = express.Router();
 
-// WHC upload config
 const WHC_UPLOAD_URL = 'https://holmgraphics.ca/shop-uploads/upload.php';
 const WHC_UPLOAD_KEY = 'holmgraphics-upload-2026';
 const WHC_BASE_URL   = 'https://holmgraphics.ca/shop-uploads/jobs';
 
-// Multer — memory storage only (no local disk)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -23,7 +21,6 @@ const upload = multer({
   }
 });
 
-// Public gallery endpoint — no auth required
 router.get('/gallery/public', async (req, res) => {
   try {
     const { category } = req.query;
@@ -126,6 +123,37 @@ router.post('/:id/items', requireStaff, async (req, res) => {
   } catch (e) { res.status(500).json({ message: 'Failed to add item', detail: e.message }); }
 });
 
+router.put('/:id/items/:itemId', requireStaff, async (req, res) => {
+  const { description, qty, price, total } = req.body;
+  try {
+    await query(
+      `UPDATE Items SET Description=@desc, Qty=@qty, Price=@price, ExtPrice=@total WHERE ID=@itemId AND ProjectNo=@projectId`,
+      {
+        desc:      { type: sql.NVarChar(sql.MAX), value: description },
+        qty:       { type: sql.Float, value: parseFloat(qty) || 1 },
+        price:     { type: sql.Float, value: parseFloat(price) || 0 },
+        total:     { type: sql.Float, value: parseFloat(total) || 0 },
+        itemId:    { type: sql.Int, value: parseInt(req.params.itemId) },
+        projectId: { type: sql.Int, value: parseInt(req.params.id) }
+      }
+    );
+    res.json({ message: 'Item updated' });
+  } catch (e) { res.status(500).json({ message: 'Failed to update item', detail: e.message }); }
+});
+
+router.delete('/:id/items/:itemId', requireStaff, async (req, res) => {
+  try {
+    await query(
+      `DELETE FROM Items WHERE ID=@itemId AND ProjectNo=@projectId`,
+      {
+        itemId:    { type: sql.Int, value: parseInt(req.params.itemId) },
+        projectId: { type: sql.Int, value: parseInt(req.params.id) }
+      }
+    );
+    res.json({ message: 'Item deleted' });
+  } catch (e) { res.status(500).json({ message: 'Failed to delete item', detail: e.message }); }
+});
+
 router.post('/:id/measurements', requireStaff, async (req, res) => {
   const { item, width, height, qty, notes } = req.body;
   try {
@@ -133,8 +161,6 @@ router.post('/:id/measurements', requireStaff, async (req, res) => {
     res.status(201).json({ message: 'Measurement added' });
   } catch (e) { res.status(500).json({ message: 'Failed to add measurement', detail: e.message }); }
 });
-
-// ─── Photos — stored on WHC ───────────────────────────────────────────────────
 
 router.get('/:id/photos', requireAuth, async (req, res) => {
   try {
@@ -157,66 +183,38 @@ router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req,
   try {
     const projectId = parseInt(req.params.id);
     const uploaded = [];
-
     for (const file of req.files) {
-      // Forward file to WHC PHP script
       const form = new FormData();
       form.append('job_id', String(projectId));
-      form.append('photo', file.buffer, {
-        filename: file.originalname,
-        contentType: file.mimetype
-      });
-
+      form.append('photo', file.buffer, { filename: file.originalname, contentType: file.mimetype });
       const whcRes = await fetch(WHC_UPLOAD_URL, {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${WHC_UPLOAD_KEY}`,
-          ...form.getHeaders()
-        },
+        headers: { 'Authorization': `Bearer ${WHC_UPLOAD_KEY}`, ...form.getHeaders() },
         body: form
       });
-
-      if (!whcRes.ok) {
-        const err = await whcRes.text();
-        console.error('WHC upload error:', err);
-        continue;
-      }
-
+      if (!whcRes.ok) { console.error('WHC upload error:', await whcRes.text()); continue; }
       const data = await whcRes.json();
       if (!data.success) continue;
-
-      // Save to DB with WHC URL
       await query(
         `INSERT INTO Photos (ProjectNo, Filename, URL) VALUES (@projectId, @filename, @url)`,
-        {
-          projectId: { type: sql.Int, value: projectId },
-          filename: { type: sql.NVarChar(255), value: data.filename },
-          url: { type: sql.NVarChar(500), value: data.url }
-        }
+        { projectId: { type: sql.Int, value: projectId }, filename: { type: sql.NVarChar(255), value: data.filename }, url: { type: sql.NVarChar(500), value: data.url } }
       );
-
       uploaded.push({ filename: data.filename, url: data.url });
     }
-
     res.status(201).json({ message: `${uploaded.length} photo(s) uploaded`, files: uploaded });
   } catch (e) { console.error('POST photos:', e); res.status(500).json({ message: 'Failed to upload photos', detail: e.message }); }
 });
 
 router.delete('/:id/photos/:filename', requireStaff, async (req, res) => {
   try {
-    // Remove from DB (file stays on WHC but won't show up)
     await query(
       `DELETE FROM Photos WHERE ProjectNo = @projectId AND Filename = @filename`,
-      {
-        projectId: { type: sql.Int, value: parseInt(req.params.id) },
-        filename: { type: sql.NVarChar(255), value: req.params.filename }
-      }
+      { projectId: { type: sql.Int, value: parseInt(req.params.id) }, filename: { type: sql.NVarChar(255), value: req.params.filename } }
     );
     res.json({ message: 'Photo deleted' });
   } catch (e) { res.status(500).json({ message: 'Failed to delete photo', detail: e.message }); }
 });
 
-// Update gallery settings for a photo
 router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
   const { gallery_include, gallery_category } = req.body;
   const projectId = parseInt(req.params.id);
@@ -229,24 +227,12 @@ router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
     if (existing) {
       await query(
         `UPDATE Photos SET GalleryInclude = @include, GalleryCategory = @category WHERE ProjectNo = @projectId AND Filename = @filename`,
-        {
-          include: { type: sql.Bit, value: gallery_include ? 1 : 0 },
-          category: { type: sql.NVarChar(50), value: gallery_category || null },
-          projectId: { type: sql.Int, value: projectId },
-          filename: { type: sql.NVarChar(255), value: filename }
-        }
+        { include: { type: sql.Bit, value: gallery_include ? 1 : 0 }, category: { type: sql.NVarChar(50), value: gallery_category || null }, projectId: { type: sql.Int, value: projectId }, filename: { type: sql.NVarChar(255), value: filename } }
       );
     } else {
-      const url = `${WHC_BASE_URL}/${projectId}/${filename}`;
       await query(
         `INSERT INTO Photos (ProjectNo, Filename, URL, GalleryInclude, GalleryCategory) VALUES (@projectId, @filename, @url, @include, @category)`,
-        {
-          projectId: { type: sql.Int, value: projectId },
-          filename: { type: sql.NVarChar(255), value: filename },
-          url: { type: sql.NVarChar(500), value: url },
-          include: { type: sql.Bit, value: gallery_include ? 1 : 0 },
-          category: { type: sql.NVarChar(50), value: gallery_category || null }
-        }
+        { projectId: { type: sql.Int, value: projectId }, filename: { type: sql.NVarChar(255), value: filename }, url: { type: sql.NVarChar(500), value: `${WHC_BASE_URL}/${projectId}/${filename}` }, include: { type: sql.Bit, value: gallery_include ? 1 : 0 }, category: { type: sql.NVarChar(50), value: gallery_category || null } }
       );
     }
     res.json({ message: 'Gallery settings updated' });
