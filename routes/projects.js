@@ -4,27 +4,25 @@ const { requireAuth, requireStaff } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const FormData = require('form-data');
+const fetch = require('node-fetch');
 const router = express.Router();
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = `uploads/jobs/${req.params.id}`;
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, Date.now() + ext);
-  }
-});
+// WHC upload config
+const WHC_UPLOAD_URL = 'https://holmgraphics.ca/shop-uploads/upload.php';
+const WHC_UPLOAD_KEY = 'holmgraphics-upload-2026';
+const WHC_BASE_URL   = 'https://holmgraphics.ca/shop-uploads/jobs';
+
+// Multer — memory storage only (no local disk)
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|webp/;
     cb(null, allowed.test(path.extname(file.originalname).toLowerCase()));
   }
 });
+
 // Public gallery endpoint — no auth required
 router.get('/gallery/public', async (req, res) => {
   try {
@@ -42,6 +40,7 @@ router.get('/gallery/public', async (req, res) => {
     res.json(photos);
   } catch (e) { res.status(500).json({ message: 'Failed to load gallery', detail: e.message }); }
 });
+
 router.get('/', requireAuth, async (req, res) => {
   try {
     const { clientId, search } = req.query;
@@ -135,24 +134,20 @@ router.post('/:id/measurements', requireStaff, async (req, res) => {
   } catch (e) { res.status(500).json({ message: 'Failed to add measurement', detail: e.message }); }
 });
 
+// ─── Photos — stored on WHC ───────────────────────────────────────────────────
+
 router.get('/:id/photos', requireAuth, async (req, res) => {
-  const dir = `uploads/jobs/${req.params.id}`;
   try {
-    if (!fs.existsSync(dir)) return res.json([]);
-    const files = fs.readdirSync(dir);
-    // Get gallery info from DB for this job
     const dbPhotos = await query(
-      `SELECT Filename, GalleryInclude, GalleryCategory FROM Photos WHERE ProjectNo = @id`,
+      `SELECT Filename, URL, GalleryInclude, GalleryCategory, UploadedAt FROM Photos WHERE ProjectNo = @id ORDER BY UploadedAt DESC`,
       { id: { type: sql.Int, value: parseInt(req.params.id) } }
     );
-    const dbMap = {};
-    dbPhotos.forEach(p => { dbMap[p.Filename] = p; });
-    const result = files.map(f => ({
-      filename: f,
-      url: `/uploads/jobs/${req.params.id}/${f}`,
-      uploaded: fs.statSync(`${dir}/${f}`).mtime,
-      gallery_include: dbMap[f]?.GalleryInclude === true || dbMap[f]?.GalleryInclude === 1,
-      gallery_category: dbMap[f]?.GalleryCategory || null
+    const result = dbPhotos.map(p => ({
+      filename: p.Filename,
+      url: p.URL,
+      uploaded: p.UploadedAt,
+      gallery_include: p.GalleryInclude === true || p.GalleryInclude === 1,
+      gallery_category: p.GalleryCategory || null
     }));
     res.json(result);
   } catch (e) { res.status(500).json({ message: 'Failed to load photos', detail: e.message }); }
@@ -161,29 +156,55 @@ router.get('/:id/photos', requireAuth, async (req, res) => {
 router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req, res) => {
   try {
     const projectId = parseInt(req.params.id);
-    const files = req.files.map(f => ({
-      filename: f.filename,
-      url: `/uploads/jobs/${req.params.id}/${f.filename}`
-    }));
-    // Save to Photos table
-    for (const f of files) {
+    const uploaded = [];
+
+    for (const file of req.files) {
+      // Forward file to WHC PHP script
+      const form = new FormData();
+      form.append('job_id', String(projectId));
+      form.append('photo', file.buffer, {
+        filename: file.originalname,
+        contentType: file.mimetype
+      });
+
+      const whcRes = await fetch(WHC_UPLOAD_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${WHC_UPLOAD_KEY}`,
+          ...form.getHeaders()
+        },
+        body: form
+      });
+
+      if (!whcRes.ok) {
+        const err = await whcRes.text();
+        console.error('WHC upload error:', err);
+        continue;
+      }
+
+      const data = await whcRes.json();
+      if (!data.success) continue;
+
+      // Save to DB with WHC URL
       await query(
         `INSERT INTO Photos (ProjectNo, Filename, URL) VALUES (@projectId, @filename, @url)`,
         {
           projectId: { type: sql.Int, value: projectId },
-          filename: { type: sql.NVarChar(255), value: f.filename },
-          url: { type: sql.NVarChar(500), value: f.url }
+          filename: { type: sql.NVarChar(255), value: data.filename },
+          url: { type: sql.NVarChar(500), value: data.url }
         }
       );
+
+      uploaded.push({ filename: data.filename, url: data.url });
     }
-    res.status(201).json({ message: `${files.length} photo(s) uploaded`, files });
-  } catch (e) { res.status(500).json({ message: 'Failed to upload photos', detail: e.message }); }
+
+    res.status(201).json({ message: `${uploaded.length} photo(s) uploaded`, files: uploaded });
+  } catch (e) { console.error('POST photos:', e); res.status(500).json({ message: 'Failed to upload photos', detail: e.message }); }
 });
 
 router.delete('/:id/photos/:filename', requireStaff, async (req, res) => {
-  const filePath = `uploads/jobs/${req.params.id}/${req.params.filename}`;
   try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    // Remove from DB (file stays on WHC but won't show up)
     await query(
       `DELETE FROM Photos WHERE ProjectNo = @projectId AND Filename = @filename`,
       {
@@ -201,7 +222,6 @@ router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
   const projectId = parseInt(req.params.id);
   const filename = req.params.filename;
   try {
-    // Upsert — update if exists, insert if not
     const existing = await queryOne(
       `SELECT ID FROM Photos WHERE ProjectNo = @projectId AND Filename = @filename`,
       { projectId: { type: sql.Int, value: projectId }, filename: { type: sql.NVarChar(255), value: filename } }
@@ -217,12 +237,13 @@ router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
         }
       );
     } else {
+      const url = `${WHC_BASE_URL}/${projectId}/${filename}`;
       await query(
         `INSERT INTO Photos (ProjectNo, Filename, URL, GalleryInclude, GalleryCategory) VALUES (@projectId, @filename, @url, @include, @category)`,
         {
           projectId: { type: sql.Int, value: projectId },
           filename: { type: sql.NVarChar(255), value: filename },
-          url: { type: sql.NVarChar(500), value: `/uploads/jobs/${req.params.id}/${filename}` },
+          url: { type: sql.NVarChar(500), value: url },
           include: { type: sql.Bit, value: gallery_include ? 1 : 0 },
           category: { type: sql.NVarChar(50), value: gallery_category || null }
         }
@@ -231,8 +252,6 @@ router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
     res.json({ message: 'Gallery settings updated' });
   } catch (e) { res.status(500).json({ message: 'Failed to update gallery settings', detail: e.message }); }
 });
-
-
 
 router.put('/:id/folder', requireStaff, async (req, res) => {
   const { folder_path } = req.body;
