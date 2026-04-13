@@ -25,7 +25,23 @@ const upload = multer({
     cb(null, allowed.test(path.extname(file.originalname).toLowerCase()));
   }
 });
-
+// Public gallery endpoint — no auth required
+router.get('/gallery/public', async (req, res) => {
+  try {
+    const { category } = req.query;
+    let where = 'GalleryInclude = 1';
+    const params = {};
+    if (category) {
+      where += ' AND GalleryCategory = @category';
+      params.category = { type: sql.NVarChar(50), value: category };
+    }
+    const photos = await query(
+      `SELECT p.Filename, p.URL, p.GalleryCategory, p.UploadedAt, CAST(pr.Description AS NVARCHAR(500)) AS project_name FROM Photos p LEFT JOIN Projects pr ON p.ProjectNo = pr.JobNo WHERE ${where} ORDER BY p.UploadedAt DESC`,
+      params
+    );
+    res.json(photos);
+  } catch (e) { res.status(500).json({ message: 'Failed to load gallery', detail: e.message }); }
+});
 router.get('/', requireAuth, async (req, res) => {
   try {
     const { clientId, search } = req.query;
@@ -216,23 +232,7 @@ router.put('/:id/photos/:filename/gallery', requireStaff, async (req, res) => {
   } catch (e) { res.status(500).json({ message: 'Failed to update gallery settings', detail: e.message }); }
 });
 
-// Public gallery endpoint — no auth required
-router.get('/gallery/public', async (req, res) => {
-  try {
-    const { category } = req.query;
-    let where = 'GalleryInclude = 1';
-    const params = {};
-    if (category) {
-      where += ' AND GalleryCategory = @category';
-      params.category = { type: sql.NVarChar(50), value: category };
-    }
-    const photos = await query(
-      `SELECT p.Filename, p.URL, p.GalleryCategory, p.UploadedAt, CAST(pr.Description AS NVARCHAR(500)) AS project_name FROM Photos p LEFT JOIN Projects pr ON p.ProjectNo = pr.JobNo WHERE ${where} ORDER BY p.UploadedAt DESC`,
-      params
-    );
-    res.json(photos);
-  } catch (e) { res.status(500).json({ message: 'Failed to load gallery', detail: e.message }); }
-});
+
 
 router.put('/:id/folder', requireStaff, async (req, res) => {
   const { folder_path } = req.body;
