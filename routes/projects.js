@@ -137,15 +137,16 @@ router.post('/:id/items', requireStaff, async (req, res) => {
 });
 
 router.put('/:id/items/:itemId', requireStaff, async (req, res) => {
-  const { description, qty, price, total } = req.body;
+  const { description, qty, price, total, qb_item_name } = req.body;
   try {
     await query(
-      `UPDATE Items SET Description=@desc, Qty=@qty, Price=@price, ExtPrice=@total WHERE ID=@itemId AND ProjectNo=@projectId`,
+      `UPDATE Items SET Description=@desc, Qty=@qty, Price=@price, ExtPrice=@total, qb_item_name=@qbItem WHERE ID=@itemId AND ProjectNo=@projectId`,
       {
         desc:      { type: sql.NVarChar(sql.MAX), value: description },
         qty:       { type: sql.Float, value: parseFloat(qty) || 1 },
         price:     { type: sql.Float, value: parseFloat(price) || 0 },
         total:     { type: sql.Float, value: parseFloat(total) || 0 },
+        qbItem:    { type: sql.NVarChar(100), value: qb_item_name || null },
         itemId:    { type: sql.Int, value: parseInt(req.params.itemId) },
         projectId: { type: sql.Int, value: parseInt(req.params.id) }
       }
