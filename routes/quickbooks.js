@@ -1,64 +1,35 @@
 /**
  * QuickBooks Online Integration - Holm Graphics Shop
  * Route: /api/quickbooks
- * Fixed for holmgraphics-shop-api (uses db/pool.js or direct env connection)
  */
 
 const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
 
-// ─── Use the project's own DB connection ─────────────────────────────────────
-// This project uses SQL Server via db/pool.js or similar
-let pool;
-try {
-  pool = require('../db/pool');
-} catch(e) {
-  try { pool = require('../db/connection'); } catch(e2) {
-    console.warn('QB: No DB pool found, will retry at runtime');
-  }
-}
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
-// Use the project's own auth middleware
-const authenticateToken = (req,res,next) => next();
-const requireAdmin      = (req,res,next) => next();
+// ─── Auth middleware (passthrough for now) ────────────────────────────────────
+const authenticateToken = (req, res, next) => next();
+const requireAdmin      = (req, res, next) => next();
 
 // ─── QB Config ────────────────────────────────────────────────────────────────
-const QB_BASE_URL  = process.env.NODE_ENV === 'production'
-  ? 'https://quickbooks.api.intuit.com'
-  : 'https://sandbox-quickbooks.api.intuit.com';
-const QB_AUTH_URL  = 'https://appcenter.intuit.com/connect/oauth2';
-const QB_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
-const QB_REVOKE_URL= 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
-const SCOPES       = 'com.intuit.quickbooks.accounting';
+const QB_AUTH_URL   = 'https://appcenter.intuit.com/connect/oauth2';
+const QB_TOKEN_URL  = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
+const QB_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
+const SCOPES        = 'com.intuit.quickbooks.accounting';
 
-// ─── Simple in-memory token store (upgrade to DB later) ───────────────────────
+function QB_BASE() {
+  return process.env.NODE_ENV === 'production'
+    ? 'https://quickbooks.api.intuit.com'
+    : 'https://sandbox-quickbooks.api.intuit.com';
+}
+
+// ─── In-memory token store ────────────────────────────────────────────────────
 let _tokens = null;
-
 async function getTokens()   { return _tokens; }
 async function saveTokens(t) { _tokens = t; }
 async function clearTokens() { _tokens = null; }
 
-// ─── HTTP helper ──────────────────────────────────────────────────────────────
-async function qbFetch(path, options = {}, tokens) {
-  if (new Date(tokens.expires_at) <= new Date(Date.now() + 60_000)) {
-    tokens = await refreshAccessToken(tokens);
-  }
-  const url = `${QB_BASE_URL}/v3/company/${tokens.realm_id}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${tokens.access_token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    }
-  });
-  if (!res.ok) throw new Error(`QB API ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
+// ─── Token refresh ────────────────────────────────────────────────────────────
 async function refreshAccessToken(tokens) {
   const creds = Buffer.from(`${process.env.QB_CLIENT_ID}:${process.env.QB_CLIENT_SECRET}`).toString('base64');
   const res = await fetch(QB_TOKEN_URL, {
@@ -78,10 +49,57 @@ async function refreshAccessToken(tokens) {
   return newTokens;
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Active tokens (auto-refresh) ────────────────────────────────────────────
+async function activeTokens() {
+  let t = await getTokens();
+  if (!t) throw new Error('QuickBooks not connected');
+  if (new Date(t.expires_at) <= new Date(Date.now() + 60_000)) {
+    t = await refreshAccessToken(t);
+  }
+  return t;
+}
+
+// ─── QB HTTP helpers ──────────────────────────────────────────────────────────
+async function qbGet(path) {
+  const t = await activeTokens();
+  const res = await fetch(`${QB_BASE()}/v3/company/${t.realm_id}${path}`, {
+    headers: { 'Authorization': `Bearer ${t.access_token}`, 'Accept': 'application/json' }
+  });
+  if (!res.ok) throw new Error(`QB API ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+async function qbPost(path, body) {
+  const t = await activeTokens();
+  const res = await fetch(`${QB_BASE()}/v3/company/${t.realm_id}${path}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${t.access_token}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`QB API ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// ─── DB helper ────────────────────────────────────────────────────────────────
+async function dbQuery(sql, params = []) {
+  let pool = null;
+  try { pool = require('../db/pool'); } catch(e) {}
+  if (!pool) try { pool = require('../db/connection'); } catch(e) {}
+  if (!pool) throw new Error('No database pool available');
+  const result = await pool.query(sql, params);
+  return result.rows;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
 
 // GET /api/quickbooks/status
-router.get('/status', authenticateToken, async (req, res) => {
+router.get('/status', async (req, res) => {
   try {
     const tokens = await getTokens();
     if (!tokens) return res.json({ connected: false });
@@ -95,7 +113,7 @@ router.get('/status', authenticateToken, async (req, res) => {
 });
 
 // GET /api/quickbooks/connect
-router.get('/connect', authenticateToken, (req, res) => {
+router.get('/connect', (req, res) => {
   const params = new URLSearchParams({
     client_id:     process.env.QB_CLIENT_ID,
     redirect_uri:  process.env.QB_REDIRECT_URI,
@@ -125,14 +143,16 @@ router.get('/callback', async (req, res) => {
       realm_id:      realmId,
       expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString()
     });
-    res.redirect(`${process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca'}/admin-quickbooks.html?connected=true`);
+    const base = process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca';
+    res.redirect(`${base}/admin-quickbooks.html?connected=true`);
   } catch (err) {
-    res.redirect(`${process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca'}/admin-quickbooks.html?error=${encodeURIComponent(err.message)}`);
+    const base = process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca';
+    res.redirect(`${base}/admin-quickbooks.html?error=${encodeURIComponent(err.message)}`);
   }
 });
 
 // DELETE /api/quickbooks/disconnect
-router.delete('/disconnect', authenticateToken, async (req, res) => {
+router.delete('/disconnect', async (req, res) => {
   try {
     const tokens = await getTokens();
     if (tokens) {
@@ -148,276 +168,265 @@ router.delete('/disconnect', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD / SUMMARY
+// ─────────────────────────────────────────────────────────────────────────────
+
 // GET /api/quickbooks/summary
-router.get('/summary', authenticateToken, async (req, res) => {
-  res.json({ synced: 0, pending: 0, cancelled: 0, synced_revenue: 0, last_synced_at: null });
+router.get('/summary', async (req, res) => {
+  try {
+    const rows = await dbQuery(`
+      SELECT
+        COUNT(*) FILTER (WHERE qb_customer_id IS NOT NULL) AS synced,
+        COUNT(*) FILTER (WHERE qb_customer_id IS NULL) AS pending,
+        0 AS cancelled,
+        0 AS synced_revenue,
+        MAX(created_at) AS last_synced_at
+      FROM clients
+    `);
+    res.json(rows[0]);
+  } catch (err) {
+    res.json({ synced: 0, pending: 0, cancelled: 0, synced_revenue: 0, last_synced_at: null });
+  }
 });
 
 // GET /api/quickbooks/sync/log
-router.get('/sync/log', authenticateToken, async (req, res) => {
+router.get('/sync/log', async (req, res) => {
   res.json([]);
 });
 
 // POST /api/quickbooks/sync/all
-router.post('/sync/all', authenticateToken, async (req, res) => {
-  const tokens = await getTokens();
-  if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
-  res.json({ synced: 0, failed: 0, errors: [], message: 'Sync not yet configured for this project' });
+router.post('/sync/all', async (req, res) => {
+  res.json({ synced: 0, failed: 0, errors: [], message: 'Use /clients/push to sync clients' });
 });
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ADD THIS TO: routes/quickbooks.js
-// New endpoint: POST /api/quickbooks/invoice/project/:id
-// Sends a single project as a QB invoice manually
+// INVOICE
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /api/quickbooks/invoice/project/:id
 router.post('/invoice/project/:id', async (req, res) => {
   try {
-    const tokens = await getTokens();
-    if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
-
-    // Pull project from DB - adjust query to match your projects table schema
-    const { id } = req.params;
-
-    // ── Find or create QB Customer ──────────────────────────────────────────
     const { client_name, client_email, description, total_amount, project_number } = req.body;
-
     if (!client_name || !total_amount) {
       return res.status(400).json({ error: 'client_name and total_amount are required' });
     }
 
-    // Refresh token if needed
-    let activeTokens = tokens;
-    if (new Date(tokens.expires_at) <= new Date(Date.now() + 60_000)) {
-      activeTokens = await refreshAccessToken(tokens);
-    }
-
-    const QB_BASE = process.env.NODE_ENV === 'production'
-      ? 'https://quickbooks.api.intuit.com'
-      : 'https://sandbox-quickbooks.api.intuit.com';
-
-    const headers = {
-      'Authorization': `Bearer ${activeTokens.access_token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json'
-    };
-
-    // Search for existing customer
-    const custSearch = await fetch(
-      `${QB_BASE}/v3/company/${activeTokens.realm_id}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName = '${client_name.replace(/'/g,"\\'")}' MAXRESULTS 1`)}`,
-      { headers }
+    // Find or create QB customer
+    const searchData = await qbGet(
+      `/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName = '${client_name.replace(/'/g,"\\'")}' MAXRESULTS 1`)}`
     );
-    const custData = await custSearch.json();
-    let customerId = custData?.QueryResponse?.Customer?.[0]?.Id;
+    let customerId = searchData?.QueryResponse?.Customer?.[0]?.Id;
 
-    // Create customer if not found
     if (!customerId) {
-      const createCust = await fetch(
-        `${QB_BASE}/v3/company/${activeTokens.realm_id}/customer`,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            DisplayName: client_name,
-            ...(client_email ? { PrimaryEmailAddr: { Address: client_email } } : {})
-          })
-        }
-      );
-      const newCust = await createCust.json();
+      const newCust = await qbPost('/customer', {
+        DisplayName: client_name,
+        ...(client_email ? { PrimaryEmailAddr: { Address: client_email } } : {})
+      });
       customerId = newCust?.Customer?.Id;
       if (!customerId) throw new Error('Failed to create QB customer');
     }
 
-    // ── Create Invoice ──────────────────────────────────────────────────────
-    const invoiceBody = {
+    // Create invoice
+    const invData = await qbPost('/invoice', {
       CustomerRef: { value: customerId },
-      DocNumber:   project_number || id,
-      PrivateNote: `Holm Graphics Project #${project_number || id}`,
-      Line: [
-        {
-          Amount: parseFloat(total_amount),
-          DetailType: 'SalesItemLineDetail',
-          Description: description || `Project #${project_number || id}`,
-          SalesItemLineDetail: {
-            ItemRef: { value: '1', name: 'Services' },
-            UnitPrice: parseFloat(total_amount),
-            Qty: 1
-          }
+      DocNumber:   String(project_number || req.params.id),
+      PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
+      Line: [{
+        Amount: parseFloat(total_amount),
+        DetailType: 'SalesItemLineDetail',
+        Description: description || `Project #${project_number || req.params.id}`,
+        SalesItemLineDetail: {
+          ItemRef: { value: '1', name: 'Services' },
+          UnitPrice: parseFloat(total_amount),
+          Qty: 1
         }
-      ],
+      }],
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
-    };
-
-    const invRes = await fetch(
-      `${QB_BASE}/v3/company/${activeTokens.realm_id}/invoice`,
-      { method: 'POST', headers, body: JSON.stringify(invoiceBody) }
-    );
-
-    if (!invRes.ok) {
-      const errText = await invRes.text();
-      throw new Error(`QB invoice creation failed: ${errText}`);
-    }
-
-    const invData = await invRes.json();
-    const invoice = invData.Invoice;
-
-    res.json({
-      success: true,
-      invoice_id: invoice.Id,
-      doc_number: invoice.DocNumber,
-      total: invoice.TotalAmt,
-      message: `Invoice #${invoice.DocNumber} created in QuickBooks`
     });
 
+    const invoice = invData.Invoice;
+    res.json({
+      success:    true,
+      invoice_id: invoice.Id,
+      doc_number: invoice.DocNumber,
+      total:      invoice.TotalAmt,
+      message:    `Invoice #${invoice.DocNumber} created in QuickBooks`
+    });
   } catch (err) {
-    console.error('QB invoice error:', err);
     res.status(500).json({ error: err.message });
   }
 });
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ADD THESE TO: routes/quickbooks.js  (before module.exports = router;)
-// Required for the manual client matching page
+// CLIENT SYNC
 // ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/quickbooks/clients/status
+router.get('/clients/status', async (req, res) => {
+  try {
+    const rows = await dbQuery(`
+      SELECT
+        COUNT(*) AS total,
+        COUNT(qb_customer_id) AS synced_to_qb,
+        COUNT(*) - COUNT(qb_customer_id) AS not_in_qb
+      FROM clients
+    `);
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/quickbooks/clients/list
+router.get('/clients/list', async (req, res) => {
+  try {
+    const rows = await dbQuery(`
+      SELECT id, company, fname, lname, email, qb_customer_id, created_at
+      FROM clients ORDER BY company ASC, lname ASC
+    `);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // GET /api/quickbooks/clients/qb-list
-// Returns all active QB customers (for the manual match browser)
 router.get('/clients/qb-list', async (req, res) => {
   try {
-    const tokens = await getTokens();
-    if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
-
-    const QB_BASE = process.env.NODE_ENV === 'production'
-      ? 'https://quickbooks.api.intuit.com'
-      : 'https://sandbox-quickbooks.api.intuit.com';
-
-    let activeTokens = tokens;
     let allCustomers = [];
     let startPos = 1;
     const pageSize = 100;
     let hasMore = true;
-
     while (hasMore) {
-      if (new Date(activeTokens.expires_at) <= new Date(Date.now() + 60_000)) {
-        activeTokens = await refreshAccessToken(activeTokens);
-      }
-      const r = await fetch(
-        `${QB_BASE}/v3/company/${activeTokens.realm_id}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPos} MAXRESULTS ${pageSize}`)}`,
-        { headers: { 'Authorization': `Bearer ${activeTokens.access_token}`, 'Accept': 'application/json' } }
+      const data = await qbGet(
+        `/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPos} MAXRESULTS ${pageSize}`)}`
       );
-      if (!r.ok) throw new Error(`QB API ${r.status}`);
-      const data = await r.json();
       const batch = data?.QueryResponse?.Customer || [];
       allCustomers = allCustomers.concat(batch);
       if (batch.length < pageSize) hasMore = false;
       else startPos += pageSize;
     }
-
     res.json(allCustomers);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/quickbooks/clients/link
-// Manually link a local client to a specific QB customer ID
-router.post('/clients/link', async (req, res) => {
+// POST /api/quickbooks/clients/push  — push all unsynced local clients to QB
+router.post('/clients/push', async (req, res) => {
   try {
-    const { client_id, qb_customer_id } = req.body;
-    if (!client_id || !qb_customer_id) {
-      return res.status(400).json({ error: 'client_id and qb_customer_id are required' });
+    const unsynced = await dbQuery(`SELECT * FROM clients WHERE qb_customer_id IS NULL`);
+    const results = { pushed: 0, failed: 0, errors: [] };
+
+    for (const client of unsynced) {
+      try {
+        const displayName = client.company ||
+          [client.fname, client.lname].filter(Boolean).join(' ') ||
+          client.email || `Client #${client.id}`;
+
+        const searchData = await qbGet(
+          `/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName = '${displayName.replace(/'/g,"\\'")}' MAXRESULTS 1`)}`
+        );
+        let qbId = searchData?.QueryResponse?.Customer?.[0]?.Id;
+
+        if (!qbId) {
+          const created = await qbPost('/customer', {
+            DisplayName: displayName,
+            ...(client.fname ? { GivenName: client.fname } : {}),
+            ...(client.lname ? { FamilyName: client.lname } : {}),
+            ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {})
+          });
+          qbId = created?.Customer?.Id;
+        }
+
+        if (qbId) {
+          await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
+          results.pushed++;
+        }
+      } catch (err) {
+        results.failed++;
+        results.errors.push({ client_id: client.id, error: err.message });
+      }
     }
-
-    // Check client exists
-    const clients = await dbQuery(`SELECT id, company, fname, lname FROM clients WHERE id = $1`, [client_id]);
-    if (clients.length === 0) return res.status(404).json({ error: 'Client not found' });
-
-    // Check not already linked to a different QB customer
-    const existing = await dbQuery(`SELECT qb_customer_id FROM clients WHERE id = $1`, [client_id]);
-    if (existing[0]?.qb_customer_id && existing[0].qb_customer_id !== qb_customer_id) {
-      // Allow override — just update it
-    }
-
-    await dbQuery(
-      `UPDATE clients SET qb_customer_id = $1 WHERE id = $2`,
-      [qb_customer_id, client_id]
-    );
-
-    res.json({ success: true, client_id, qb_customer_id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json(results);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// ─────────────────────────────────────────────────────────────────────────────
-// ADD THESE TO: routes/quickbooks.js  (before module.exports = router;)
-// Required for the manual client matching page
-// ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/quickbooks/clients/qb-list
-// Returns all active QB customers (for the manual match browser)
-router.get('/clients/qb-list', async (req, res) => {
+// POST /api/quickbooks/clients/push/:id  — push single client to QB
+router.post('/clients/push/:id', async (req, res) => {
   try {
-    const tokens = await getTokens();
-    if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
+    const clients = await dbQuery(`SELECT * FROM clients WHERE id = $1`, [req.params.id]);
+    if (!clients.length) return res.status(404).json({ error: 'Client not found' });
+    const client = clients[0];
+    if (client.qb_customer_id) return res.json({ already_synced: true, qb_customer_id: client.qb_customer_id });
 
-    const QB_BASE = process.env.NODE_ENV === 'production'
-      ? 'https://quickbooks.api.intuit.com'
-      : 'https://sandbox-quickbooks.api.intuit.com';
+    const displayName = client.company ||
+      [client.fname, client.lname].filter(Boolean).join(' ') ||
+      client.email || `Client #${client.id}`;
 
-    let activeTokens = tokens;
-    let allCustomers = [];
+    const created = await qbPost('/customer', {
+      DisplayName: displayName,
+      ...(client.fname ? { GivenName: client.fname } : {}),
+      ...(client.lname ? { FamilyName: client.lname } : {}),
+      ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {})
+    });
+    const qbId = created?.Customer?.Id;
+    if (qbId) await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
+    res.json({ success: true, qb_customer_id: qbId, display_name: displayName });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/quickbooks/clients/pull  — import QB customers into local DB
+router.post('/clients/pull', async (req, res) => {
+  try {
+    const results = { imported: 0, updated: 0, skipped: 0, errors: [] };
     let startPos = 1;
     const pageSize = 100;
     let hasMore = true;
 
     while (hasMore) {
-      if (new Date(activeTokens.expires_at) <= new Date(Date.now() + 60_000)) {
-        activeTokens = await refreshAccessToken(activeTokens);
-      }
-      const r = await fetch(
-        `${QB_BASE}/v3/company/${activeTokens.realm_id}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPos} MAXRESULTS ${pageSize}`)}`,
-        { headers: { 'Authorization': `Bearer ${activeTokens.access_token}`, 'Accept': 'application/json' } }
+      const data = await qbGet(
+        `/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPos} MAXRESULTS ${pageSize}`)}`
       );
-      if (!r.ok) throw new Error(`QB API ${r.status}`);
-      const data = await r.json();
-      const batch = data?.QueryResponse?.Customer || [];
-      allCustomers = allCustomers.concat(batch);
-      if (batch.length < pageSize) hasMore = false;
+      const customers = data?.QueryResponse?.Customer || [];
+      if (!customers.length) { hasMore = false; break; }
+
+      for (const cust of customers) {
+        try {
+          const existing = await dbQuery(`SELECT id FROM clients WHERE qb_customer_id = $1`, [cust.Id]);
+          if (existing.length) { results.skipped++; continue; }
+
+          const email = cust.PrimaryEmailAddr?.Address || null;
+          if (email) {
+            const byEmail = await dbQuery(`SELECT id FROM clients WHERE email = $1 AND qb_customer_id IS NULL`, [email]);
+            if (byEmail.length) {
+              await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [cust.Id, byEmail[0].id]);
+              results.updated++;
+              continue;
+            }
+          }
+
+          await dbQuery(
+            `INSERT INTO clients (company, fname, lname, email, qb_customer_id, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`,
+            [cust.CompanyName || cust.DisplayName || '', cust.GivenName || '', cust.FamilyName || '', email, cust.Id]
+          );
+          results.imported++;
+        } catch (err) {
+          results.errors.push({ qb_id: cust.Id, error: err.message });
+        }
+      }
+      if (customers.length < pageSize) hasMore = false;
       else startPos += pageSize;
     }
-
-    res.json(allCustomers);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json(results);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/quickbooks/clients/link
-// Manually link a local client to a specific QB customer ID
+// POST /api/quickbooks/clients/link  — manually link a client to a QB customer
 router.post('/clients/link', async (req, res) => {
   try {
     const { client_id, qb_customer_id } = req.body;
-    if (!client_id || !qb_customer_id) {
-      return res.status(400).json({ error: 'client_id and qb_customer_id are required' });
-    }
-
-    // Check client exists
-    const clients = await dbQuery(`SELECT id, company, fname, lname FROM clients WHERE id = $1`, [client_id]);
-    if (clients.length === 0) return res.status(404).json({ error: 'Client not found' });
-
-    // Check not already linked to a different QB customer
-    const existing = await dbQuery(`SELECT qb_customer_id FROM clients WHERE id = $1`, [client_id]);
-    if (existing[0]?.qb_customer_id && existing[0].qb_customer_id !== qb_customer_id) {
-      // Allow override — just update it
-    }
-
-    await dbQuery(
-      `UPDATE clients SET qb_customer_id = $1 WHERE id = $2`,
-      [qb_customer_id, client_id]
-    );
-
+    if (!client_id || !qb_customer_id) return res.status(400).json({ error: 'client_id and qb_customer_id are required' });
+    const clients = await dbQuery(`SELECT id FROM clients WHERE id = $1`, [client_id]);
+    if (!clients.length) return res.status(404).json({ error: 'Client not found' });
+    await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qb_customer_id, client_id]);
     res.json({ success: true, client_id, qb_customer_id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 module.exports = router;
