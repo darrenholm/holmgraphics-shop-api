@@ -274,5 +274,78 @@ router.post('/invoice/project/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// ADD THESE TO: routes/quickbooks.js  (before module.exports = router;)
+// Required for the manual client matching page
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/quickbooks/clients/qb-list
+// Returns all active QB customers (for the manual match browser)
+router.get('/clients/qb-list', async (req, res) => {
+  try {
+    const tokens = await getTokens();
+    if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
+
+    const QB_BASE = process.env.NODE_ENV === 'production'
+      ? 'https://quickbooks.api.intuit.com'
+      : 'https://sandbox-quickbooks.api.intuit.com';
+
+    let activeTokens = tokens;
+    let allCustomers = [];
+    let startPos = 1;
+    const pageSize = 100;
+    let hasMore = true;
+
+    while (hasMore) {
+      if (new Date(activeTokens.expires_at) <= new Date(Date.now() + 60_000)) {
+        activeTokens = await refreshAccessToken(activeTokens);
+      }
+      const r = await fetch(
+        `${QB_BASE}/v3/company/${activeTokens.realm_id}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE Active = true STARTPOSITION ${startPos} MAXRESULTS ${pageSize}`)}`,
+        { headers: { 'Authorization': `Bearer ${activeTokens.access_token}`, 'Accept': 'application/json' } }
+      );
+      if (!r.ok) throw new Error(`QB API ${r.status}`);
+      const data = await r.json();
+      const batch = data?.QueryResponse?.Customer || [];
+      allCustomers = allCustomers.concat(batch);
+      if (batch.length < pageSize) hasMore = false;
+      else startPos += pageSize;
+    }
+
+    res.json(allCustomers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/quickbooks/clients/link
+// Manually link a local client to a specific QB customer ID
+router.post('/clients/link', async (req, res) => {
+  try {
+    const { client_id, qb_customer_id } = req.body;
+    if (!client_id || !qb_customer_id) {
+      return res.status(400).json({ error: 'client_id and qb_customer_id are required' });
+    }
+
+    // Check client exists
+    const clients = await dbQuery(`SELECT id, company, fname, lname FROM clients WHERE id = $1`, [client_id]);
+    if (clients.length === 0) return res.status(404).json({ error: 'Client not found' });
+
+    // Check not already linked to a different QB customer
+    const existing = await dbQuery(`SELECT qb_customer_id FROM clients WHERE id = $1`, [client_id]);
+    if (existing[0]?.qb_customer_id && existing[0].qb_customer_id !== qb_customer_id) {
+      // Allow override — just update it
+    }
+
+    await dbQuery(
+      `UPDATE clients SET qb_customer_id = $1 WHERE id = $2`,
+      [qb_customer_id, client_id]
+    );
+
+    res.json({ success: true, client_id, qb_customer_id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
