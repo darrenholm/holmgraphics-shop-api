@@ -107,7 +107,10 @@ router.post('/:id/status', requireStaff, async (req, res) => {
   } catch (e) { res.status(500).json({ message: 'Failed to update status', detail: e.message }); }
 });
 
-const rows = await query(`SELECT ID AS id, CAST(Description AS NVARCHAR(500)) AS item_name, Qty AS quantity, Price AS unit_price, ExtPrice AS total, qb_item_name FROM Items WHERE ProjectNo = @id ORDER BY ID`,);
+router.get('/:id/items', requireAuth, async (req, res) => {
+  try {
+    const rows = await query(`SELECT ID AS id, CAST(Description AS NVARCHAR(500)) AS item_name, Qty AS quantity, Price AS unit_price, ExtPrice AS total, qb_item_name FROM Items WHERE ProjectNo = @id ORDER BY ID`, { id: { type: sql.Int, value: parseInt(req.params.id) } });
+    res.json(rows);
   } catch (e) { res.status(500).json({ message: 'Failed to load items', detail: e.message }); }
 });
 
