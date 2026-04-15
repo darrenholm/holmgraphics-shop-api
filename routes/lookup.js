@@ -29,7 +29,7 @@ router.get('/clients', requireStaff, async (req, res) => {
     }
 
     const rows = await query(
-      `SELECT TOP 50
+      `SELECT TOP 500
          [ID]        AS id,
          [Company]   AS company_name,
          [FName] AS first_name,
