@@ -288,8 +288,8 @@ router.get('/clients/status', async (req, res) => {
 router.get('/clients/list', async (req, res) => {
   try {
     const rows = await dbQuery(`
-      SELECT id, company, fname, lname, email, qb_customer_id, created_at
-      FROM clients ORDER BY company ASC, lname ASC
+     SELECT id, company, fname, lname, CAST(email AS NVARCHAR(500)) as email, qb_customer_id
+FROM Clients ORDER BY company ASC, lname ASC
     `);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
