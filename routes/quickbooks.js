@@ -164,5 +164,115 @@ router.post('/sync/all', authenticateToken, async (req, res) => {
   if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
   res.json({ synced: 0, failed: 0, errors: [], message: 'Sync not yet configured for this project' });
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// ADD THIS TO: routes/quickbooks.js
+// New endpoint: POST /api/quickbooks/invoice/project/:id
+// Sends a single project as a QB invoice manually
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/quickbooks/invoice/project/:id
+router.post('/invoice/project/:id', async (req, res) => {
+  try {
+    const tokens = await getTokens();
+    if (!tokens) return res.status(400).json({ error: 'QuickBooks not connected' });
+
+    // Pull project from DB - adjust query to match your projects table schema
+    const { id } = req.params;
+
+    // ── Find or create QB Customer ──────────────────────────────────────────
+    const { client_name, client_email, description, total_amount, project_number } = req.body;
+
+    if (!client_name || !total_amount) {
+      return res.status(400).json({ error: 'client_name and total_amount are required' });
+    }
+
+    // Refresh token if needed
+    let activeTokens = tokens;
+    if (new Date(tokens.expires_at) <= new Date(Date.now() + 60_000)) {
+      activeTokens = await refreshAccessToken(tokens);
+    }
+
+    const QB_BASE = process.env.NODE_ENV === 'production'
+      ? 'https://quickbooks.api.intuit.com'
+      : 'https://sandbox-quickbooks.api.intuit.com';
+
+    const headers = {
+      'Authorization': `Bearer ${activeTokens.access_token}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    };
+
+    // Search for existing customer
+    const custSearch = await fetch(
+      `${QB_BASE}/v3/company/${activeTokens.realm_id}/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName = '${client_name.replace(/'/g,"\\'")}' MAXRESULTS 1`)}`,
+      { headers }
+    );
+    const custData = await custSearch.json();
+    let customerId = custData?.QueryResponse?.Customer?.[0]?.Id;
+
+    // Create customer if not found
+    if (!customerId) {
+      const createCust = await fetch(
+        `${QB_BASE}/v3/company/${activeTokens.realm_id}/customer`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            DisplayName: client_name,
+            ...(client_email ? { PrimaryEmailAddr: { Address: client_email } } : {})
+          })
+        }
+      );
+      const newCust = await createCust.json();
+      customerId = newCust?.Customer?.Id;
+      if (!customerId) throw new Error('Failed to create QB customer');
+    }
+
+    // ── Create Invoice ──────────────────────────────────────────────────────
+    const invoiceBody = {
+      CustomerRef: { value: customerId },
+      DocNumber:   project_number || id,
+      PrivateNote: `Holm Graphics Project #${project_number || id}`,
+      Line: [
+        {
+          Amount: parseFloat(total_amount),
+          DetailType: 'SalesItemLineDetail',
+          Description: description || `Project #${project_number || id}`,
+          SalesItemLineDetail: {
+            ItemRef: { value: '1', name: 'Services' },
+            UnitPrice: parseFloat(total_amount),
+            Qty: 1
+          }
+        }
+      ],
+      ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
+    };
+
+    const invRes = await fetch(
+      `${QB_BASE}/v3/company/${activeTokens.realm_id}/invoice`,
+      { method: 'POST', headers, body: JSON.stringify(invoiceBody) }
+    );
+
+    if (!invRes.ok) {
+      const errText = await invRes.text();
+      throw new Error(`QB invoice creation failed: ${errText}`);
+    }
+
+    const invData = await invRes.json();
+    const invoice = invData.Invoice;
+
+    res.json({
+      success: true,
+      invoice_id: invoice.Id,
+      doc_number: invoice.DocNumber,
+      total: invoice.TotalAmt,
+      message: `Invoice #${invoice.DocNumber} created in QuickBooks`
+    });
+
+  } catch (err) {
+    console.error('QB invoice error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
