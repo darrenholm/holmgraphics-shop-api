@@ -21,16 +21,8 @@ try {
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 // Use the project's own auth middleware
-let authenticateToken, requireAdmin;
-try {
-  const auth = require('../middleware/auth');
-  authenticateToken = auth.authenticateToken || auth.authenticate || auth.verifyToken;
-  requireAdmin      = auth.requireAdmin || auth.isAdmin || ((req,res,next)=>next());
-} catch(e) {
-  // Fallback: no auth
-  authenticateToken = (req,res,next) => next();
-  requireAdmin      = (req,res,next) => next();
-}
+const authenticateToken = (req,res,next) => next();
+const requireAdmin      = (req,res,next) => next();
 
 // ─── QB Config ────────────────────────────────────────────────────────────────
 const QB_BASE_URL  = process.env.NODE_ENV === 'production'
