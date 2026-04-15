@@ -246,5 +246,19 @@ router.put('/:id/folder', requireStaff, async (req, res) => {
     res.json({ message: 'Folder path updated' });
   } catch (e) { res.status(500).json({ message: 'Failed to update folder path', detail: e.message }); }
 });
+// GET /api/projects/qb-items
+router.get('/qb-items', async (req, res) => {
+  try {
+    const { query } = require('../db/connection');
+    const items = await query(
+      `SELECT id, name, item_type, category, price, description 
+       FROM QBItems WHERE active = 1 
+       ORDER BY category ASC, name ASC`
+    );
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
