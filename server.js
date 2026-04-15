@@ -39,6 +39,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/auth',     authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api',          lookupRoutes);
+app.use('/api/quickbooks', require('./routes/quickbooks'));
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
