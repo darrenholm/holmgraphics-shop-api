@@ -50,7 +50,20 @@ router.get('/', requireAuth, async (req, res) => {
     res.json(rows);
   } catch (e) { console.error('GET /projects:', e); res.status(500).json({ message: 'Failed to load projects', detail: e.message }); }
 });
-
+// GET /api/projects/qb-items
+router.get('/qb-items', async (req, res) => {
+  try {
+    const { query } = require('../db/connection');
+    const items = await query(
+      `SELECT id, name, item_type, category, price, description 
+       FROM QBItems WHERE active = 1 
+       ORDER BY category ASC, name ASC`
+    );
+    res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.get('/:id', requireAuth, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
@@ -245,20 +258,6 @@ router.put('/:id/folder', requireStaff, async (req, res) => {
     await query(`UPDATE Projects SET FolderPath = @path WHERE JobNo = @id`, { path: { type: sql.NVarChar(500), value: folder_path || null }, id: { type: sql.Int, value: parseInt(req.params.id) } });
     res.json({ message: 'Folder path updated' });
   } catch (e) { res.status(500).json({ message: 'Failed to update folder path', detail: e.message }); }
-});
-// GET /api/projects/qb-items
-router.get('/qb-items', async (req, res) => {
-  try {
-    const { query } = require('../db/connection');
-    const items = await query(
-      `SELECT id, name, item_type, category, price, description 
-       FROM QBItems WHERE active = 1 
-       ORDER BY category ASC, name ASC`
-    );
-    res.json(items);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 module.exports = router;
