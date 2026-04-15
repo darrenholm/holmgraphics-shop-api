@@ -84,14 +84,22 @@ async function qbPost(path, body) {
   return res.json();
 }
 
-// ─── DB helper ────────────────────────────────────────────────────────────────
-async function dbQuery(sql, params = []) {
-  let pool = null;
-  try { pool = require('../db/pool'); } catch(e) {}
-  if (!pool) try { pool = require('../db/connection'); } catch(e) {}
-  if (!pool) throw new Error('No database pool available');
-  const result = await pool.query(sql, params);
-  return result.rows;
+// ─── DB helper (Azure SQL via mssql) ─────────────────────────────────────────
+async function dbQuery(sql_text, params = []) {
+  const { getPool, sql } = require('../db/connection');
+  const pool = await getPool();
+  const request = pool.request();
+  // Convert positional params ($1,$2) to mssql named params
+  let i = 0;
+  const converted = sql_text.replace(/\$\d+/g, () => {
+    const name = `p${i}`;
+    const val = params[i];
+    request.input(name, val);
+    i++;
+    return `@${name}`;
+  });
+  const result = await request.query(converted);
+  return result.recordset;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
