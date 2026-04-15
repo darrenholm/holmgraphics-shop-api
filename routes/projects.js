@@ -115,10 +115,10 @@ router.get('/:id/items', requireAuth, async (req, res) => {
 });
 
 router.post('/:id/items', requireStaff, async (req, res) => {
-  const { description, qty, price, total } = req.body;
+  const { description, qty, price, total, qb_item_name } = req.body;
   if (!description?.trim()) return res.status(400).json({ message: 'Description required' });
   try {
-    await query(`INSERT INTO Items (ProjectNo, Description, Qty, Price, ExtPrice) VALUES (@projectId, @desc, @qty, @price, @total)`, { projectId: { type: sql.Int, value: parseInt(req.params.id) }, desc: { type: sql.NVarChar(sql.MAX), value: description.trim() }, qty: { type: sql.Float, value: parseFloat(qty) || 1 }, price: { type: sql.Float, value: parseFloat(price) || 0 }, total: { type: sql.Float, value: parseFloat(total) || 0 } });
+    await query(`INSERT INTO Items (ProjectNo, Description, Qty, Price, ExtPrice, qb_item_name) VALUES (@projectId, @desc, @qty, @price, @total, @qbItem)`, { projectId: { type: sql.Int, value: parseInt(req.params.id) }, desc: { type: sql.NVarChar(sql.MAX), value: description.trim() }, qty: { type: sql.Float, value: parseFloat(qty) || 1 }, price: { type: sql.Float, value: parseFloat(price) || 0 }, total: { type: sql.Float, value: parseFloat(total) || 0 }, qbItem: { type: sql.NVarChar(100), value: qb_item_name || null } });
     res.status(201).json({ message: 'Item added' });
   } catch (e) { res.status(500).json({ message: 'Failed to add item', detail: e.message }); }
 });
