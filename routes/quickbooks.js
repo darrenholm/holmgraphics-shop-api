@@ -185,11 +185,11 @@ router.get('/summary', async (req, res) => {
   try {
     const rows = await dbQuery(`
       SELECT
-        COUNT(*) FILTER (WHERE qb_customer_id IS NOT NULL) AS synced,
-        COUNT(*) FILTER (WHERE qb_customer_id IS NULL) AS pending,
+        SUM(CASE WHEN qb_customer_id IS NOT NULL THEN 1 ELSE 0 END) AS synced,
+        SUM(CASE WHEN qb_customer_id IS NULL THEN 1 ELSE 0 END) AS pending,
         0 AS cancelled,
         0 AS synced_revenue,
-        MAX() AS last_synced_at
+        NULL AS last_synced_at
       FROM Clients
     `);
     res.json(rows[0]);
