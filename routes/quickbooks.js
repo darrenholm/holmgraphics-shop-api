@@ -189,8 +189,8 @@ router.get('/summary', async (req, res) => {
         COUNT(*) FILTER (WHERE qb_customer_id IS NULL) AS pending,
         0 AS cancelled,
         0 AS synced_revenue,
-        MAX(created_at) AS last_synced_at
-      FROM clients
+        MAX() AS last_synced_at
+      FROM Clients
     `);
     res.json(rows[0]);
   } catch (err) {
@@ -278,7 +278,7 @@ router.get('/clients/status', async (req, res) => {
         COUNT(*) AS total,
         COUNT(qb_customer_id) AS synced_to_qb,
         COUNT(*) - COUNT(qb_customer_id) AS not_in_qb
-      FROM clients
+      FROM Clients
     `);
     res.json(rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -318,7 +318,7 @@ router.get('/clients/qb-list', async (req, res) => {
 // POST /api/quickbooks/clients/push  — push all unsynced local clients to QB
 router.post('/clients/push', async (req, res) => {
   try {
-    const unsynced = await dbQuery(`SELECT * FROM clients WHERE qb_customer_id IS NULL`);
+    const unsynced = await dbQuery(`SELECT * FROM Clients WHERE qb_customer_id IS NULL`);
     const results = { pushed: 0, failed: 0, errors: [] };
 
     for (const client of unsynced) {
@@ -343,7 +343,7 @@ router.post('/clients/push', async (req, res) => {
         }
 
         if (qbId) {
-          await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
+          await dbQuery(`UPDATE Clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
           results.pushed++;
         }
       } catch (err) {
@@ -358,7 +358,7 @@ router.post('/clients/push', async (req, res) => {
 // POST /api/quickbooks/clients/push/:id  — push single client to QB
 router.post('/clients/push/:id', async (req, res) => {
   try {
-    const clients = await dbQuery(`SELECT * FROM clients WHERE id = $1`, [req.params.id]);
+    const clients = await dbQuery(`SELECT * FROM Clients WHERE id = $1`, [req.params.id]);
     if (!clients.length) return res.status(404).json({ error: 'Client not found' });
     const client = clients[0];
     if (client.qb_customer_id) return res.json({ already_synced: true, qb_customer_id: client.qb_customer_id });
@@ -374,7 +374,7 @@ router.post('/clients/push/:id', async (req, res) => {
       ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {})
     });
     const qbId = created?.Customer?.Id;
-    if (qbId) await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
+    if (qbId) await dbQuery(`UPDATE Clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
     res.json({ success: true, qb_customer_id: qbId, display_name: displayName });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -396,21 +396,21 @@ router.post('/clients/pull', async (req, res) => {
 
       for (const cust of customers) {
         try {
-          const existing = await dbQuery(`SELECT id FROM clients WHERE qb_customer_id = $1`, [cust.Id]);
+          const existing = await dbQuery(`SELECT id FROM Clients WHERE qb_customer_id = $1`, [cust.Id]);
           if (existing.length) { results.skipped++; continue; }
 
           const email = cust.PrimaryEmailAddr?.Address || null;
           if (email) {
-            const byEmail = await dbQuery(`SELECT id FROM clients WHERE email = $1 AND qb_customer_id IS NULL`, [email]);
+            const byEmail = await dbQuery(`SELECT id FROM Clients WHERE email = $1 AND qb_customer_id IS NULL`, [email]);
             if (byEmail.length) {
-              await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [cust.Id, byEmail[0].id]);
+              await dbQuery(`UPDATE Clients SET qb_customer_id = $1 WHERE id = $2`, [cust.Id, byEmail[0].id]);
               results.updated++;
               continue;
             }
           }
 
           await dbQuery(
-            `INSERT INTO clients (company, fname, lname, email, qb_customer_id, created_at) VALUES ($1, $2, $3, $4, $5, NOW())`,
+            `INSERT INTO Clients (company, fname, lname, email, qb_customer_id) VALUES ($1, $2, $3, $4, $5)`,
             [cust.CompanyName || cust.DisplayName || '', cust.GivenName || '', cust.FamilyName || '', email, cust.Id]
           );
           results.imported++;
@@ -430,9 +430,9 @@ router.post('/clients/link', async (req, res) => {
   try {
     const { client_id, qb_customer_id } = req.body;
     if (!client_id || !qb_customer_id) return res.status(400).json({ error: 'client_id and qb_customer_id are required' });
-    const clients = await dbQuery(`SELECT id FROM clients WHERE id = $1`, [client_id]);
+    const clients = await dbQuery(`SELECT id FROM Clients WHERE id = $1`, [client_id]);
     if (!clients.length) return res.status(404).json({ error: 'Client not found' });
-    await dbQuery(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qb_customer_id, client_id]);
+    await dbQuery(`UPDATE Clients SET qb_customer_id = $1 WHERE id = $2`, [qb_customer_id, client_id]);
     res.json({ success: true, client_id, qb_customer_id });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
