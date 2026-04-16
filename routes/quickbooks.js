@@ -222,9 +222,9 @@ router.get('/taxcodes', async (req, res) => {
 // POST /api/quickbooks/invoice/project/:id
 router.post('/invoice/project/:id', async (req, res) => {
   try {
-    const { client_name, client_email, description, total_amount, project_number } = req.body;
-    if (!client_name || !total_amount) {
-      return res.status(400).json({ error: 'client_name and total_amount are required' });
+    const { client_name, client_email, description, items, project_number } = req.body;
+    if (!client_name || !items?.length) {
+      return res.status(400).json({ error: 'client_name and items are required' });
     }
 
     // Find or create QB customer
@@ -242,28 +242,40 @@ router.post('/invoice/project/:id', async (req, res) => {
       if (!customerId) throw new Error('Failed to create QB customer');
     }
 
-    // Look up the 'Misc' item in QB for the ItemRef
+    // Look up the 'Misc' fallback item
     const itemSearch = await qbGet(
       `/query?query=${encodeURIComponent(`SELECT * FROM Item WHERE Name = 'Misc' MAXRESULTS 1`)}`
     );
     const miscItemId = itemSearch?.QueryResponse?.Item?.[0]?.Id || '1';
 
-    // Create invoice with HST ON (tax code ID 7) via minorversion=65
+    // Build Line array — look up each item's QB item ID by name
+    const Line = await Promise.all(items.map(async (item) => {
+      let itemId = miscItemId;
+      if (item.qb_item_name) {
+        const s = await qbGet(
+          `/query?query=${encodeURIComponent(`SELECT * FROM Item WHERE Name = '${item.qb_item_name.replace(/'/g,"\\'")}' MAXRESULTS 1`)}`
+        );
+        itemId = s?.QueryResponse?.Item?.[0]?.Id || miscItemId;
+      }
+      return {
+        Amount:      parseFloat(item.total),
+        DetailType:  'SalesItemLineDetail',
+        Description: item.description || '',
+        SalesItemLineDetail: {
+          ItemRef:    { value: itemId },
+          UnitPrice:  parseFloat(item.unit_price),
+          Qty:        parseFloat(item.qty),
+          TaxCodeRef: { value: '7' }
+        }
+      };
+    }));
+
+    // Create invoice
     const invData = await qbPost('/invoice?minorversion=65', {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
-      Line: [{
-        Amount:      parseFloat(total_amount),
-        DetailType:  'SalesItemLineDetail',
-        Description: description || `Project #${project_number || req.params.id}`,
-        SalesItemLineDetail: {
-          ItemRef:    { value: miscItemId },
-          UnitPrice:  parseFloat(total_amount),
-          Qty:        1,
-          TaxCodeRef: { value: '7' }
-        }
-      }],
+      Line,
       TxnTaxDetail: {
         TxnTaxCodeRef: { value: '7' },
         TotalTax: 0
