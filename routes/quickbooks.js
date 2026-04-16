@@ -17,6 +17,9 @@ const QB_TOKEN_URL  = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer
 const QB_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
 const SCOPES        = 'com.intuit.quickbooks.accounting';
 
+// HST ON tax code ID (from QB TaxCode query — "HST (ON)Only", Id: 7)
+const HST_TAX_CODE_ID = '7';
+
 function QB_BASE() {
   return process.env.NODE_ENV === 'production'
     ? 'https://quickbooks.api.intuit.com'
@@ -89,7 +92,6 @@ async function dbQuery(sql_text, params = []) {
   const { getPool, sql } = require('../db/connection');
   const pool = await getPool();
   const request = pool.request();
-  // Convert positional params ($1,$2) to mssql named params
   let i = 0;
   const converted = sql_text.replace(/\$\d+/g, () => {
     const name = `p${i}`;
@@ -208,11 +210,7 @@ router.post('/sync/all', async (req, res) => {
   res.json({ synced: 0, failed: 0, errors: [], message: 'Use /clients/push to sync clients' });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TAX CODES (temp diagnostic route)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// GET /api/quickbooks/taxcodes
+// GET /api/quickbooks/taxcodes  — diagnostic route
 router.get('/taxcodes', async (req, res) => {
   try {
     const data = await qbGet(`/query?query=${encodeURIComponent('SELECT * FROM TaxCode')}`);
@@ -253,12 +251,8 @@ router.post('/invoice/project/:id', async (req, res) => {
     );
     const miscItemId = itemSearch?.QueryResponse?.Item?.[0]?.Id || '1';
 
-    // Look up HST ON tax code
-    const taxData = await qbGet(`/query?query=${encodeURIComponent("SELECT * FROM TaxCode WHERE Name = 'HST ON' MAXRESULTS 1")}`);
-    const taxCodeId = taxData?.QueryResponse?.TaxCode?.[0]?.Id || null;
-
-    // Create invoice
-    const invoiceBody = {
+    // Create invoice with HST ON tax (code ID 7)
+    const invData = await qbPost('/invoice', {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
@@ -273,11 +267,11 @@ router.post('/invoice/project/:id', async (req, res) => {
           TaxCodeRef: { value: 'TAX' }
         }
       }],
-      ...(taxCodeId ? { TxnTaxDetail: { TxnTaxCodeRef: { value: taxCodeId } } } : {}),
+      TxnTaxDetail: {
+        TxnTaxCodeRef: { value: HST_TAX_CODE_ID }
+      },
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
-    };
-
-    const invData = await qbPost('/invoice', invoiceBody);
+    });
 
     const invoice = invData.Invoice;
     res.json({
