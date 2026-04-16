@@ -209,6 +209,18 @@ router.post('/sync/all', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TAX CODES (temp diagnostic route)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/quickbooks/taxcodes
+router.get('/taxcodes', async (req, res) => {
+  try {
+    const data = await qbGet(`/query?query=${encodeURIComponent('SELECT * FROM TaxCode')}`);
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // INVOICE
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -241,24 +253,31 @@ router.post('/invoice/project/:id', async (req, res) => {
     );
     const miscItemId = itemSearch?.QueryResponse?.Item?.[0]?.Id || '1';
 
+    // Look up HST ON tax code
+    const taxData = await qbGet(`/query?query=${encodeURIComponent("SELECT * FROM TaxCode WHERE Name = 'HST ON' MAXRESULTS 1")}`);
+    const taxCodeId = taxData?.QueryResponse?.TaxCode?.[0]?.Id || null;
+
     // Create invoice
-    const invData = await qbPost('/invoice', {
+    const invoiceBody = {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
       Line: [{
-  Amount:      parseFloat(total_amount),
-  DetailType:  'SalesItemLineDetail',
-  Description: description || `Project #${project_number || req.params.id}`,
-  SalesItemLineDetail: {
-    ItemRef:    { value: miscItemId },
-    UnitPrice:  parseFloat(total_amount),
-    Qty:        1,
-    TaxCodeRef: { value: 'TAX' }
-  }
-}],
+        Amount:      parseFloat(total_amount),
+        DetailType:  'SalesItemLineDetail',
+        Description: description || `Project #${project_number || req.params.id}`,
+        SalesItemLineDetail: {
+          ItemRef:    { value: miscItemId },
+          UnitPrice:  parseFloat(total_amount),
+          Qty:        1,
+          TaxCodeRef: { value: 'TAX' }
+        }
+      }],
+      ...(taxCodeId ? { TxnTaxDetail: { TxnTaxCodeRef: { value: taxCodeId } } } : {}),
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
-    });
+    };
+
+    const invData = await qbPost('/invoice', invoiceBody);
 
     const invoice = invData.Invoice;
     res.json({
