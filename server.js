@@ -8,7 +8,8 @@ const fs      = require('fs');
 const authRoutes    = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
 const lookupRoutes  = require('./routes/lookup');
-
+const ssRouter = require('./routes/ss');
+app.use('/api/ss', ssRouter);
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
