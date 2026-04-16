@@ -8,8 +8,6 @@ const fs      = require('fs');
 const authRoutes    = require('./routes/auth');
 const projectRoutes = require('./routes/projects');
 const lookupRoutes  = require('./routes/lookup');
-const ssRouter = require('./routes/ss');
-app.use('/api/ss', ssRouter);
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -41,6 +39,8 @@ app.use('/api/auth',     authRoutes);
 app.use('/api/projects', projectRoutes);
 app.use('/api',          lookupRoutes);
 app.use('/api/quickbooks', require('./routes/quickbooks'));
+const ssRouter = require('./routes/ss');
+app.use('/api/ss', ssRouter);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
