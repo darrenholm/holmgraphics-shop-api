@@ -247,15 +247,16 @@ router.post('/invoice/project/:id', async (req, res) => {
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
       Line: [{
-        Amount:      parseFloat(total_amount),
-        DetailType:  'SalesItemLineDetail',
-        Description: description || `Project #${project_number || req.params.id}`,
-        SalesItemLineDetail: {
-          ItemRef:   { value: miscItemId },
-          UnitPrice: parseFloat(total_amount),
-          Qty:       1
-        }
-      }],
+  Amount:      parseFloat(total_amount),
+  DetailType:  'SalesItemLineDetail',
+  Description: description || `Project #${project_number || req.params.id}`,
+  SalesItemLineDetail: {
+    ItemRef:    { value: miscItemId },
+    UnitPrice:  parseFloat(total_amount),
+    Qty:        1,
+    TaxCodeRef: { value: 'TAX' }
+  }
+}],
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
     });
 
