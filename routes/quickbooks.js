@@ -325,6 +325,18 @@ router.get('/clients/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/quickbooks/clients/search?q=term  — direct QB customer search
+router.get('/clients/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').replace(/'/g, "\\'");
+    if (!q) return res.json([]);
+    const data = await qbGet(
+      `/query?query=${encodeURIComponent(`SELECT * FROM Customer WHERE DisplayName LIKE '%${q}%' MAXRESULTS 20`)}`
+    );
+    res.json(data?.QueryResponse?.Customer || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/quickbooks/clients/qb-list
 router.get('/clients/qb-list', async (req, res) => {
   try {
