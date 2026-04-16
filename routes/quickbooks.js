@@ -256,17 +256,18 @@ router.post('/invoice/project/:id', async (req, res) => {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
-      Line: [{
-        Amount:      parseFloat(total_amount),
-        DetailType:  'SalesItemLineDetail',
-        Description: description || `Project #${project_number || req.params.id}`,
-        SalesItemLineDetail: {
-          ItemRef:    { value: miscItemId },
-          UnitPrice:  parseFloat(total_amount),
-          Qty:        1,
-          TaxCodeRef: { value: 'TAX' }
-        }
-      }],
+ Line: [{
+  Amount:      parseFloat(total_amount),
+  DetailType:  'SalesItemLineDetail',
+  Description: description || `Project #${project_number || req.params.id}`,
+  SalesItemLineDetail: {
+    ItemRef:    { value: miscItemId },
+    UnitPrice:  parseFloat(total_amount),
+    Qty:        1,
+    TaxCodeRef: { value: 'NON' }
+  }
+}],
+// Remove TxnTaxDetail entirely
       TxnTaxDetail: {
         TxnTaxCodeRef: { value: HST_TAX_CODE_ID }
       },
