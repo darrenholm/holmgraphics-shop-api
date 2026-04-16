@@ -7,6 +7,9 @@ const express = require('express');
 const router  = express.Router();
 const crypto  = require('crypto');
 
+// HST ON tax code ID (from QB TaxCode query — "HST (ON)Only", Id: 7)
+const HST_TAX_CODE_ID = '7';
+
 // ─── Auth middleware (passthrough for now) ────────────────────────────────────
 const authenticateToken = (req, res, next) => next();
 const requireAdmin      = (req, res, next) => next();
@@ -16,9 +19,6 @@ const QB_AUTH_URL   = 'https://appcenter.intuit.com/connect/oauth2';
 const QB_TOKEN_URL  = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 const QB_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
 const SCOPES        = 'com.intuit.quickbooks.accounting';
-
-// HST ON tax code ID (from QB TaxCode query — "HST (ON)Only", Id: 7)
-const HST_TAX_CODE_ID = '7';
 
 function QB_BASE() {
   return process.env.NODE_ENV === 'production'
@@ -251,26 +251,22 @@ router.post('/invoice/project/:id', async (req, res) => {
     );
     const miscItemId = itemSearch?.QueryResponse?.Item?.[0]?.Id || '1';
 
-    // Create invoice with HST ON tax (code ID 7)
+    // Create invoice — let QB handle tax automatically via AutoTax
     const invData = await qbPost('/invoice', {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
- Line: [{
-  Amount:      parseFloat(total_amount),
-  DetailType:  'SalesItemLineDetail',
-  Description: description || `Project #${project_number || req.params.id}`,
-  SalesItemLineDetail: {
-    ItemRef:    { value: miscItemId },
-    UnitPrice:  parseFloat(total_amount),
-    Qty:        1,
-    TaxCodeRef: { value: 'NON' }
-  }
-}],
-// Remove TxnTaxDetail entirely
-      TxnTaxDetail: {
-        TxnTaxCodeRef: { value: HST_TAX_CODE_ID }
-      },
+      AutoTax:     true,
+      Line: [{
+        Amount:      parseFloat(total_amount),
+        DetailType:  'SalesItemLineDetail',
+        Description: description || `Project #${project_number || req.params.id}`,
+        SalesItemLineDetail: {
+          ItemRef:   { value: miscItemId },
+          UnitPrice: parseFloat(total_amount),
+          Qty:       1
+        }
+      }],
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
     });
 
