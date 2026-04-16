@@ -147,6 +147,25 @@ router.post('/clients', requireStaff, async (req, res) => {
     res.status(201).json({ id: result[0]?.id, message: 'Client created' });
   } catch (e) { res.status(500).json({ message: 'Failed to create client', detail: e.message }); }
 });
+
+// ─── PATCH /api/clients/:id ──────────────────────────────────────────────────
+router.patch('/clients/:id', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { company } = req.body;
+  if (!company?.trim()) return res.status(400).json({ message: 'Company name required' });
+  try {
+    await query(
+      `UPDATE Clients SET Company = @company WHERE ID = @id`,
+      {
+        company: { type: sql.NVarChar(255), value: company.trim() },
+        id:      { type: sql.Int, value: id }
+      }
+    );
+    res.json({ message: 'Client updated' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to update client', detail: e.message });
+  }
+});
 module.exports = router;
 
 
