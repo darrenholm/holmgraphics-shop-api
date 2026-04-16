@@ -235,19 +235,25 @@ router.post('/invoice/project/:id', async (req, res) => {
       if (!customerId) throw new Error('Failed to create QB customer');
     }
 
+    // Look up the 'Misc' item in QB for the ItemRef
+    const itemSearch = await qbGet(
+      `/query?query=${encodeURIComponent(`SELECT * FROM Item WHERE Name = 'Misc' MAXRESULTS 1`)}`
+    );
+    const miscItemId = itemSearch?.QueryResponse?.Item?.[0]?.Id || '1';
+
     // Create invoice
     const invData = await qbPost('/invoice', {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
       PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
       Line: [{
-        Amount: parseFloat(total_amount),
-        DetailType: 'SalesItemLineDetail',
+        Amount:      parseFloat(total_amount),
+        DetailType:  'SalesItemLineDetail',
         Description: description || `Project #${project_number || req.params.id}`,
         SalesItemLineDetail: {
-          ItemRef: { value: '1', name: 'Services' },
+          ItemRef:   { value: miscItemId },
           UnitPrice: parseFloat(total_amount),
-          Qty: 1
+          Qty:       1
         }
       }],
       ...(client_email ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' } : {})
@@ -288,8 +294,8 @@ router.get('/clients/status', async (req, res) => {
 router.get('/clients/list', async (req, res) => {
   try {
     const rows = await dbQuery(`
-     SELECT id, company, fname, lname, CAST(email AS NVARCHAR(500)) as email, qb_customer_id
-FROM Clients ORDER BY company ASC, lname ASC
+      SELECT id, company, fname, lname, CAST(email AS NVARCHAR(500)) as email, qb_customer_id
+      FROM Clients ORDER BY company ASC, lname ASC
     `);
     res.json(rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
