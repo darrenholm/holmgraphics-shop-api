@@ -5,11 +5,10 @@ const cors    = require('cors');
 const path    = require('path');
 const fs      = require('fs');
 
-const authRoutes    = require('./routes/auth');
-const projectRoutes = require('./routes/projects');
-const lookupRoutes  = require('./routes/lookup');
-// QuickBooks routes are still a work-in-progress and not mounted yet.
-// const quickbooksRoutes = require('./routes/quickbooks');
+const authRoutes       = require('./routes/auth');
+const projectRoutes    = require('./routes/projects');
+const lookupRoutes     = require('./routes/lookup');
+const quickbooksRoutes = require('./routes/quickbooks');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -38,10 +37,10 @@ app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-app.use('/api/auth',     authRoutes);
-app.use('/api/projects', projectRoutes);
-app.use('/api',          lookupRoutes);
-// app.use('/api/quickbooks', quickbooksRoutes);  // not ready yet
+app.use('/api/auth',       authRoutes);
+app.use('/api/projects',   projectRoutes);
+app.use('/api',            lookupRoutes);
+app.use('/api/quickbooks', quickbooksRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
