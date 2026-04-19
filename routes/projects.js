@@ -88,6 +88,17 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
+// ─── GET /api/projects/qb-items ──────────────────────────────────────────────
+// Stub. QuickBooks item catalog isn't wired up against Railway yet — the
+// QB integration lives on the `qb-work-preserve` branch and still needs to
+// be ported onto the pg foundation. Returning [] keeps the frontend's job
+// detail page from choking when it tries to `.reduce()` the result.
+//
+// MUST be defined before `/:id` or Express matches "qb-items" as an :id.
+// Must be public (no requireAuth) — the frontend fetch at
+// src/routes/jobs/[id]/+page.svelte:159 doesn't send the auth token.
+router.get('/qb-items', (req, res) => res.json([]));
+
 // ─── GET /api/projects/:id ───────────────────────────────────────────────────
 router.get('/:id', requireAuth, async (req, res) => {
   try {
