@@ -357,6 +357,51 @@ router.post('/:id/items', requireStaff, async (req, res) => {
   }
 });
 
+// ─── PUT /api/projects/:id/items/:itemId ─────────────────────────────────────
+router.put('/:id/items/:itemId', requireStaff, async (req, res) => {
+  const { description, qty, price, total } = req.body;
+  if (!description?.trim()) return res.status(400).json({ message: 'Description required' });
+  try {
+    const rows = await query(
+      `UPDATE items
+          SET description = $1,
+              qty         = $2,
+              price       = $3,
+              ext_price   = $4
+        WHERE id = $5 AND project_id = $6
+        RETURNING id`,
+      [
+        description.trim(),
+        parseFloat(qty) || 1,
+        parseFloat(price) || 0,
+        parseFloat(total) || 0,
+        parseInt(req.params.itemId),
+        parseInt(req.params.id),
+      ]
+    );
+    if (rows.length === 0) return res.status(404).json({ message: 'Item not found' });
+    res.json({ message: 'Item updated' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to update item', detail: e.message });
+  }
+});
+
+// ─── DELETE /api/projects/:id/items/:itemId ──────────────────────────────────
+router.delete('/:id/items/:itemId', requireStaff, async (req, res) => {
+  try {
+    const rows = await query(
+      `DELETE FROM items
+        WHERE id = $1 AND project_id = $2
+        RETURNING id`,
+      [parseInt(req.params.itemId), parseInt(req.params.id)]
+    );
+    if (rows.length === 0) return res.status(404).json({ message: 'Item not found' });
+    res.json({ message: 'Item deleted' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to delete item', detail: e.message });
+  }
+});
+
 // ─── POST /api/projects/:id/measurements ─────────────────────────────────────
 router.post('/:id/measurements', requireStaff, async (req, res) => {
   const { item, width, height, notes } = req.body;
