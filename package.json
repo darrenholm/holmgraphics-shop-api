@@ -1,7 +1,7 @@
 {
   "name": "holmgraphics-api",
   "version": "1.0.0",
-  "description": "Holm Graphics Shop — Express API for HolmGraphicsMain Azure SQL",
+  "description": "Holm Graphics Shop — Express API for HolmGraphicsMain Railway Postgres",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,8 +13,8 @@
     "dotenv": "^16.4.5",
     "express": "^4.18.3",
     "jsonwebtoken": "^9.0.2",
-    "mssql": "^11.0.1",
-    "multer": "^2.1.1"
+    "multer": "^2.1.1",
+    "pg": "^8.11.5"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

@@ -1,53 +1,43 @@
 // db/connection.js
-// Azure SQL connection pool using mssql (tedious driver)
+// Railway Postgres connection pool using node-postgres (`pg`).
+//
+// Parameterized queries use positional placeholders: $1, $2, $3 ...
+// The `params` argument is an ordinary array, e.g.:
+//    query('SELECT * FROM clients WHERE id = $1', [id])
 require('dotenv').config();
-const sql = require('mssql');
+const { Pool } = require('pg');
 
-const config = {
-  server: process.env.DB_SERVER,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  port: parseInt(process.env.DB_PORT) || 1433,
-  options: {
-    encrypt: true,           // Required for Azure SQL
-    trustServerCertificate: false,
-    enableArithAbort: true,
-    connectTimeout: 30000,
-    requestTimeout: 30000,
-  },
-  pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000
-  }
-};
-
-let pool = null;
-
-async function getPool() {
-  if (pool) return pool;
-  pool = await sql.connect(config);
-  console.log('✅ Connected to Azure SQL:', process.env.DB_SERVER);
-  return pool;
+// DATABASE_URL is injected by Railway for services attached to a Postgres
+// plugin. For local dev, set it in .env to the *public* proxy URL from
+// Railway dashboard → Postgres → Connect ("DATABASE_PUBLIC_URL").
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) {
+  console.error('FATAL: DATABASE_URL is not set. Add it to .env (local dev) '
+    + 'or attach the Postgres service in Railway (production).');
+  process.exit(1);
 }
 
-// Helper: run a parameterized query and return rows
-async function query(text, params = {}) {
-  const p = await getPool();
-  const request = p.request();
-  // Bind named parameters: { name: { type: sql.VarChar, value: 'x' } }
-  for (const [key, { type, value }] of Object.entries(params)) {
-    request.input(key, type, value);
-  }
-  const result = await request.query(text);
-  return result.recordset;
+const pool = new Pool({
+  connectionString,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+pool.on('error', (err) => {
+  console.error('Postgres pool error:', err);
+});
+
+// Run a parameterized query; returns an array of rows (possibly empty).
+async function query(text, params = []) {
+  const result = await pool.query(text, params);
+  return result.rows;
 }
 
-// Helper: run query, return first row or null
-async function queryOne(text, params = {}) {
+// Run a query and return the first row, or null.
+async function queryOne(text, params = []) {
   const rows = await query(text, params);
   return rows[0] || null;
 }
 
-module.exports = { sql, getPool, query, queryOne };
+module.exports = { pool, query, queryOne };

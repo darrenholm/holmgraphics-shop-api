@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+
+# Contains plaintext passwords — edit locally, never commit
+db/set-passwords.js
