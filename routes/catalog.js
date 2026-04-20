@@ -43,6 +43,12 @@ router.get('/search', async (req, res) => {
       .flatMap((b) => String(b).split(','))
       .map((b) => b.trim())
       .filter(Boolean);
+    const categoriesParam = req.query.category;
+    const categoryList = []
+      .concat(categoriesParam || [])
+      .flatMap((c) => String(c).split(','))
+      .map((c) => c.trim().toLowerCase())
+      .filter(Boolean);
     const supplier = typeof req.query.supplier === 'string' ? req.query.supplier.trim() : '';
     const inStockOnly = req.query.in_stock === '1' || req.query.in_stock === 'true';
     const includeDiscontinued =
@@ -68,6 +74,10 @@ router.get('/search', async (req, res) => {
       params.push(brandList.map((b) => b.toLowerCase()));
       where.push(`LOWER(p.brand) = ANY($${params.length}::text[])`);
     }
+    if (categoryList.length) {
+      params.push(categoryList);
+      where.push(`p.category = ANY($${params.length}::text[])`);
+    }
     if (supplier) {
       params.push(supplier);
       where.push(`s.code = $${params.length}`);
@@ -83,6 +93,8 @@ router.get('/search', async (req, res) => {
         p.product_name,
         p.fr_product_name,
         p.brand,
+        p.category,
+        p.category_raw,
         s.code AS supplier,
         s.name AS supplier_name,
         p.is_discontinued,
@@ -133,6 +145,29 @@ router.get('/search', async (req, res) => {
   }
 });
 
+// ─── GET /api/catalog/categories ─────────────────────────────────────────────
+// Canonicalized category buckets with product counts. Powers the category
+// pill bar in the storefront. Rows where category is still NULL (awaiting
+// backfill) fall under an '__unclassified' bucket so we can see progress.
+router.get('/categories', async (req, res) => {
+  try {
+    const rows = await query(`
+      SELECT
+        COALESCE(p.category, '__unclassified') AS category,
+        COUNT(*)::int AS product_count
+      FROM supplier_product p
+      WHERE p.is_sellable = TRUE
+        AND p.is_discontinued = FALSE
+      GROUP BY COALESCE(p.category, '__unclassified')
+      ORDER BY COUNT(*) DESC
+    `);
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /catalog/categories:', e);
+    res.status(500).json({ message: 'Failed to load categories', detail: e.message });
+  }
+});
+
 // ─── GET /api/catalog/brands ─────────────────────────────────────────────────
 // Distinct brands across all suppliers, with a count of active products
 // per brand (useful for showing "(42)" beside each in filter UI).
@@ -176,6 +211,8 @@ router.get('/:supplier/:style', async (req, res) => {
         p.description,
         p.fr_description,
         p.brand,
+        p.category,
+        p.category_raw,
         p.discount_code,
         p.price_group,
         p.youth,
