@@ -323,7 +323,8 @@ router.get('/:id/items', requireAuth, async (req, res) => {
   try {
     const rows = await query(
       `SELECT id, description AS item_name, qty AS quantity,
-              price AS unit_price, ext_price AS total
+              price AS unit_price, ext_price AS total,
+              qb_item_name
          FROM items
         WHERE project_id = $1
         ORDER BY id`,
@@ -337,18 +338,19 @@ router.get('/:id/items', requireAuth, async (req, res) => {
 
 // ─── POST /api/projects/:id/items ────────────────────────────────────────────
 router.post('/:id/items', requireStaff, async (req, res) => {
-  const { description, qty, price, total } = req.body;
+  const { description, qty, price, total, qb_item_name } = req.body;
   if (!description?.trim()) return res.status(400).json({ message: 'Description required' });
   try {
     await query(
-      `INSERT INTO items (project_id, description, qty, price, ext_price)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO items (project_id, description, qty, price, ext_price, qb_item_name)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         parseInt(req.params.id),
         description.trim(),
         parseFloat(qty) || 1,
         parseFloat(price) || 0,
         parseFloat(total) || 0,
+        qb_item_name || null,
       ]
     );
     res.status(201).json({ message: 'Item added' });
@@ -359,22 +361,24 @@ router.post('/:id/items', requireStaff, async (req, res) => {
 
 // ─── PUT /api/projects/:id/items/:itemId ─────────────────────────────────────
 router.put('/:id/items/:itemId', requireStaff, async (req, res) => {
-  const { description, qty, price, total } = req.body;
+  const { description, qty, price, total, qb_item_name } = req.body;
   if (!description?.trim()) return res.status(400).json({ message: 'Description required' });
   try {
     const rows = await query(
       `UPDATE items
-          SET description = $1,
-              qty         = $2,
-              price       = $3,
-              ext_price   = $4
-        WHERE id = $5 AND project_id = $6
+          SET description  = $1,
+              qty          = $2,
+              price        = $3,
+              ext_price    = $4,
+              qb_item_name = $5
+        WHERE id = $6 AND project_id = $7
         RETURNING id`,
       [
         description.trim(),
         parseFloat(qty) || 1,
         parseFloat(price) || 0,
         parseFloat(total) || 0,
+        qb_item_name || null,
         parseInt(req.params.itemId),
         parseInt(req.params.id),
       ]
