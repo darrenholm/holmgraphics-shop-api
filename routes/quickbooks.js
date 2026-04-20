@@ -294,14 +294,19 @@ router.post('/invoice/project/:id', async (req, res) => {
     const Line = await Promise.all(items.map(async (item) => {
       let itemId = miscItemId;
       if (item.qb_item_name) {
-        // Exclude Category rows — QB stores categories in the Item table too,
-        // and picking a category causes "Invalid Reference Id" (code 2500).
+        // QB stores categories in the Item table alongside products. If a
+        // category shares the name of an invoiceable item (e.g. "Vehicles"),
+        // picking the category causes "Invalid Reference Id" (code 2500).
+        // QBQL doesn't support Type != 'Category' (code 2090), so fetch all
+        // matches and filter client-side.
         const s = await qbGet(
           `/query?query=${encodeURIComponent(
-            `SELECT * FROM Item WHERE Name = '${item.qb_item_name.replace(/'/g, "\\'")}' AND Type != 'Category' MAXRESULTS 1`
+            `SELECT * FROM Item WHERE Name = '${item.qb_item_name.replace(/'/g, "\\'")}'`
           )}`
         );
-        itemId = s?.QueryResponse?.Item?.[0]?.Id || miscItemId;
+        const hits = s?.QueryResponse?.Item || [];
+        const product = hits.find((i) => i.Type !== 'Category') || null;
+        itemId = product?.Id || miscItemId;
       }
       return {
         Amount:      parseFloat(item.total),
