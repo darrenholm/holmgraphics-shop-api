@@ -30,12 +30,20 @@ async function connectFtp(timeoutMs = 15000) {
   if (!whcConfigured()) throw new Error('WHC FTP env vars not configured');
   const client = new ftp.Client(timeoutMs);
   client.ftp.verbose = false;
+  // WHC's shared hosting serves a TLS cert for the box's own hostname
+  // (srv22.swhc.ca), not our vanity ftp.holmgraphics.ca alias. The connection
+  // is still encrypted, and we have to use the vanity hostname for cPanel
+  // to route auth to the right account — so skip strict hostname matching.
   await client.access({
     host:     WHC_HOST,
     port:     WHC_PORT,
     user:     WHC_USER,
     password: WHC_PASS,
     secure:   WHC_SECURE,
+    secureOptions: WHC_SECURE ? {
+      // Trust the cert even though its CN/altnames don't include our vanity host.
+      checkServerIdentity: () => undefined,
+    } : undefined,
   });
   return client;
 }
