@@ -191,6 +191,52 @@ router.get('/gallery', async (req, res) => {
   }
 });
 
+// ─── GET /api/projects/photos/all ────────────────────────────────────────────
+// ADMIN-ONLY. Returns every photo in the system with its parent project's
+// description + client name. Powers the bulk gallery curation page in the
+// shop app (/admin/gallery-curate). Sorted newest-first.
+//
+// Optional ?unpublished=1 narrows to rows where show_in_gallery=false so an
+// admin can blow through the backlog without scrolling past already-curated
+// photos.
+//
+// MUST be declared before /:id so Express doesn't match "photos" as :id.
+router.get('/photos/all', requireAdmin, async (req, res) => {
+  const onlyUnpublished = req.query.unpublished === '1' || req.query.unpublished === 'true';
+  try {
+    const rows = await query(
+      `SELECT ph.id,
+              ph.project_id,
+              ph.filename,
+              ph.category,
+              ph.show_in_gallery,
+              ph.uploaded_at,
+              p.description AS project_description,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+         FROM project_photos ph
+         JOIN projects p ON p.id = ph.project_id
+         LEFT JOIN clients c ON c.id = p.client_id
+        ${onlyUnpublished ? 'WHERE ph.show_in_gallery = FALSE' : ''}
+        ORDER BY ph.uploaded_at DESC, ph.id DESC`
+    );
+    const out = rows.map((r) => ({
+      id:                  r.id,
+      project_id:          r.project_id,
+      project_description: r.project_description,
+      client_name:         r.client_name,
+      filename:            r.filename,
+      category:            r.category,
+      show_in_gallery:     r.show_in_gallery,
+      uploaded:            r.uploaded_at,
+      url:                 `${WHC_PUBLIC_BASE}/${r.project_id}/${encodeURIComponent(r.filename)}`,
+    }));
+    res.json(out);
+  } catch (e) {
+    console.error('GET /photos/all:', e);
+    res.status(500).json({ message: 'Failed to load photos', detail: e.message });
+  }
+});
+
 // ─── GET /api/projects/:id ───────────────────────────────────────────────────
 router.get('/:id', requireAuth, async (req, res) => {
   try {
