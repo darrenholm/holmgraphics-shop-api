@@ -6,28 +6,50 @@ const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff } = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const ftp = require('basic-ftp');
+const { Readable } = require('stream');
 const router = express.Router();
 
-// ─── File upload config (photos live on disk, not in DB) ─────────────────────
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = `uploads/jobs/${req.params.id}`;
-    fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, Date.now() + ext);
-  }
-});
+// ─── WHC photo storage config ────────────────────────────────────────────────
+// Photos live on WHC's cPanel hosting under public_html/shop-uploads/jobs/<id>/
+// because Railway's filesystem is ephemeral (wiped on redeploy). The API
+// streams uploaded files to WHC via FTPS (explicit, port 21 + AUTH TLS).
+const WHC_HOST        = process.env.WHC_FTP_HOST;
+const WHC_PORT        = parseInt(process.env.WHC_FTP_PORT || '21', 10);
+const WHC_USER        = process.env.WHC_FTP_USER;
+const WHC_PASS        = process.env.WHC_FTP_PASSWORD;
+const WHC_SECURE      = process.env.WHC_FTP_SECURE !== 'false'; // FTPS by default
+const WHC_REMOTE_BASE = (process.env.WHC_REMOTE_BASE || 'public_html/shop-uploads/jobs').replace(/\/$/, '');
+const WHC_PUBLIC_BASE = (process.env.WHC_PUBLIC_BASE || 'https://holmgraphics.ca/shop-uploads/jobs').replace(/\/$/, '');
+
+function whcConfigured() {
+  return Boolean(WHC_HOST && WHC_USER && WHC_PASS);
+}
+
+async function connectFtp(timeoutMs = 15000) {
+  if (!whcConfigured()) throw new Error('WHC FTP env vars not configured');
+  const client = new ftp.Client(timeoutMs);
+  client.ftp.verbose = false;
+  await client.access({
+    host:     WHC_HOST,
+    port:     WHC_PORT,
+    user:     WHC_USER,
+    password: WHC_PASS,
+    secure:   WHC_SECURE,
+  });
+  return client;
+}
+
+// ─── File upload config ──────────────────────────────────────────────────────
+// Memory storage: buffer each file in RAM, then stream to WHC via FTPS.
+// Never touches Railway's ephemeral filesystem.
 const upload = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = /jpeg|jpg|png|gif|webp/;
     cb(null, allowed.test(path.extname(file.originalname).toLowerCase()));
-  }
+  },
 });
 
 // ─── GET /api/projects ───────────────────────────────────────────────────────
@@ -428,41 +450,90 @@ router.post('/:id/measurements', requireStaff, async (req, res) => {
 });
 
 // ─── GET /api/projects/:id/photos ────────────────────────────────────────────
-// Photos are stored on the filesystem, not in the DB.
+// Photos are stored on WHC hosting under public_html/shop-uploads/jobs/<id>/
+// and served publicly from https://holmgraphics.ca/shop-uploads/jobs/<id>/.
+// This endpoint lists what's on WHC for the given project id.
 router.get('/:id/photos', requireAuth, async (req, res) => {
-  const dir = `uploads/jobs/${req.params.id}`;
+  const id = req.params.id;
+  const remoteDir = `${WHC_REMOTE_BASE}/${id}`;
+  let client;
   try {
-    if (!fs.existsSync(dir)) return res.json([]);
-    const files = fs.readdirSync(dir).map(f => ({
-      filename: f,
-      url: `/uploads/jobs/${req.params.id}/${f}`,
-      uploaded: fs.statSync(`${dir}/${f}`).mtime,
-    }));
+    client = await connectFtp();
+    let list;
+    try {
+      list = await client.list(remoteDir);
+    } catch (e) {
+      // Directory doesn't exist yet — no photos for this job.
+      return res.json([]);
+    }
+    const files = list
+      .filter((f) => f.isFile)
+      .map((f) => ({
+        filename: f.name,
+        url: `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(f.name)}`,
+        uploaded: f.modifiedAt || f.rawModifiedAt || null,
+      }));
     res.json(files);
   } catch (e) {
+    console.error('GET /:id/photos:', e);
     res.status(500).json({ message: 'Failed to load photos', detail: e.message });
+  } finally {
+    if (client) client.close();
   }
 });
 
+// ─── POST /api/projects/:id/photos ───────────────────────────────────────────
+// Streams each uploaded file's buffer to WHC via FTPS. Never writes to
+// Railway's ephemeral filesystem.
 router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req, res) => {
+  const id = req.params.id;
+  const remoteDir = `${WHC_REMOTE_BASE}/${id}`;
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ message: 'No files uploaded' });
+  }
+  let client;
   try {
-    const files = req.files.map(f => ({
-      filename: f.filename,
-      url: `/uploads/jobs/${req.params.id}/${f.filename}`,
-    }));
-    res.status(201).json({ message: `${files.length} photo(s) uploaded`, files });
+    client = await connectFtp(30000);
+    await client.ensureDir(remoteDir);
+    const uploaded = [];
+    for (const f of req.files) {
+      const ext = path.extname(f.originalname).toLowerCase() || '.jpg';
+      const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+      await client.uploadFrom(Readable.from(f.buffer), safeName);
+      uploaded.push({
+        filename: safeName,
+        url: `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(safeName)}`,
+      });
+    }
+    res.status(201).json({ message: `${uploaded.length} photo(s) uploaded`, files: uploaded });
   } catch (e) {
+    console.error('POST /:id/photos:', e);
     res.status(500).json({ message: 'Failed to upload photos', detail: e.message });
+  } finally {
+    if (client) client.close();
   }
 });
 
+// ─── DELETE /api/projects/:id/photos/:filename ───────────────────────────────
 router.delete('/:id/photos/:filename', requireStaff, async (req, res) => {
-  const filePath = `uploads/jobs/${req.params.id}/${req.params.filename}`;
+  const id = req.params.id;
+  // Strip any path separators so callers can't escape the job folder.
+  const filename = req.params.filename.replace(/[\/\\]/g, '');
+  const remotePath = `${WHC_REMOTE_BASE}/${id}/${filename}`;
+  let client;
   try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    client = await connectFtp();
+    try {
+      await client.remove(remotePath);
+    } catch (e) {
+      // Already gone — treat delete as idempotent.
+    }
     res.json({ message: 'Photo deleted' });
   } catch (e) {
+    console.error('DELETE /:id/photos:', e);
     res.status(500).json({ message: 'Failed to delete photo', detail: e.message });
+  } finally {
+    if (client) client.close();
   }
 });
 

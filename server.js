@@ -2,8 +2,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
-const path    = require('path');
-const fs      = require('fs');
 
 const authRoutes       = require('./routes/auth');
 const projectRoutes    = require('./routes/projects');
@@ -13,9 +11,8 @@ const quickbooksRoutes = require('./routes/quickbooks');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Ensure uploads folder exists ─────────────────────────────────────────────
-if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
-if (!fs.existsSync('uploads/jobs')) fs.mkdirSync('uploads/jobs');
+// Job photos are stored on WHC (see routes/projects.js), not on this server's
+// local disk — Railway's filesystem is ephemeral. No local uploads folder.
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173')
@@ -32,9 +29,6 @@ app.use(cors({
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
 app.use(express.json());
-
-// ─── Static uploads ───────────────────────────────────────────────────────────
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth',       authRoutes);
@@ -82,6 +76,6 @@ app.listen(PORT, () => {
   }
   console.log(`\nHolm Graphics API running on port ${PORT}`);
   console.log(`   Health:     http://localhost:${PORT}/api/health`);
-  console.log(`   Uploads:    http://localhost:${PORT}/uploads`);
+  console.log(`   Photos:     ${process.env.WHC_PUBLIC_BASE || '(WHC_PUBLIC_BASE unset)'}`);
   console.log(`   Postgres:   ${dbHost}\n`);
 });
