@@ -30,6 +30,24 @@ function QB_BASE() {
     : 'https://sandbox-quickbooks.api.intuit.com';
 }
 
+// Sanitize an email before sending to QB. Strips trailing `#mailto:...`
+// artefacts from legacy Outlook-paste imports, surrounding `<...>`, and
+// whitespace. Returns '' if the cleaned value doesn't look like an email,
+// which tells callers to omit the field entirely (QB prefers no email
+// over a bad one — a bad one returns a 400 ValidationFault).
+function cleanEmail(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim();
+  // Drop everything from the first `#` onward (handles foo@bar.com#mailto:foo@bar.com#).
+  const hash = s.indexOf('#');
+  if (hash >= 0) s = s.slice(0, hash).trim();
+  // Strip wrapping angle brackets.
+  s = s.replace(/^<|>$/g, '').trim();
+  // Minimal sanity check: one @, at least one dot after it, no spaces.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return '';
+  return s;
+}
+
 // ─── In-memory token store ───────────────────────────────────────────────────
 let _tokens = null;
 async function getTokens()     { return _tokens; }
@@ -243,7 +261,8 @@ router.get('/taxcodes', async (req, res) => {
 // POST /api/quickbooks/invoice/project/:id
 router.post('/invoice/project/:id', async (req, res) => {
   try {
-    const { client_name, client_email, description, items, project_number } = req.body;
+    const { client_name, description, items, project_number } = req.body;
+    const client_email = cleanEmail(req.body.client_email);
     if (!client_name || !items?.length) {
       return res.status(400).json({ error: 'client_name and items are required' });
     }
@@ -405,9 +424,10 @@ router.post('/clients/push', async (req, res) => {
 
     for (const client of unsynced) {
       try {
+        const email = cleanEmail(client.email);
         const displayName = client.company ||
           [client.fname, client.lname].filter(Boolean).join(' ') ||
-          client.email || `Client #${client.id}`;
+          email || `Client #${client.id}`;
 
         const searchData = await qbGet(
           `/query?query=${encodeURIComponent(
@@ -421,7 +441,7 @@ router.post('/clients/push', async (req, res) => {
             DisplayName: displayName,
             ...(client.fname ? { GivenName: client.fname } : {}),
             ...(client.lname ? { FamilyName: client.lname } : {}),
-            ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
+            ...(email ? { PrimaryEmailAddr: { Address: email } } : {}),
           });
           qbId = created?.Customer?.Id;
         }
@@ -451,15 +471,16 @@ router.post('/clients/push/:id', async (req, res) => {
       return res.json({ already_synced: true, qb_customer_id: client.qb_customer_id });
     }
 
+    const email = cleanEmail(client.email);
     const displayName = client.company ||
       [client.fname, client.lname].filter(Boolean).join(' ') ||
-      client.email || `Client #${client.id}`;
+      email || `Client #${client.id}`;
 
     const created = await qbPost('/customer', {
       DisplayName: displayName,
       ...(client.fname ? { GivenName: client.fname } : {}),
       ...(client.lname ? { FamilyName: client.lname } : {}),
-      ...(client.email ? { PrimaryEmailAddr: { Address: client.email } } : {}),
+      ...(email ? { PrimaryEmailAddr: { Address: email } } : {}),
     });
     const qbId = created?.Customer?.Id;
     if (qbId) await query(`UPDATE clients SET qb_customer_id = $1 WHERE id = $2`, [qbId, client.id]);
