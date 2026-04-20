@@ -294,9 +294,11 @@ router.post('/invoice/project/:id', async (req, res) => {
     const Line = await Promise.all(items.map(async (item) => {
       let itemId = miscItemId;
       if (item.qb_item_name) {
+        // Exclude Category rows — QB stores categories in the Item table too,
+        // and picking a category causes "Invalid Reference Id" (code 2500).
         const s = await qbGet(
           `/query?query=${encodeURIComponent(
-            `SELECT * FROM Item WHERE Name = '${item.qb_item_name.replace(/'/g, "\\'")}' MAXRESULTS 1`
+            `SELECT * FROM Item WHERE Name = '${item.qb_item_name.replace(/'/g, "\\'")}' AND Type != 'Category' MAXRESULTS 1`
           )}`
         );
         itemId = s?.QueryResponse?.Item?.[0]?.Id || miscItemId;
