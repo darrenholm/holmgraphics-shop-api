@@ -3,6 +3,8 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 
+const { runMigrations } = require('./db/migrate');
+
 const authRoutes       = require('./routes/auth');
 const projectRoutes    = require('./routes/projects');
 const lookupRoutes     = require('./routes/lookup');
@@ -66,16 +68,27 @@ app.use((err, req, res, next) => {
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  let dbHost = '(DATABASE_URL not set)';
-  if (process.env.DATABASE_URL) {
-    try {
-      const u = new URL(process.env.DATABASE_URL);
-      dbHost = `${u.hostname}:${u.port}/${u.pathname.slice(1)}`;
-    } catch { dbHost = '(invalid DATABASE_URL)'; }
+// Apply any pending SQL migrations BEFORE we start serving requests, so
+// handlers never hit a missing table.
+(async () => {
+  try {
+    await runMigrations();
+  } catch (e) {
+    console.error('FATAL: migrations failed —', e.message);
+    process.exit(1);
   }
-  console.log(`\nHolm Graphics API running on port ${PORT}`);
-  console.log(`   Health:     http://localhost:${PORT}/api/health`);
-  console.log(`   Photos:     ${process.env.WHC_PUBLIC_BASE || '(WHC_PUBLIC_BASE unset)'}`);
-  console.log(`   Postgres:   ${dbHost}\n`);
-});
+
+  app.listen(PORT, () => {
+    let dbHost = '(DATABASE_URL not set)';
+    if (process.env.DATABASE_URL) {
+      try {
+        const u = new URL(process.env.DATABASE_URL);
+        dbHost = `${u.hostname}:${u.port}/${u.pathname.slice(1)}`;
+      } catch { dbHost = '(invalid DATABASE_URL)'; }
+    }
+    console.log(`\nHolm Graphics API running on port ${PORT}`);
+    console.log(`   Health:     http://localhost:${PORT}/api/health`);
+    console.log(`   Photos:     ${process.env.WHC_PUBLIC_BASE || '(WHC_PUBLIC_BASE unset)'}`);
+    console.log(`   Postgres:   ${dbHost}\n`);
+  });
+})();

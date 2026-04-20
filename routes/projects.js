@@ -3,7 +3,8 @@
 // Rewritten for Railway Postgres (pg driver, $1..$n placeholders).
 const express = require('express');
 const { query, queryOne } = require('../db/connection');
-const { requireAuth, requireStaff } = require('../middleware/auth');
+const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
+const { runBackfill } = require('../db/backfill-photos');
 const multer = require('multer');
 const path = require('path');
 const ftp = require('basic-ftp');
@@ -59,6 +60,14 @@ const upload = multer({
     cb(null, allowed.test(path.extname(file.originalname).toLowerCase()));
   },
 });
+
+// Allowed gallery categories — must match the CHECK constraint in
+// db/migrations/001_project_photos.sql.
+const PHOTO_CATEGORIES = ['signs_led', 'vehicle_wraps', 'apparel', 'printing', 'other'];
+function normalizeCategory(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  return PHOTO_CATEGORIES.includes(v) ? v : 'other';
+}
 
 // ─── GET /api/projects ───────────────────────────────────────────────────────
 router.get('/', requireAuth, async (req, res) => {
@@ -138,6 +147,47 @@ router.get('/qb-items', async (req, res) => {
   } catch (err) {
     console.error('GET /projects/qb-items:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/projects/gallery ───────────────────────────────────────────────
+// PUBLIC — no auth. Used by holmgraphics.ca/gallery.html.
+// Returns every photo marked show_in_gallery=true with its category, the
+// public URL, and the parent project's description. No client info.
+// Optional ?category=<cat> filter; otherwise returns everything.
+// NOTE: must be declared before /:id so Express doesn't match "gallery"
+// as an :id param.
+router.get('/gallery', async (req, res) => {
+  const wanted = req.query.category
+    ? normalizeCategory(req.query.category)
+    : null;
+  try {
+    const rows = await query(
+      `SELECT ph.id,
+              ph.project_id,
+              ph.filename,
+              ph.category,
+              ph.uploaded_at,
+              p.description AS project_description
+         FROM project_photos ph
+         JOIN projects p ON p.id = ph.project_id
+        WHERE ph.show_in_gallery = TRUE
+          ${wanted ? `AND ph.category = $1` : ''}
+        ORDER BY ph.uploaded_at DESC, ph.id DESC`,
+      wanted ? [wanted] : []
+    );
+    const out = rows.map((r) => ({
+      id:          r.id,
+      project_id:  r.project_id,
+      category:    r.category,
+      description: r.project_description,
+      uploaded:    r.uploaded_at,
+      url:         `${WHC_PUBLIC_BASE}/${r.project_id}/${encodeURIComponent(r.filename)}`,
+    }));
+    res.json(out);
+  } catch (e) {
+    console.error('GET /gallery:', e);
+    res.status(500).json({ message: 'Failed to load gallery', detail: e.message });
   }
 });
 
@@ -458,47 +508,56 @@ router.post('/:id/measurements', requireStaff, async (req, res) => {
 });
 
 // ─── GET /api/projects/:id/photos ────────────────────────────────────────────
-// Photos are stored on WHC hosting under public_html/shop-uploads/jobs/<id>/
-// and served publicly from https://holmgraphics.ca/shop-uploads/jobs/<id>/.
-// This endpoint lists what's on WHC for the given project id.
+// Returns every photo on this job. Metadata (category, show_in_gallery)
+// comes from the project_photos table; the raw file lives on WHC.
 router.get('/:id/photos', requireAuth, async (req, res) => {
-  const id = req.params.id;
-  const remoteDir = `${WHC_REMOTE_BASE}/${id}`;
-  let client;
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Invalid project id' });
+  }
   try {
-    client = await connectFtp();
-    let list;
-    try {
-      list = await client.list(remoteDir);
-    } catch (e) {
-      // Directory doesn't exist yet — no photos for this job.
-      return res.json([]);
-    }
-    const files = list
-      .filter((f) => f.isFile)
-      .map((f) => ({
-        filename: f.name,
-        url: `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(f.name)}`,
-        uploaded: f.modifiedAt || f.rawModifiedAt || null,
-      }));
-    res.json(files);
+    const rows = await query(
+      `SELECT id,
+              filename,
+              category,
+              show_in_gallery,
+              uploaded_at,
+              uploaded_by
+         FROM project_photos
+        WHERE project_id = $1
+        ORDER BY uploaded_at DESC, id DESC`,
+      [id]
+    );
+    const out = rows.map((r) => ({
+      id:              r.id,
+      filename:        r.filename,
+      category:        r.category,
+      show_in_gallery: r.show_in_gallery,
+      uploaded:        r.uploaded_at,
+      uploaded_by:     r.uploaded_by,
+      url:             `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(r.filename)}`,
+    }));
+    res.json(out);
   } catch (e) {
     console.error('GET /:id/photos:', e);
     res.status(500).json({ message: 'Failed to load photos', detail: e.message });
-  } finally {
-    if (client) client.close();
   }
 });
 
 // ─── POST /api/projects/:id/photos ───────────────────────────────────────────
-// Streams each uploaded file's buffer to WHC via FTPS. Never writes to
-// Railway's ephemeral filesystem.
+// Uploads one or more files. `category` comes in as a form field alongside
+// the files — same value applies to every file in this request.
+// Writes to WHC via FTPS, then inserts metadata rows.
 router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req, res) => {
-  const id = req.params.id;
-  const remoteDir = `${WHC_REMOTE_BASE}/${id}`;
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Invalid project id' });
+  }
   if (!req.files || req.files.length === 0) {
     return res.status(400).json({ message: 'No files uploaded' });
   }
+  const category = normalizeCategory(req.body.category);
+  const remoteDir = `${WHC_REMOTE_BASE}/${id}`;
   let client;
   try {
     client = await connectFtp(30000);
@@ -508,9 +567,19 @@ router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req,
       const ext = path.extname(f.originalname).toLowerCase() || '.jpg';
       const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
       await client.uploadFrom(Readable.from(f.buffer), safeName);
+      const inserted = await queryOne(
+        `INSERT INTO project_photos (project_id, filename, category, uploaded_by)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, uploaded_at`,
+        [id, safeName, category, req.user?.id || null]
+      );
       uploaded.push({
-        filename: safeName,
-        url: `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(safeName)}`,
+        id:              inserted.id,
+        filename:        safeName,
+        category,
+        show_in_gallery: false,
+        uploaded:        inserted.uploaded_at,
+        url:             `${WHC_PUBLIC_BASE}/${id}/${encodeURIComponent(safeName)}`,
       });
     }
     res.status(201).json({ message: `${uploaded.length} photo(s) uploaded`, files: uploaded });
@@ -522,26 +591,105 @@ router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req,
   }
 });
 
-// ─── DELETE /api/projects/:id/photos/:filename ───────────────────────────────
-router.delete('/:id/photos/:filename', requireStaff, async (req, res) => {
-  const id = req.params.id;
-  // Strip any path separators so callers can't escape the job folder.
-  const filename = req.params.filename.replace(/[\/\\]/g, '');
+// ─── PATCH /api/projects/:id/photos/:photoId ─────────────────────────────────
+// Admin curation: flip show_in_gallery and/or change category. Both fields
+// are optional; whichever are present in the body get updated.
+router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
+  const id      = parseInt(req.params.id, 10);
+  const photoId = parseInt(req.params.photoId, 10);
+  if (!Number.isInteger(id) || !Number.isInteger(photoId)) {
+    return res.status(400).json({ message: 'Invalid id(s)' });
+  }
+
+  const sets = [];
+  const params = [];
+  if (typeof req.body.show_in_gallery === 'boolean') {
+    params.push(req.body.show_in_gallery);
+    sets.push(`show_in_gallery = $${params.length}`);
+  }
+  if (req.body.category !== undefined) {
+    params.push(normalizeCategory(req.body.category));
+    sets.push(`category = $${params.length}`);
+  }
+  if (sets.length === 0) {
+    return res.status(400).json({ message: 'Nothing to update' });
+  }
+  params.push(photoId, id);
+  try {
+    const updated = await queryOne(
+      `UPDATE project_photos
+          SET ${sets.join(', ')}
+        WHERE id = $${params.length - 1} AND project_id = $${params.length}
+        RETURNING id, filename, category, show_in_gallery, uploaded_at`,
+      params
+    );
+    if (!updated) return res.status(404).json({ message: 'Photo not found' });
+    res.json(updated);
+  } catch (e) {
+    console.error('PATCH /:id/photos/:photoId:', e);
+    res.status(500).json({ message: 'Failed to update photo', detail: e.message });
+  }
+});
+
+// ─── DELETE /api/projects/:id/photos/:target ─────────────────────────────────
+// Deletes the DB row and the file on WHC. Idempotent on the FTP side.
+// `:target` may be either a numeric project_photos.id (preferred) or a
+// filename (legacy — the pre-DB frontend uses filename). Handling both
+// lets us deploy the API without coordinating a frontend deploy.
+router.delete('/:id/photos/:target', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Invalid project id' });
+  }
+  const target = req.params.target;
+
+  let row;
+  if (/^\d+$/.test(target)) {
+    row = await queryOne(
+      `SELECT id, filename FROM project_photos WHERE id = $1 AND project_id = $2`,
+      [parseInt(target, 10), id]
+    );
+  } else {
+    // Legacy path: lookup by filename within this project.
+    const safe = target.replace(/[\/\\]/g, '');
+    row = await queryOne(
+      `SELECT id, filename FROM project_photos WHERE project_id = $1 AND filename = $2`,
+      [id, safe]
+    );
+  }
+  if (!row) return res.status(404).json({ message: 'Photo not found' });
+
+  const filename   = row.filename.replace(/[\/\\]/g, '');
   const remotePath = `${WHC_REMOTE_BASE}/${id}/${filename}`;
+
   let client;
   try {
     client = await connectFtp();
-    try {
-      await client.remove(remotePath);
-    } catch (e) {
-      // Already gone — treat delete as idempotent.
-    }
+    try { await client.remove(remotePath); }
+    catch (e) { /* already gone — ignore */ }
+    await query(`DELETE FROM project_photos WHERE id = $1`, [row.id]);
     res.json({ message: 'Photo deleted' });
   } catch (e) {
-    console.error('DELETE /:id/photos:', e);
+    console.error('DELETE /:id/photos/:target:', e);
     res.status(500).json({ message: 'Failed to delete photo', detail: e.message });
   } finally {
     if (client) client.close();
+  }
+});
+
+// ─── POST /api/projects/admin/backfill-photos ────────────────────────────────
+// One-shot. Walks WHC folders and inserts project_photos rows for every
+// file already on disk. Re-runnable (unique constraint makes it idempotent).
+// Runs synchronously — may take a while with 565 MB of photos; bump
+// client-side timeout if you invoke this from a browser.
+router.post('/admin/backfill-photos', requireAdmin, async (req, res) => {
+  try {
+    const logs = [];
+    const stats = await runBackfill({ log: (m) => logs.push(m) });
+    res.json({ ...stats, logs });
+  } catch (e) {
+    console.error('backfill:', e);
+    res.status(500).json({ message: 'Backfill failed', detail: e.message });
   }
 });
 
