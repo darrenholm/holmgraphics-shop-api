@@ -5,33 +5,35 @@
 //
 // Account #26562. Account rep confirmed static IP not required for NA.
 
-// Endpoint bases differ between UAT (sandbox) and production. SanMar's
-// PromoStandards endpoints are the same URL family; only the credentials
-// differ (sandbox creds vs production creds). Confirm against the
-// integration guide before prod cutover.
+// Endpoint URLs straight out of the SanMar Canada PromoStandards Web
+// Services Integration Guide (2025 beta, account #26562). UAT is reached
+// via the /uat-ws/ prefix; production uses /pstd/ with each service living
+// under its own /<service><version>/ subpath. MediaContent in production
+// supports both 1.1 and 1.2 — we use 1.2 because the response shape is one
+// MediaContent element per image URL (1.1 crams multiple URLs into a single
+// <url> element as whitespace-separated text). Bulk Data is SanMar-specific
+// and doesn't live under the PromoStandards tree at all.
 const ENDPOINTS = {
   uat: {
-    productData:         'https://edi.atc-apparel.com/pstd/productdata2.0/ProductDataServiceV2.php',
-    mediaContent:        'https://edi.atc-apparel.com/promostandards/MediaContentService.php',
-    inventory:           'https://edi.atc-apparel.com/promostandards/InventoryService.php',
-    pricing:             'https://edi.atc-apparel.com/promostandards/PricingAndConfigurationService.php',
-    purchaseOrder:       'https://edi.atc-apparel.com/promostandards/POService.php',
-    orderStatus:         'https://edi.atc-apparel.com/promostandards/OrderStatusService.php',
-    shipmentNotification:'https://edi.atc-apparel.com/promostandards/OrderShipmentNotificationService.php',
-    invoice:             'https://edi.atc-apparel.com/promostandards/InvoiceService.php',
+    productData:         'https://edi.atc-apparel.com/uat-ws/promostandards/productdata2.0/ProductDataServiceV2.php',
+    mediaContent:        'https://edi.atc-apparel.com/uat-ws/promostandards/mediacontent1.1/MediaContentService.php',
+    inventory:           'https://edi.atc-apparel.com/uat-ws/promostandards/inventory2.0/InventoryServiceV2.php',
+    pricing:             'https://edi.atc-apparel.com/uat-ws/promostandards/productpricingconfiguration/PricingAndConfigurationService.php',
+    purchaseOrder:       'https://edi.atc-apparel.com/uat-ws/promostandards/purchaseorder/POService.php',
+    orderStatus:         'https://edi.atc-apparel.com/uat-ws/promostandards/orderstatus2.0/OrderStatusServiceV2.php',
+    shipmentNotification:'https://edi.atc-apparel.com/uat-ws/promostandards/osn2.0/OrderShipmentNotificationServiceV2.php',
+    invoice:             'https://edi.atc-apparel.com/uat-ws/promostandards/invoice1.0/InvoiceService.php',
     bulkData:            'https://edi.atc-apparel.com/bulk-data/BulkDataService.php',
   },
   production: {
-    // TODO(#44): confirm production endpoints from SanMar onboarding email
-    // once we move off UAT. For now they mirror UAT.
     productData:         'https://edi.atc-apparel.com/pstd/productdata2.0/ProductDataServiceV2.php',
-    mediaContent:        'https://edi.atc-apparel.com/promostandards/MediaContentService.php',
-    inventory:           'https://edi.atc-apparel.com/promostandards/InventoryService.php',
-    pricing:             'https://edi.atc-apparel.com/promostandards/PricingAndConfigurationService.php',
-    purchaseOrder:       'https://edi.atc-apparel.com/promostandards/POService.php',
-    orderStatus:         'https://edi.atc-apparel.com/promostandards/OrderStatusService.php',
-    shipmentNotification:'https://edi.atc-apparel.com/promostandards/OrderShipmentNotificationService.php',
-    invoice:             'https://edi.atc-apparel.com/promostandards/InvoiceService.php',
+    mediaContent:        'https://edi.atc-apparel.com/pstd/mediacontent1.2/MediaContentService.php',
+    inventory:           'https://edi.atc-apparel.com/pstd/inventory2.0/InventoryServiceV2.php',
+    pricing:             'https://edi.atc-apparel.com/pstd/productpricingconfiguration/PricingAndConfigurationService.php',
+    purchaseOrder:       'https://edi.atc-apparel.com/pstd/purchaseorder/POService.php',
+    orderStatus:         'https://edi.atc-apparel.com/pstd/orderstatus2.0/OrderStatusServiceV2.php',
+    shipmentNotification:'https://edi.atc-apparel.com/pstd/osn2.0/OrderShipmentNotificationServiceV2.php',
+    invoice:             'https://edi.atc-apparel.com/pstd/invoice1.0/InvoiceService.php',
     bulkData:            'https://edi.atc-apparel.com/bulk-data/BulkDataService.php',
   },
 };
