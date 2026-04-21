@@ -30,6 +30,7 @@ const ALWAYS_ARRAY = new Set([
   'ServiceMessage',
   'Location',
   'MediaItem',
+  'MediaContent',
   'Configuration',
   'FobPoint',
 ]);

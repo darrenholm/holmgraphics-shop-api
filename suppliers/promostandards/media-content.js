@@ -59,14 +59,88 @@ async function getMediaContent(config, args) {
     url:         toStr(m.url),
     mediaType:   toStr(m.mediaType),
     classType:   toStr(m.classType),
-    partId:      toStr(m.productPartId) || toStr(m.partId),
-    color:       toStr(m.color?.colorName) || toStr(m.colorName),
+    // partId may live at top-level, under ProductPartArray.ProductPart[].partId,
+    // or (rarely) as productPartId. Collect all that apply.
+    partId:      toStr(m.productPartId) || toStr(m.partId) || extractPartIds(m)[0] || null,
+    partIds:     extractPartIds(m),
+    color:       extractColorName(m),
+    colorHex:    extractColorHex(m),
     size:        toStr(m.size?.apparelSize) || toStr(m.size),
     description: toStr(m.description),
+    fileName:    toStr(m.fileName),
     _raw:        m,
   }));
 
   return { productId, items, messages };
+}
+
+// A MediaContent item may associate with one or more ProductParts. Return
+// every partId we can find.
+function extractPartIds(m) {
+  const ids = new Set();
+  const ppa = m?.ProductPartArray;
+  if (ppa) {
+    const parts = ppa.ProductPart ?? ppa.productPart ?? ppa;
+    const list = Array.isArray(parts) ? parts : [parts];
+    for (const p of list) {
+      if (!p) continue;
+      const id = toStr(p.partId ?? p.PartId ?? p.productPartId);
+      if (id) ids.add(id);
+    }
+  }
+  const flat = toStr(m?.partId) || toStr(m?.productPartId);
+  if (flat) ids.add(flat);
+  return [...ids];
+}
+
+// Colour name might hang off Color/colorName/SwatchColor/swatchColor — or
+// be inlined as a scalar `color` field.
+function extractColorName(m) {
+  if (!m) return null;
+  return (
+    toStr(m.color?.colorName) ||
+    toStr(m.Color?.colorName) ||
+    toStr(m.color?.name)      ||
+    toStr(m.Color?.name)      ||
+    toStr(m.SwatchColor?.colorName) ||
+    toStr(m.swatchColor?.colorName) ||
+    toStr(m.colorName)        ||
+    toStr(m.swatchColor)      ||
+    toStr(m.color)            ||
+    null
+  );
+}
+
+// Hex may live at m.Color.hex, m.color.hex, m.hex, m.SwatchHex, etc. Accept
+// with/without leading # and normalise to upper-case 6-char form.
+function extractColorHex(m) {
+  if (!m) return null;
+  const candidate =
+    m.color?.hex ??
+    m.Color?.hex ??
+    m.color?.colorHex ??
+    m.Color?.colorHex ??
+    m.SwatchColor?.hex ??
+    m.swatchColor?.hex ??
+    m.SwatchHex ??
+    m.swatchHex ??
+    m.hex ??
+    null;
+  return normaliseHex(candidate);
+}
+
+function normaliseHex(v) {
+  if (v === undefined || v === null) return null;
+  let s = String(v).trim();
+  if (!s) return null;
+  if (s.startsWith('#')) s = s.slice(1);
+  if (!/^[0-9a-fA-F]{3,8}$/.test(s)) return null;
+  if (s.length === 3) {
+    s = s.split('').map((c) => c + c).join('');  // abc → aabbcc
+  }
+  if (s.length === 8) s = s.slice(0, 6);          // strip alpha
+  if (s.length !== 6) return null;
+  return '#' + s.toUpperCase();
 }
 
 async function getMediaDateModified(_config, _args) {

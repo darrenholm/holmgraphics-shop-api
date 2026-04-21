@@ -10,8 +10,10 @@ const { query, queryOne } = require('../db/connection');
 const { requireAdmin } = require('../middleware/auth');
 const { runSanmarIngest } = require('../suppliers/sanmar/ingest');
 const { backfillCategories } = require('../suppliers/sanmar/category-backfill');
+const { backfillMedia } = require('../suppliers/sanmar/media-backfill');
 const { loadConfig: loadSanmarConfig } = require('../suppliers/sanmar/config');
 const { getProduct: getSanmarProduct } = require('../suppliers/promostandards/product-data');
+const { getMediaContent: getSanmarMedia } = require('../suppliers/promostandards/media-content');
 
 const router = express.Router();
 
@@ -139,6 +141,84 @@ router.post('/sanmar/ingest', requireAdmin, async (req, res) => {
     res.status(500).json({
       ok: false,
       message: 'SanMar ingest failed',
+      detail: e.message,
+      logs,
+    });
+  }
+});
+
+// ─── GET /api/suppliers/sanmar/debug-media?style=ATC1000 ─────────────────────
+// Diagnostic: call getMediaContent for one style and return the parsed items
+// plus the raw XML-shape payload so we can see exactly where colour hex / per-
+// part image URLs live in SanMar's MediaContent response. Admin only.
+router.get('/sanmar/debug-media', requireAdmin, async (req, res) => {
+  const style = String(req.query.style || '').trim();
+  if (!style) return res.status(400).json({ message: 'style query param required' });
+  try {
+    const config = loadSanmarConfig();
+    const result = await getSanmarMedia(config, { productId: style });
+    const byColor = {};
+    for (const it of result.items) {
+      if (!it.color) continue;
+      const key = it.color;
+      byColor[key] = byColor[key] || { hexes: new Set(), urls: new Set(), classTypes: new Set() };
+      if (it.colorHex) byColor[key].hexes.add(it.colorHex);
+      if (it.url)      byColor[key].urls.add(it.url);
+      if (it.classType) byColor[key].classTypes.add(it.classType);
+    }
+    const colorSummary = Object.fromEntries(
+      Object.entries(byColor).map(([k, v]) => [k, {
+        hexes: [...v.hexes],
+        classTypes: [...v.classTypes],
+        urlCount: v.urls.size,
+      }])
+    );
+    res.json({
+      ok: true,
+      style,
+      itemCount: result.items.length,
+      colorSummary,
+      sampleItems: result.items.slice(0, 8),
+      messages: result.messages,
+    });
+  } catch (e) {
+    console.error('sanmar debug-media:', e);
+    res.status(500).json({ ok: false, message: 'debug-media failed', detail: e.message });
+  }
+});
+
+// ─── POST /api/suppliers/sanmar/media-backfill ───────────────────────────────
+// One-shot trigger for the MediaContent backfill job. Same model as
+// category-backfill: runs synchronously inside the API process (Railway), so
+// bump your client timeout for a full run. Chunk with ?limit=N to stay under
+// Railway's 5-minute HTTP edge timeout.
+//
+// Query params:
+//   ?refresh=1      → re-sync every sellable style (default: only rows with
+//                     NULL color_hex or NULL image_url)
+//   ?limit=N        → cap to N styles (default: all qualifying)
+//   ?rate=N         → ms between SOAP calls (default 400)
+//   ?skip-images=1  → only touch color_hex, leave image_url alone
+router.post('/sanmar/media-backfill', requireAdmin, async (req, res) => {
+  const logs = [];
+  const refresh    = req.query.refresh === '1' || req.query.refresh === 'true';
+  const skipImages = req.query['skip-images'] === '1' || req.query['skip-images'] === 'true';
+  const limit      = req.query.limit ? Number(req.query.limit) : null;
+  const rateMs     = req.query.rate  ? Number(req.query.rate)  : undefined;
+  try {
+    const result = await backfillMedia({
+      refresh,
+      skipImages,
+      limit,
+      rateMs,
+      log: (m) => logs.push(m),
+    });
+    res.json({ ok: true, ...result, logs });
+  } catch (e) {
+    console.error('sanmar media-backfill:', e);
+    res.status(500).json({
+      ok: false,
+      message: 'SanMar media backfill failed',
       detail: e.message,
       logs,
     });
