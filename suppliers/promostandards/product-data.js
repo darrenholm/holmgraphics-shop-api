@@ -49,7 +49,10 @@ async function getProduct(config, args) {
   const messages = normaliseMessages(payload.ServiceMessageArray);
   assertNoErrors(messages, { allowCodes: [201] });
 
-  const product = payload.Product || {};
+  // The SOAP client forces <Product> into an array (see ALWAYS_ARRAY), so
+  // payload.Product is [{...}] even for single-product responses. Unwrap.
+  const rawProduct = payload.Product;
+  const product = Array.isArray(rawProduct) ? (rawProduct[0] || {}) : (rawProduct || {});
   return {
     productId:    toStr(product.productId) || productId,
     productName:  toStr(product.productName),
@@ -143,20 +146,33 @@ function toArray(v) {
   return Array.isArray(v) ? v : [v];
 }
 
-// PromoStandards V2.0 exposes product categories via:
+// PromoStandards V2.0 (as SanMar implements it) exposes product categories via:
 //   <ProductCategoryArray>
-//     <category>TSHIRTS</category>
-//     <category>POLOS/KNITS</category>  <!-- 0..n -->
+//     <ProductCategory>
+//       <category>100% BASIC TEES</category>
+//       <subCategory>NA</subCategory>
+//     </ProductCategory>
+//     ...0..n more <ProductCategory> blocks
 //   </ProductCategoryArray>
-// After XML→JSON parsing that lands as product.ProductCategoryArray.category
-// which may be a string (single) OR an array (multiple). Some suppliers also
-// emit a legacy flat product.productCategory — fall back to that if present.
+// After XML→JSON parsing ProductCategory may be an object (single) or array
+// (multiple). We return the flat list of category strings.
+// Legacy fallback: some responses expose a flat productCategory scalar.
 function extractCategoryList(product) {
   const arr = product.ProductCategoryArray;
   if (arr) {
-    const cat = arr.category ?? arr.Category;
-    const list = toArray(cat).map(toStr).filter(Boolean);
-    if (list.length) return list;
+    const pcRaw = arr.ProductCategory ?? arr.productCategory;
+    if (pcRaw) {
+      const list = toArray(pcRaw)
+        .map((pc) => (pc && typeof pc === 'object') ? toStr(pc.category ?? pc.Category) : toStr(pc))
+        .filter(Boolean);
+      if (list.length) return list;
+    }
+    // Older shape: <ProductCategoryArray><category>…</category></ProductCategoryArray>
+    const bareCat = arr.category ?? arr.Category;
+    if (bareCat) {
+      const list = toArray(bareCat).map(toStr).filter(Boolean);
+      if (list.length) return list;
+    }
   }
   const flat = toStr(product.productCategory);
   return flat ? [flat] : [];
