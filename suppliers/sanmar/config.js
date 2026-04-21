@@ -11,7 +11,7 @@
 // integration guide before prod cutover.
 const ENDPOINTS = {
   uat: {
-    productData:         'https://edi.atc-apparel.com/promostandards/ProductDataService.php',
+    productData:         'https://edi.atc-apparel.com/pstd/productdata2.0/ProductDataServiceV2.php',
     mediaContent:        'https://edi.atc-apparel.com/promostandards/MediaContentService.php',
     inventory:           'https://edi.atc-apparel.com/promostandards/InventoryService.php',
     pricing:             'https://edi.atc-apparel.com/promostandards/PricingAndConfigurationService.php',
@@ -24,7 +24,7 @@ const ENDPOINTS = {
   production: {
     // TODO(#44): confirm production endpoints from SanMar onboarding email
     // once we move off UAT. For now they mirror UAT.
-    productData:         'https://edi.atc-apparel.com/promostandards/ProductDataService.php',
+    productData:         'https://edi.atc-apparel.com/pstd/productdata2.0/ProductDataServiceV2.php',
     mediaContent:        'https://edi.atc-apparel.com/promostandards/MediaContentService.php',
     inventory:           'https://edi.atc-apparel.com/promostandards/InventoryService.php',
     pricing:             'https://edi.atc-apparel.com/promostandards/PricingAndConfigurationService.php',
