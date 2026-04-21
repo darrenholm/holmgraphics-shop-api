@@ -532,24 +532,79 @@ router.delete('/:id/items/:itemId', requireStaff, async (req, res) => {
   }
 });
 
+// Treat empty strings, null, undefined, and unparseable values as NULL. The
+// previous POST handler used `parseFloat(width)` directly, which returns NaN
+// for an empty input. That NaN was being written to PG's NUMERIC column and
+// later rendered as the literal string "NaN" in the UI.
+function toFiniteNumber(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = parseFloat(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // ─── POST /api/projects/:id/measurements ─────────────────────────────────────
 router.post('/:id/measurements', requireStaff, async (req, res) => {
   const { item, width, height, notes } = req.body;
   try {
-    await query(
+    const rows = await query(
       `INSERT INTO measurements (project_id, item, width_in, height_in, comment)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, item, width_in AS width, height_in AS height, comment AS notes`,
       [
         parseInt(req.params.id),
         item || null,
-        width != null ? parseFloat(width) : null,
-        height != null ? parseFloat(height) : null,
+        toFiniteNumber(width),
+        toFiniteNumber(height),
         notes || null,
       ]
     );
-    res.status(201).json({ message: 'Measurement added' });
+    res.status(201).json({ message: 'Measurement added', measurement: rows[0] });
   } catch (e) {
     res.status(500).json({ message: 'Failed to add measurement', detail: e.message });
+  }
+});
+
+// ─── PUT /api/projects/:id/measurements/:mId ─────────────────────────────────
+router.put('/:id/measurements/:mId', requireStaff, async (req, res) => {
+  const { item, width, height, notes } = req.body;
+  try {
+    const rows = await query(
+      `UPDATE measurements
+          SET item      = $1,
+              width_in  = $2,
+              height_in = $3,
+              comment   = $4
+        WHERE id = $5 AND project_id = $6
+        RETURNING id, item, width_in AS width, height_in AS height, comment AS notes`,
+      [
+        item || null,
+        toFiniteNumber(width),
+        toFiniteNumber(height),
+        notes || null,
+        parseInt(req.params.mId),
+        parseInt(req.params.id),
+      ]
+    );
+    if (rows.length === 0) return res.status(404).json({ message: 'Measurement not found' });
+    res.json({ message: 'Measurement updated', measurement: rows[0] });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to update measurement', detail: e.message });
+  }
+});
+
+// ─── DELETE /api/projects/:id/measurements/:mId ──────────────────────────────
+router.delete('/:id/measurements/:mId', requireStaff, async (req, res) => {
+  try {
+    const rows = await query(
+      `DELETE FROM measurements
+        WHERE id = $1 AND project_id = $2
+        RETURNING id`,
+      [parseInt(req.params.mId), parseInt(req.params.id)]
+    );
+    if (rows.length === 0) return res.status(404).json({ message: 'Measurement not found' });
+    res.json({ message: 'Measurement deleted' });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to delete measurement', detail: e.message });
   }
 });
 
