@@ -9,6 +9,7 @@ const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireAdmin } = require('../middleware/auth');
 const { runSanmarIngest } = require('../suppliers/sanmar/ingest');
+const { backfillCategories } = require('../suppliers/sanmar/category-backfill');
 
 const router = express.Router();
 
@@ -57,6 +58,44 @@ router.post('/sanmar/ingest', requireAdmin, async (req, res) => {
     res.status(500).json({
       ok: false,
       message: 'SanMar ingest failed',
+      detail: e.message,
+      logs,
+    });
+  }
+});
+
+// ─── POST /api/suppliers/sanmar/category-backfill ────────────────────────────
+// One-shot trigger for the SanMar category-backfill job. Runs synchronously
+// inside the API process — i.e. on Railway, where postgres.railway.internal
+// resolves and SANMAR_* creds are in scope. Local CLI runs hit a network
+// wall, so the browser/curl trigger is the supported path.
+//
+// Query params:
+//   ?refresh=1  → re-sync every row (default: only NULL rows)
+//   ?limit=N    → cap to N styles (use for a smoke test)
+//   ?rate=N     → ms between SOAP calls (default 300)
+//
+// Total runtime is roughly  styles × rate / 1000  seconds + network. The
+// HTTP request blocks until done — bump your client timeout for full runs.
+// Output is the same per-style log lines the CLI produces, returned as JSON.
+router.post('/sanmar/category-backfill', requireAdmin, async (req, res) => {
+  const logs = [];
+  const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const limit   = req.query.limit ? Number(req.query.limit) : null;
+  const rateMs  = req.query.rate  ? Number(req.query.rate)  : undefined;
+  try {
+    const result = await backfillCategories({
+      refresh,
+      limit,
+      rateMs,
+      log: (m) => logs.push(m),
+    });
+    res.json({ ok: true, ...result, logs });
+  } catch (e) {
+    console.error('sanmar category-backfill:', e);
+    res.status(500).json({
+      ok: false,
+      message: 'SanMar category backfill failed',
       detail: e.message,
       logs,
     });
