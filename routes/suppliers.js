@@ -10,8 +10,33 @@ const { query, queryOne } = require('../db/connection');
 const { requireAdmin } = require('../middleware/auth');
 const { runSanmarIngest } = require('../suppliers/sanmar/ingest');
 const { backfillCategories } = require('../suppliers/sanmar/category-backfill');
+const { loadConfig: loadSanmarConfig } = require('../suppliers/sanmar/config');
+const { getProduct: getSanmarProduct } = require('../suppliers/promostandards/product-data');
 
 const router = express.Router();
+
+// ─── GET /api/suppliers/sanmar/debug-product?style=PC54 ──────────────────────
+// Diagnostic: return the raw parsed getProduct() response so we can inspect
+// the XML shape (e.g. confirm where categories live). Admin only.
+router.get('/sanmar/debug-product', requireAdmin, async (req, res) => {
+  const style = String(req.query.style || '').trim();
+  if (!style) return res.status(400).json({ message: 'style query param required' });
+  try {
+    const config = loadSanmarConfig();
+    const result = await getSanmarProduct(config, { productId: style });
+    res.json({
+      ok: true,
+      style,
+      extractedCategory: result.category,
+      extractedCategories: result.categories,
+      rawKeys: Object.keys(result._raw || {}),
+      raw: result._raw,
+    });
+  } catch (e) {
+    console.error('sanmar debug-product:', e);
+    res.status(500).json({ ok: false, message: 'debug-product failed', detail: e.message });
+  }
+});
 
 // ─── GET /api/suppliers ──────────────────────────────────────────────────────
 // List all registered suppliers + their most recent successful ingest.
