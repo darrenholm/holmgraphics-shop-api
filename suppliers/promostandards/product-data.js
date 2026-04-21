@@ -55,7 +55,8 @@ async function getProduct(config, args) {
     productName:  toStr(product.productName),
     description:  toStr(product.description),
     brand:        toStr(product.productBrand),
-    category:     toStr(product.productCategory),
+    category:     extractCategory(product),
+    categories:   extractCategoryList(product),
     isCaution:    toBool(product.isCaution),
     isCloseout:   toBool(product.isCloseout),
     parts:        normaliseParts(product.ProductPartArray),
@@ -140,6 +141,28 @@ function normaliseParts(partArray) {
 function toArray(v) {
   if (v === undefined || v === null) return [];
   return Array.isArray(v) ? v : [v];
+}
+
+// PromoStandards V2.0 exposes product categories via:
+//   <ProductCategoryArray>
+//     <category>TSHIRTS</category>
+//     <category>POLOS/KNITS</category>  <!-- 0..n -->
+//   </ProductCategoryArray>
+// After XML→JSON parsing that lands as product.ProductCategoryArray.category
+// which may be a string (single) OR an array (multiple). Some suppliers also
+// emit a legacy flat product.productCategory — fall back to that if present.
+function extractCategoryList(product) {
+  const arr = product.ProductCategoryArray;
+  if (arr) {
+    const cat = arr.category ?? arr.Category;
+    const list = toArray(cat).map(toStr).filter(Boolean);
+    if (list.length) return list;
+  }
+  const flat = toStr(product.productCategory);
+  return flat ? [flat] : [];
+}
+function extractCategory(product) {
+  return extractCategoryList(product)[0] || null;
 }
 function toStr(v) {
   if (v === undefined || v === null) return null;
