@@ -16,20 +16,20 @@ const CATEGORIES = Object.freeze({
   T_SHIRTS:    't-shirts',
   POLOS:       'polos',
   WOVEN:       'woven-shirts',
-  FLEECE:      'fleece',        // sweatshirts, hoodies, fleece, sweaters
-  OUTERWEAR:   'outerwear',     // jackets, vests, parkas, softshells
-  HEADWEAR:    'headwear',      // caps, hats, beanies, visors
+  FLEECE:      'fleece',
+  OUTERWEAR:   'outerwear',
+  HEADWEAR:    'headwear',
   BAGS:        'bags',
-  BOTTOMS:     'bottoms',       // pants, shorts, joggers
-  ACTIVEWEAR:  'activewear',    // performance, athletic
+  BOTTOMS:     'bottoms',
+  ACTIVEWEAR:  'activewear',
   WORKWEAR:    'workwear',
-  ACCESSORIES: 'accessories',   // towels, blankets, scarves, socks
-  YOUTH:       'youth',         // supplier-tagged youth/infant/toddler
-  LADIES:      'ladies',        // rarely the only tag; usually pairs with a type
+  ACCESSORIES: 'accessories',
+  YOUTH:       'youth',
+  LADIES:      'ladies',
   OTHER:       'other',
 });
 
-// Display labels for the UI. The storefront can import this to render pills.
+// Display labels for the UI. The storefront imports these to render pills.
 const LABELS = Object.freeze({
   't-shirts':     'T-Shirts',
   'polos':        'Polos',
@@ -47,49 +47,23 @@ const LABELS = Object.freeze({
   'other':        'Other',
 });
 
-// Ordered rules — first match wins. More specific patterns come first
-// (e.g. "FLEECE JACKET" is outerwear, not fleece-pullover).
+// Ordered rules — first match wins. More specific patterns come first.
+// Plurals: word boundaries don't fire between consecutive word chars,
+// so every countable noun uses "NOUN?S?" to catch both forms.
 const RULES = [
-  // Outerwear first — "FLEECE JACKET" / "SOFTSHELL JACKET" beat generic fleece.
-  [/\b(JACKET|PARKA|VEST|SOFTSHELL|RAIN|PUFFER|COAT|ANORAK|WINDBREAKER|OUTERWEAR)\b/i,  CATEGORIES.OUTERWEAR],
-
-  // Headwear.
-  [/\b(CAP|HAT|BEANIE|VISOR|TOQUE|HEADWEAR|BUCKET)\b/i,                                 CATEGORIES.HEADWEAR],
-
-  // Bags.
-  [/\b(BAG|TOTE|BACKPACK|DUFFLE|DUFFEL|POUCH|SACK|LUGGAGE)\b/i,                         CATEGORIES.BAGS],
-
-  // Polos / knits.
-  [/\b(POLO|KNIT)\b/i,                                                                  CATEGORIES.POLOS],
-
-  // Woven / button-ups.
-  [/\b(WOVEN|BUTTON|DRESS SHIRT|OXFORD|POPLIN|FLANNEL|DENIM SHIRT)\b/i,                 CATEGORIES.WOVEN],
-
-  // Fleece / sweats / hoodies.
-  [/\b(HOODIE|HOODED|SWEATSHIRT|CREWNECK|PULLOVER|FLEECE|SWEATER)\b/i,                  CATEGORIES.FLEECE],
-
-  // Bottoms.
-  [/\b(PANT|SHORT|JOGGER|SWEATPANT|LEGGING|TROUSER|SKIRT)\b/i,                          CATEGORIES.BOTTOMS],
-
-  // T-shirts.
-  [/\b(T[- ]?SHIRT|TEE|TANK|MUSCLE)\b/i,                                                CATEGORIES.T_SHIRTS],
-
-  // Activewear / performance — catch this after garment-type rules so a
-  // "PERFORMANCE POLO" still classifies as a polo.
-  [/\b(ACTIVEWEAR|PERFORMANCE|ATHLETIC|SPORTS)\b/i,                                     CATEGORIES.ACTIVEWEAR],
-
-  // Workwear.
-  [/\b(WORKWEAR|HI-?VIS|SAFETY|COVERALL|MECHANIC)\b/i,                                  CATEGORIES.WORKWEAR],
-
-  // Youth / infant / toddler as a last-resort type (SanMar sometimes
-  // tags only by demographic when the garment spans categories).
-  [/\b(YOUTH|INFANT|TODDLER|BABY|KIDS?)\b/i,                                            CATEGORIES.YOUTH],
-
-  // Ladies as last-resort type.
-  [/\b(LADIES|WOMEN'?S?)\b/i,                                                           CATEGORIES.LADIES],
-
-  // Accessories catch-all.
-  [/\b(TOWEL|BLANKET|SCARF|SOCK|GLOVE|APRON|UMBRELLA|ACCESSOR)\b/i,                     CATEGORIES.ACCESSORIES],
+  [/\b(JACKETS?|PARKAS?|VESTS?|SOFTSHELLS?|RAINWEAR|PUFFERS?|COATS?|ANORAKS?|WINDBREAKERS?|OUTERWEAR)\b/i, CATEGORIES.OUTERWEAR],
+  [/\b(CAPS?|HATS?|BEANIES?|VISORS?|TOQUES?|HEADWEAR|BUCKETS?)\b/i,                                       CATEGORIES.HEADWEAR],
+  [/\b(BAGS?|TOTES?|BACKPACKS?|DUFFLES?|DUFFELS?|POUCHES?|SACKS?|LUGGAGE)\b/i,                            CATEGORIES.BAGS],
+  [/\b(POLOS?|KNITS?)\b/i,                                                                                CATEGORIES.POLOS],
+  [/\b(WOVENS?|BUTTON[- ]?UPS?|DRESS SHIRTS?|OXFORDS?|POPLIN|FLANNELS?|DENIM SHIRTS?)\b/i,                CATEGORIES.WOVEN],
+  [/\b(HOODIES?|HOODED|SWEATSHIRTS?|CREWNECKS?|PULLOVERS?|FLEECE|SWEATERS?)\b/i,                          CATEGORIES.FLEECE],
+  [/\b(PANTS?|SHORTS?|JOGGERS?|SWEATPANTS?|LEGGINGS?|TROUSERS?|SKIRTS?)\b/i,                              CATEGORIES.BOTTOMS],
+  [/\b(T[- ]?SHIRTS?|TEES?|TANKS?|MUSCLE)\b/i,                                                            CATEGORIES.T_SHIRTS],
+  [/\b(ACTIVEWEAR|PERFORMANCE|ATHLETIC|SPORTS?)\b/i,                                                      CATEGORIES.ACTIVEWEAR],
+  [/\b(WORKWEAR|HI-?VIS|SAFETY|COVERALLS?|MECHANIC)\b/i,                                                  CATEGORIES.WORKWEAR],
+  [/\b(YOUTH|INFANT|TODDLER|BABY|KIDS?)\b/i,                                                              CATEGORIES.YOUTH],
+  [/\b(LADIES|WOMEN'?S?|MATERNITY)\b/i,                                                                   CATEGORIES.LADIES],
+  [/\b(TOWELS?|BLANKETS?|SCARF|SCARVES|SOCKS?|GLOVES?|APRONS?|UMBRELLAS?|ACCESSOR)\b/i,                   CATEGORIES.ACCESSORIES],
 ];
 
 /**
