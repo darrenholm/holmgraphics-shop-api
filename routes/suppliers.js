@@ -38,6 +38,39 @@ router.get('/sanmar/debug-product', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── GET /api/suppliers/sanmar/debug-style?style=ATC1000 ─────────────────────
+// Diagnostic: is this style in our DB? what's its state? Admin only.
+router.get('/sanmar/debug-style', requireAdmin, async (req, res) => {
+  const style = String(req.query.style || '').trim();
+  if (!style) return res.status(400).json({ message: 'style query param required' });
+  try {
+    // Exact + fuzzy (ATC1000 vs 1000 vs ATC1000P) case-insensitive lookup.
+    const exact = await query(
+      `SELECT p.id, p.style, p.brand, p.product_name, p.category, p.category_raw,
+              p.is_sellable, p.is_discontinued, p.price_group, p.discount_code,
+              p.last_synced_at,
+              (SELECT COUNT(*) FROM supplier_variant v WHERE v.product_id = p.id)::int AS variant_count
+         FROM supplier_product p
+         JOIN supplier s ON s.id = p.supplier_id
+        WHERE s.code = 'sanmar_ca' AND UPPER(p.style) = UPPER($1)`,
+      [style],
+    );
+    const fuzzy = await query(
+      `SELECT p.style, p.product_name, p.category, p.is_sellable, p.is_discontinued
+         FROM supplier_product p
+         JOIN supplier s ON s.id = p.supplier_id
+        WHERE s.code = 'sanmar_ca' AND UPPER(p.style) LIKE UPPER($1)
+        ORDER BY p.style
+        LIMIT 30`,
+      [`%${style}%`],
+    );
+    res.json({ ok: true, exact, fuzzy });
+  } catch (e) {
+    console.error('sanmar debug-style:', e);
+    res.status(500).json({ ok: false, message: 'debug-style failed', detail: e.message });
+  }
+});
+
 // ─── GET /api/suppliers ──────────────────────────────────────────────────────
 // List all registered suppliers + their most recent successful ingest.
 router.get('/', requireAdmin, async (req, res) => {
