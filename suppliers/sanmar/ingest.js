@@ -43,9 +43,14 @@ function sizeSortKey(size) {
   return SIZE_ORDER[upper] ?? 999;
 }
 
-// Is this variant a discontinued row? SanMar flags in two places.
+// Is this variant a discontinued row?
+//
+// Historical note: we previously treated priceGroup === 'DR' as a discontinued
+// signal. That was wrong — DR means "call for pricing" (pricing hidden at the
+// wholesale level, e.g. staple SKUs like ATC1000). Those products are still
+// actively sold. The only reliable discontinued signal in Bulk Data is the
+// productName prefix.
 function looksDiscontinued(v) {
-  if (v.priceGroup && v.priceGroup.toUpperCase() === 'DR') return true;
   if (v.productName && /^\s*DISCONTINU/i.test(v.productName)) return true;
   return false;
 }

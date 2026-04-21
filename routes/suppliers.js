@@ -38,6 +38,29 @@ router.get('/sanmar/debug-product', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/suppliers/sanmar/reset-dr-flag ────────────────────────────────
+// One-shot data repair: clear is_discontinued on rows that were flagged solely
+// because their price_group is 'DR'. DR = "call for pricing", not end-of-life.
+// Truly discontinued rows still have productName starting with "DISCONTINU" —
+// those stay flagged.
+router.post('/sanmar/reset-dr-flag', requireAdmin, async (req, res) => {
+  try {
+    const result = await query(
+      `UPDATE supplier_product
+          SET is_discontinued = FALSE
+        WHERE supplier_id = (SELECT id FROM supplier WHERE code = 'sanmar_ca')
+          AND is_discontinued = TRUE
+          AND price_group = 'DR'
+          AND (product_name IS NULL OR product_name NOT ILIKE 'DISCONTINU%')
+        RETURNING id, style`,
+    );
+    res.json({ ok: true, cleared: result.length, styles: result.map((r) => r.style) });
+  } catch (e) {
+    console.error('sanmar reset-dr-flag:', e);
+    res.status(500).json({ ok: false, message: 'reset-dr-flag failed', detail: e.message });
+  }
+});
+
 // ─── GET /api/suppliers/sanmar/debug-style?style=ATC1000 ─────────────────────
 // Diagnostic: is this style in our DB? what's its state? Admin only.
 router.get('/sanmar/debug-style', requireAdmin, async (req, res) => {
