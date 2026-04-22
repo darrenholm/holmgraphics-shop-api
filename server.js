@@ -11,6 +11,7 @@ const lookupRoutes     = require('./routes/lookup');
 const quickbooksRoutes = require('./routes/quickbooks');
 const suppliersRoutes  = require('./routes/suppliers');
 const catalogRoutes    = require('./routes/catalog');
+const clientsRoutes    = require('./routes/clients');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,7 @@ app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
 app.use('/api/catalog',    catalogRoutes);
+app.use('/api/clients',    clientsRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {

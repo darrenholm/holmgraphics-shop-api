@@ -108,6 +108,12 @@ router.get('/', requireAuth, async (req, res) => {
               p.contact_name AS contact,
               p.contact_phone,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              -- client_folder_name is what the files-bridge should use. Falls
+              -- back to the derived name when no manual override is set.
+              COALESCE(NULLIF(c.files_folder, ''),
+                       c.company,
+                       CONCAT_WS(' ', c.fname, c.lname)) AS client_folder_name,
+              c.files_folder AS client_folder_override,
               s.name AS status_name,
               pt.name AS project_type,
               CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_to
@@ -255,6 +261,12 @@ router.get('/:id', requireAuth, async (req, res) => {
               p.contact_phone,
               p.contact_email,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              -- client_folder_name is what the files-bridge should use. Falls
+              -- back to the derived name when no manual override is set.
+              COALESCE(NULLIF(c.files_folder, ''),
+                       c.company,
+                       CONCAT_WS(' ', c.fname, c.lname)) AS client_folder_name,
+              c.files_folder AS client_folder_override,
               c.email AS client_email,
               s.name AS status_name,
               pt.name AS project_type,
