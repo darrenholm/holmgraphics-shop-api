@@ -38,11 +38,14 @@ app.use(express.json());
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth',       authRoutes);
 app.use('/api/projects',   projectRoutes);
+// /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
+// otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
+// (parsing "folder-mappings" as an integer id and crashing the query).
+app.use('/api/clients',    clientsRoutes);
 app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
 app.use('/api/catalog',    catalogRoutes);
-app.use('/api/clients',    clientsRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
