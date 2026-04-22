@@ -6,11 +6,16 @@
 //   1. Call GetBulkData — one request, whole catalog.
 //   2. Group the flat variant list by `style` to derive parent products.
 //   3. Upsert supplier_product rows (one per style).
-//   4. Upsert supplier_variant rows (one per productId).
+//   4. Upsert supplier_variant rows (one per productId), applying the
+//      hand-curated colour-hex map so the storefront has real swatch dots
+//      after every sync (SanMar's APIs don't expose hex at all — see
+//      suppliers/sanmar/color-hex-map.js for the full rationale).
 //   5. Record the run in sync_run.
 //
 // Idempotent: ON CONFLICT DO UPDATE everywhere. Re-running the same night
-// just refreshes last_synced_at + mutates changed fields.
+// just refreshes last_synced_at + mutates changed fields. color_hex is
+// preserved via COALESCE so a later manual edit or a media-backfill-sourced
+// hex survives a nightly re-run even if it's not in the map yet.
 //
 // CLI usage (runs a full sync against SANMAR_ENV):
 //   node suppliers/sanmar/ingest.js
@@ -23,6 +28,7 @@ require('dotenv').config();
 
 const { pool, query, queryOne } = require('../../db/connection');
 const sanmar = require('./index');
+const { lookupHex } = require('./color-hex-map');
 
 // ── size → sort order map so variants display S < M < L < XL consistently ─
 const SIZE_ORDER = {
@@ -87,7 +93,6 @@ function groupConsensus(arr, key) {
 // ── DB upserts ──────────────────────────────────────────────────────────
 
 async function upsertProduct(client, supplierId, style, group) {
-  const rep = group[0];  // representative row for style-level fields
   const brand        = firstNonNull(group, 'brand');
   const productName  = firstNonNull(group, 'productName');
   const frProductName = firstNonNull(group, 'frProductName');
@@ -146,22 +151,30 @@ async function upsertProduct(client, supplierId, style, group) {
 }
 
 async function upsertVariant(client, productId, v) {
+  // SanMar never ships colour hex on any surface — Bulk Data, Product Data
+  // and Media Content all lack it. The hand-curated map is the only path.
+  // Anything not in the map leaves color_hex NULL and the UI shows grey.
+  const hexFromMap = lookupHex(v.swatchColor);
+
   await client.query(
     `
     INSERT INTO supplier_variant (
       product_id, supplier_variant_id,
       size, size_order,
-      color_name, fr_color_name,
+      color_name, fr_color_name, color_hex,
       weight_lb, image_url,
       quantity, price, sale_price, sale_end_date, currency,
       raw_json, last_synced_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'CAD', $13::jsonb, NOW())
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'CAD', $14::jsonb, NOW())
     ON CONFLICT (product_id, supplier_variant_id) DO UPDATE SET
       size            = EXCLUDED.size,
       size_order      = EXCLUDED.size_order,
       color_name      = EXCLUDED.color_name,
       fr_color_name   = EXCLUDED.fr_color_name,
+      -- COALESCE preserves any hex already set (e.g. by media-backfill or
+      -- a manual correction) when the map doesn't know this colour yet.
+      color_hex       = COALESCE(EXCLUDED.color_hex, supplier_variant.color_hex),
       weight_lb       = EXCLUDED.weight_lb,
       image_url       = EXCLUDED.image_url,
       quantity        = EXCLUDED.quantity,
@@ -174,7 +187,7 @@ async function upsertVariant(client, productId, v) {
     [
       productId, v.supplierVariantId,
       v.size, sizeSortKey(v.size),
-      v.swatchColor, v.frSwatchColor,
+      v.swatchColor, v.frSwatchColor, hexFromMap,
       v.weight, v.imageUrl,
       v.quantity, v.price, v.salePrice, v.saleEndDate,
       JSON.stringify({
@@ -217,6 +230,10 @@ async function runSanmarIngest({ log = console.log } = {}) {
   let productsUpserted = 0;
   let variantsUpserted = 0;
 
+  // Colour-map coverage reporting — so we notice when SanMar introduces a
+  // new colour name we haven't added to the map.
+  const unmappedColours = new Map();   // name → hit count
+
   try {
     const client = sanmar.makeClient();
     log(`sanmar ingest: calling GetBulkData (env=${client.config.env})`);
@@ -238,6 +255,12 @@ async function runSanmarIngest({ log = console.log } = {}) {
         for (const v of group) {
           await upsertVariant(db, productId, v);
           variantsUpserted++;
+          if (v.swatchColor && !lookupHex(v.swatchColor)) {
+            unmappedColours.set(
+              v.swatchColor,
+              (unmappedColours.get(v.swatchColor) || 0) + 1,
+            );
+          }
         }
         await db.query('COMMIT');
         productsUpserted++;
@@ -247,6 +270,18 @@ async function runSanmarIngest({ log = console.log } = {}) {
       } finally {
         db.release();
       }
+    }
+
+    // Surface the top-N unmapped colours so we can add them to color-hex-map.js.
+    if (unmappedColours.size > 0) {
+      const top = [...unmappedColours.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 25)
+        .map(([name, n]) => `${name} (${n})`);
+      log(
+        `sanmar ingest: ${unmappedColours.size} colour names missing from hex map — ` +
+        `top: ${top.join(', ')}`,
+      );
     }
 
     await pool.query(
@@ -261,7 +296,13 @@ async function runSanmarIngest({ log = console.log } = {}) {
     log(
       `sanmar ingest: done — products=${productsUpserted} variants=${variantsUpserted}`,
     );
-    return { syncId, productsUpserted, variantsUpserted, messages };
+    return {
+      syncId,
+      productsUpserted,
+      variantsUpserted,
+      messages,
+      unmappedColours: Object.fromEntries(unmappedColours),
+    };
   } catch (e) {
     await pool.query(
       `UPDATE sync_run SET

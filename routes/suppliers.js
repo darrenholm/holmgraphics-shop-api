@@ -6,7 +6,7 @@
 // Public-facing catalog browse endpoints live in routes/catalog.js.
 
 const express = require('express');
-const { query, queryOne } = require('../db/connection');
+const { pool, query, queryOne } = require('../db/connection');
 const { requireAdmin } = require('../middleware/auth');
 const { runSanmarIngest } = require('../suppliers/sanmar/ingest');
 const { backfillCategories } = require('../suppliers/sanmar/category-backfill');
@@ -14,6 +14,7 @@ const { backfillMedia } = require('../suppliers/sanmar/media-backfill');
 const { loadConfig: loadSanmarConfig } = require('../suppliers/sanmar/config');
 const { getProduct: getSanmarProduct } = require('../suppliers/promostandards/product-data');
 const { getMediaContent: getSanmarMedia } = require('../suppliers/promostandards/media-content');
+const { lookupHex: lookupSanmarHex } = require('../suppliers/sanmar/color-hex-map');
 
 const router = express.Router();
 
@@ -169,6 +170,7 @@ router.get('/sanmar/debug-media', requireAdmin, async (req, res) => {
     const colorSummary = Object.fromEntries(
       Object.entries(byColor).map(([k, v]) => [k, {
         hexes: [...v.hexes],
+        mapHex: lookupSanmarHex(k),
         classTypes: [...v.classTypes],
         urlCount: v.urls.size,
       }])
@@ -184,6 +186,118 @@ router.get('/sanmar/debug-media', requireAdmin, async (req, res) => {
   } catch (e) {
     console.error('sanmar debug-media:', e);
     res.status(500).json({ ok: false, message: 'debug-media failed', detail: e.message });
+  }
+});
+
+// ─── POST /api/suppliers/sanmar/apply-color-hex ──────────────────────────────
+// One-shot data repair: walk every distinct color_name in supplier_variant
+// rows for SanMar, look it up in the hand-curated color-hex-map.js, and
+// UPDATE matching rows. Lets us seed hex into existing catalog data without
+// waiting for a full Bulk Data ingest.
+//
+// Query params:
+//   ?refresh=1  → overwrite non-NULL color_hex values too (default: only
+//                 touch rows where color_hex IS NULL)
+//   ?dry-run=1  → compute counts, return them, write nothing
+//   ?limit=N    → cap to the first N distinct colours (smoke test)
+router.post('/sanmar/apply-color-hex', requireAdmin, async (req, res) => {
+  const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const dryRun  = req.query['dry-run'] === '1' || req.query['dry-run'] === 'true'
+              || req.query.dryRun === '1' || req.query.dryRun === 'true';
+  const limit   = req.query.limit ? Math.max(1, Number(req.query.limit)) : null;
+  const logs    = [];
+  const log     = (m) => logs.push(m);
+
+  try {
+    const { rows: colorRows } = await pool.query(
+      `SELECT DISTINCT v.color_name
+         FROM supplier_variant v
+         JOIN supplier_product p ON p.id = v.product_id
+         JOIN supplier s         ON s.id = p.supplier_id
+        WHERE s.code = 'sanmar_ca'
+          AND v.color_name IS NOT NULL
+          ${refresh ? '' : 'AND v.color_hex IS NULL'}
+        ORDER BY v.color_name
+        ${limit ? `LIMIT ${Number(limit)}` : ''}`,
+    );
+    log(`apply-color-hex: ${colorRows.length} distinct colour names to process ` +
+        `(refresh=${refresh}, dryRun=${dryRun})`);
+
+    let resolved    = 0;
+    let unmapped    = 0;
+    let rowsUpdated = 0;
+    const misses    = [];
+
+    for (const { color_name: colorName } of colorRows) {
+      const hex = lookupSanmarHex(colorName);
+      if (!hex) {
+        unmapped++;
+        misses.push(colorName);
+        continue;
+      }
+      resolved++;
+
+      if (dryRun) {
+        // Count how many rows would be affected, don't mutate.
+        const { rows: cnt } = await pool.query(
+          `SELECT COUNT(*)::int AS n
+             FROM supplier_variant v
+             JOIN supplier_product p ON p.id = v.product_id
+             JOIN supplier s         ON s.id = p.supplier_id
+            WHERE s.code = 'sanmar_ca'
+              AND LOWER(v.color_name) = LOWER($1)
+              ${refresh ? '' : 'AND v.color_hex IS NULL'}`,
+          [colorName],
+        );
+        rowsUpdated += cnt[0].n;
+      } else {
+        const upd = await pool.query(
+          `UPDATE supplier_variant
+              SET color_hex = $1,
+                  last_synced_at = NOW()
+            WHERE id IN (
+              SELECT v.id
+                FROM supplier_variant v
+                JOIN supplier_product p ON p.id = v.product_id
+                JOIN supplier s         ON s.id = p.supplier_id
+               WHERE s.code = 'sanmar_ca'
+                 AND LOWER(v.color_name) = LOWER($2)
+                 ${refresh ? '' : 'AND v.color_hex IS NULL'}
+            )`,
+          [hex, colorName],
+        );
+        rowsUpdated += upd.rowCount || 0;
+      }
+    }
+
+    log(
+      `apply-color-hex: done — resolved=${resolved}, unmapped=${unmapped}, ` +
+      `rowsUpdated=${rowsUpdated}${dryRun ? ' (dry run)' : ''}`,
+    );
+    if (misses.length) {
+      log(`apply-color-hex: missing from map: ${misses.slice(0, 40).join(', ')}` +
+          (misses.length > 40 ? ` … and ${misses.length - 40} more` : ''));
+    }
+
+    res.json({
+      ok: true,
+      dryRun,
+      refresh,
+      distinctColours: colorRows.length,
+      resolved,
+      unmapped,
+      rowsUpdated,
+      misses,
+      logs,
+    });
+  } catch (e) {
+    console.error('sanmar apply-color-hex:', e);
+    res.status(500).json({
+      ok: false,
+      message: 'apply-color-hex failed',
+      detail: e.message,
+      logs,
+    });
   }
 });
 

@@ -2,19 +2,20 @@
 //
 // Per-colour metadata sync for SanMar Canada.
 //
-// Bulk Data 1.0 gives us price + stock but nothing visual beyond a single
-// `imageUrl` string per variant — in particular, no colour-hex codes (the
-// storefront falls back to grey circles) and nothing for DR staple SKUs that
-// ship with no imagery at all.
+// Bulk Data 1.0 gives us price + stock but only a single `imageUrl` string
+// per variant, and Media Content 1.2 — the cleanest per-image response we
+// can get — still has NO hex field in its schema. This job therefore:
 //
-// This job walks sellable styles, calls MediaContent 1.1.0 getMediaContent,
-// and uses the response to populate supplier_variant rows:
+//   image_url  ← MediaContent 1.2 Primary images when the variant row is
+//                missing imagery (e.g. ATC1000 family — SanMar doesn't ship
+//                Bulk Data images for DR products)
 //
-//   color_hex  ← from swatch items (or a Color.hex buried anywhere in the
-//                MediaContent item), matched by colorName or partId
-//   image_url  ← from classType='Primary' images when the row is missing
-//                imagery (e.g. ATC1000 family — SanMar doesn't ship Bulk
-//                Data images for DR products)
+//   color_hex  ← Hand-curated color-hex-map.js. We once also scraped hex
+//                from MediaContent items that had it, but v1.2 doesn't
+//                standardise hex at all; the map is the source of truth.
+//                Any hex a MediaContent response does happen to contain is
+//                still honoured (some suppliers ship a custom extension),
+//                the map is the fallback.
 //
 // Strategy mirrors category-backfill.js:
 //   - Resumable (only touches rows missing what we'd backfill unless --refresh)
@@ -34,6 +35,7 @@ require('dotenv').config();
 const { pool, query } = require('../../db/connection');
 const { loadConfig } = require('./config');
 const { getMediaContent } = require('../promostandards/media-content');
+const { lookupHex } = require('./color-hex-map');
 
 const DEFAULT_RATE_MS = 400;
 const RETRY_LIMIT     = 3;
@@ -123,10 +125,14 @@ async function backfillMedia({
             hexByColor.set(colorKey, item.colorHex);
           }
 
+          // v1.2 puts the file kind on `fileType`; our parser normalises it
+          // to `mediaType`. Be tolerant of null (some adapters omit it when
+          // the URL is obviously an image).
+          const isImage = !item.mediaType || /image/i.test(item.mediaType);
           if (
             !skipImages &&
             item.url &&
-            item.mediaType === 'Image' &&
+            isImage &&
             (item.classType === 'Primary' || item.classType === null)
           ) {
             for (const pid of (item.partIds || [])) {
@@ -135,6 +141,24 @@ async function backfillMedia({
             if (colorKey && !primaryImageByColor.has(colorKey)) {
               primaryImageByColor.set(colorKey, item.url);
             }
+          }
+        }
+
+        // Fallback: hand-curated map covers colours MediaContent didn't
+        // give us hex for. Look at the colour names actually present on
+        // this product's variants.
+        const { rows: variantColors } = await pool.query(
+          `SELECT DISTINCT color_name
+             FROM supplier_variant
+            WHERE product_id = $1
+              AND color_name IS NOT NULL`,
+          [row.id],
+        );
+        for (const r of variantColors) {
+          const colorKey = r.color_name.toLowerCase();
+          if (!hexByColor.has(colorKey)) {
+            const mapHex = lookupHex(r.color_name);
+            if (mapHex) hexByColor.set(colorKey, mapHex);
           }
         }
 
