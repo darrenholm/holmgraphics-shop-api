@@ -205,24 +205,58 @@ const MAP = {
 };
 
 /**
- * Look up a hex code for a SanMar colour name.
+ * Normalize a SanMar colour name into the form used as a MAP key.
  *
- * Match is case-insensitive, whitespace-trimmed. Registered (®) / trademark
- * (™) symbols and parenthetical suffixes are stripped. Returns null for
- * unknown names — caller writes NULL and the UI shows a grey circle.
+ * Handles the common noise SanMar feeds us:
+ *   - ®/™/© trademark symbols          ("Realtree Xtra®"        → "realtree xtra")
+ *   - parenthetical suffixes           ("Navy (Heather)"        → "navy")
+ *   - asterisk decorators              ("Athletic Heather**"    → "athletic heather")
+ *   - caret prefixes on safety colours ("^Safety Green"         → "safety green")
+ *   - inseam suffixes on pants/shorts  ("Black Inseam 30\""     → "black")
+ *   - leading/trailing + repeated ws   ("Athletic  Heather"     → "athletic heather")
+ *   - case                             ("BLACK"                 → "black")
  *
- * @param {string|null|undefined} colorName  e.g. "Athletic Heather", "Realtree Xtra®"
- * @returns {string|null}  "#RRGGBB" or null
+ * Exported so the ingest/backfill paths can use the same canonical form.
  */
-function lookupHex(colorName) {
-  if (!colorName) return null;
-  const key = String(colorName)
-    .replace(/[®™©]/g, '')
-    .replace(/\s*\([^)]*\)\s*/g, ' ')
+function normalizeColorName(colorName) {
+  if (colorName == null) return '';
+  return String(colorName)
+    .replace(/[®™©]/g, '')                    // trademark symbols
+    .replace(/\s*\([^)]*\)\s*/g, ' ')         // parenthetical suffixes
+    .replace(/\*+/g, '')                      // asterisks anywhere
+    .replace(/^\^+/, '')                      // leading carets
+    .replace(/\s+inseam\s+\d+"?/gi, '')       // "Inseam 30\"" size suffix
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ');
-  return MAP[key] || null;
 }
 
-module.exports = { lookupHex, MAP };
+/**
+ * Look up a hex code for a SanMar colour name.
+ *
+ * Match is case-insensitive, whitespace-trimmed, and aggressively normalized
+ * (see normalizeColorName). For two-tone names ("Black/White", "Navy/Gold")
+ * we fall back to the body colour (everything before the first slash), which
+ * is SanMar's convention. Returns null for unknown names — caller writes
+ * NULL and the UI shows a grey circle.
+ *
+ * @param {string|null|undefined} colorName  e.g. "Athletic Heather", "Realtree Xtra®", "Black/White"
+ * @returns {string|null}  "#RRGGBB" or null
+ */
+function lookupHex(colorName) {
+  const key = normalizeColorName(colorName);
+  if (!key) return null;
+
+  // Direct hit on the full (normalized) name
+  if (MAP[key]) return MAP[key];
+
+  // Two-tone fallback: use body colour only
+  if (key.includes('/')) {
+    const body = normalizeColorName(key.split('/')[0]);
+    if (body && body !== key && MAP[body]) return MAP[body];
+  }
+
+  return null;
+}
+
+module.exports = { lookupHex, normalizeColorName, MAP };
