@@ -616,6 +616,24 @@ const MAP = {
 
   // Oatmeal
   'oatmeal heather':       '#D6CCB2',
+
+  // Final sweep — colors surfaced by the dry-run apply-color-hex pass
+  'blizzard':              '#DDE4E7',
+  'carolina':              '#7BA4DB',
+  'concord purple':        '#5A4B8B',
+  'coyote brown':          '#81613C',
+  'faded blue':            '#7A9FC4',
+  'heather indigo':        '#4B4B6B',
+  'heather irish green':   '#4A7F5E',
+  'heather maroon':        '#6B2C39',
+  'heather military green':'#4A5D3A',
+  'heather orange':        '#D45C2E',
+  'indigo frost':          '#7E8AB5',
+  'jasper blue':           '#507089',
+  'rainyday ivory':        '#D8CEB5',
+  'scarlet red heather':   '#A82238',
+  'true navy heather':     '#2B3250',
+  'true royal heather':    '#3A4F9F',
 };
 
 /**
