@@ -260,6 +260,7 @@ router.get('/:id', requireAuth, async (req, res) => {
               p.contact_name AS contact,
               p.contact_phone,
               p.contact_email,
+              p.po_number,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
               -- client_folder_name is what the files-bridge should use. Falls
               -- back to the derived name when no manual override is set.
@@ -311,6 +312,7 @@ router.post('/', requireStaff, async (req, res) => {
   const {
     project_name, client_id, project_type_id, status_id,
     assigned_employee_id, due_date, contact, contact_phone, contact_email,
+    po_number,
   } = req.body;
   if (!project_name || !client_id) {
     return res.status(400).json({ message: 'project_name and client_id are required' });
@@ -320,11 +322,11 @@ router.post('/', requireStaff, async (req, res) => {
       `INSERT INTO projects (
           description, client_id, project_type_id, status_id,
           production_emp_id, due_date, contact_name, contact_phone,
-          contact_email, created_date
+          contact_email, po_number, created_date
        ) VALUES (
           $1, $2, $3, $4,
           $5, $6, $7, $8,
-          $9, CURRENT_DATE
+          $9, $10, CURRENT_DATE
        )
        RETURNING id`,
       [
@@ -337,6 +339,7 @@ router.post('/', requireStaff, async (req, res) => {
         contact || null,
         contact_phone || null,
         contact_email || null,
+        po_number ? String(po_number).trim() || null : null,
       ]
     );
     res.status(201).json({ id: rows[0]?.id, message: 'Project created' });
@@ -352,6 +355,7 @@ router.put('/:id', requireStaff, async (req, res) => {
   const {
     project_name, client_id, project_type_id, status_id,
     assigned_employee_id, due_date, contact, contact_phone, contact_email,
+    po_number,
   } = req.body;
   try {
     await query(
@@ -364,8 +368,9 @@ router.put('/:id', requireStaff, async (req, res) => {
               due_date          = $6,
               contact_name      = $7,
               contact_phone     = $8,
-              contact_email     = $9
-        WHERE id = $10`,
+              contact_email     = $9,
+              po_number         = $10
+        WHERE id = $11`,
       [
         project_name,
         parseInt(client_id),
@@ -376,6 +381,7 @@ router.put('/:id', requireStaff, async (req, res) => {
         contact || null,
         contact_phone || null,
         contact_email || null,
+        po_number ? String(po_number).trim() || null : null,
         id,
       ]
     );

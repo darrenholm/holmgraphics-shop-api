@@ -122,6 +122,52 @@ async function qbPost(path, body) {
   return res.json();
 }
 
+// ─── PO# custom-field discovery ──────────────────────────────────────────────
+// QBO Online does NOT have a top-level PONumber on the Invoice entity (that
+// was QB Desktop). The "P.O. Number" field visible on the invoice entry
+// form and template is a *custom field* — QBO gives each company 3 custom
+// slots (DefinitionId 1/2/3) that the admin names. On this tenant slot 1
+// is labelled "P.O. Number" (see the "CUSTOM-1" placeholder on the
+// template customiser).
+//
+// We look up the DefinitionId dynamically from /preferences so this
+// survives if the slots get reshuffled later. Cached in-process — a
+// process bounce refreshes it. If the lookup fails we fall back to
+// slot "1" with Name "P.O. Number", which matches what the UI shows today.
+
+// undefined = never checked, null = checked and not found, string = id
+let poCustomFieldIdCache;
+
+async function getPoCustomFieldId() {
+  if (poCustomFieldIdCache !== undefined) return poCustomFieldIdCache;
+  try {
+    const prefs = await qbGet('/preferences');
+    // SalesFormsPrefs.CustomField is an array of entries like:
+    //   { Name: 'SalesFormsPrefs.UseSalesCustom1',  BooleanValue: true  }
+    //   { Name: 'SalesFormsPrefs.SalesCustomName1', StringValue: 'P.O. Number' }
+    // Slot number is the trailing digit in Name.
+    const fields = prefs?.Preferences?.SalesFormsPrefs?.CustomField || [];
+    for (const f of fields) {
+      if (!/SalesCustomName\d/.test(f.Name || '')) continue;
+      const label = f.StringValue || '';
+      if (/p\.?o\.?\s*(number|#)?|purchase\s*order/i.test(label)) {
+        const slot = (f.Name.match(/(\d)$/) || [])[1];
+        if (slot) {
+          poCustomFieldIdCache = slot;
+          return slot;
+        }
+      }
+    }
+    poCustomFieldIdCache = null;
+    return null;
+  } catch (e) {
+    // Don't cache failures — transient token/network issues shouldn't
+    // permanently break PO# export for this process.
+    console.warn('QB preferences lookup failed:', e.message);
+    return null;
+  }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // AUTH ROUTES
 // ═════════════════════════════════════════════════════════════════════════════
@@ -263,6 +309,12 @@ router.post('/invoice/project/:id', async (req, res) => {
   try {
     const { client_name, description, items, project_number } = req.body;
     const client_email = cleanEmail(req.body.client_email);
+    // Customer-supplied PO#. Optional. Rendered on the printed/emailed
+    // invoice via CustomerMemo and stashed in PrivateNote for internal
+    // search. QBO Online has no dedicated PONumber field on Invoice (that
+    // was QB Desktop); the "P.O. Number" field on the QBO invoice screen
+    // is a company-configured custom field we can't rely on being there.
+    const po_number = (req.body.po_number || '').toString().trim();
     if (!client_name || !items?.length) {
       return res.status(400).json({ error: 'client_name and items are required' });
     }
@@ -322,15 +374,36 @@ router.post('/invoice/project/:id', async (req, res) => {
     }));
 
     // Create the invoice.
+    const privateNote = po_number
+      ? `Holm Graphics Project #${project_number || req.params.id} — Customer PO# ${po_number}`
+      : `Holm Graphics Project #${project_number || req.params.id}`;
+
+    // Discover the company-configured P.O. Number custom-field slot. Fall
+    // back to slot "1" which is what this tenant uses today (the invoice
+    // template customiser shows "CUSTOM-1" as the P.O. Number placeholder).
+    let poField = null;
+    if (po_number) {
+      const defId = (await getPoCustomFieldId()) || '1';
+      poField = {
+        DefinitionId: defId,
+        Name:         'P.O. Number',
+        Type:         'StringType',
+        StringValue:  po_number,
+      };
+    }
+
     const invData = await qbPost('/invoice?minorversion=65', {
       CustomerRef: { value: customerId },
       DocNumber:   String(project_number || req.params.id),
-      PrivateNote: `Holm Graphics Project #${project_number || req.params.id}`,
+      PrivateNote: privateNote,
       Line,
       TxnTaxDetail: {
         TxnTaxCodeRef: { value: '7' },
         TotalTax: 0,
       },
+      // Native "P.O. Number" field on the invoice — QBO stores it as a
+      // custom field entry keyed by DefinitionId.
+      ...(poField ? { CustomField: [poField] } : {}),
       ...(client_email
         ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' }
         : {}),
