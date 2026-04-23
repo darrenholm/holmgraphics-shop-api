@@ -11,18 +11,26 @@ const router = express.Router();
 router.get('/clients', requireStaff, async (req, res) => {
   try {
     const { search } = req.query;
+    // The clients list page wants more than 50 rows; cap at 1000 to keep the
+    // payload manageable. ?limit=50 remains the default so the existing jobs/new
+    // lookup keeps its snappy shape.
+    let limit = parseInt(req.query.limit, 10);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 50;
+    if (limit > 1000) limit = 1000;
+
     const params = [];
     let where = '';
     if (search) {
       params.push(`%${search}%`);
-      where = `WHERE company ILIKE $1 OR fname ILIKE $1 OR lname ILIKE $1`;
+      where = `WHERE company ILIKE $1 OR fname ILIKE $1 OR lname ILIKE $1 OR email ILIKE $1`;
     }
+    params.push(limit);
     const rows = await query(
       `SELECT id, company AS company_name, fname AS first_name, lname AS last_name, email
          FROM clients
          ${where}
         ORDER BY COALESCE(company, lname)
-        LIMIT 50`,
+        LIMIT $${params.length}`,
       params
     );
     res.json(rows);
