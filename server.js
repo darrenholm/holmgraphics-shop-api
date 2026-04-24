@@ -5,13 +5,20 @@ const cors    = require('cors');
 
 const { runMigrations } = require('./db/migrate');
 
-const authRoutes       = require('./routes/auth');
-const projectRoutes    = require('./routes/projects');
-const lookupRoutes     = require('./routes/lookup');
-const quickbooksRoutes = require('./routes/quickbooks');
-const suppliersRoutes  = require('./routes/suppliers');
-const catalogRoutes    = require('./routes/catalog');
-const clientsRoutes    = require('./routes/clients');
+const authRoutes         = require('./routes/auth');
+const projectRoutes      = require('./routes/projects');
+const lookupRoutes       = require('./routes/lookup');
+const quickbooksRoutes   = require('./routes/quickbooks');
+const suppliersRoutes    = require('./routes/suppliers');
+const catalogRoutes      = require('./routes/catalog');
+const clientsRoutes      = require('./routes/clients');
+const customerAuthRoutes = require('./routes/customer-auth');
+const dtfConfigRoutes    = require('./routes/dtf-config');
+const ordersRoutes       = require('./routes/orders');
+const designsRoutes      = require('./routes/designs');
+const proofsRoutes       = require('./routes/proofs');
+const dtfAdminRoutes     = require('./routes/dtf-admin');
+const ordersAdminRoutes  = require('./routes/orders-admin');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -37,6 +44,13 @@ app.use(express.json());
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth',       authRoutes);
+app.use('/api/customer',     customerAuthRoutes);
+app.use('/api/dtf',          dtfConfigRoutes);
+app.use('/api/orders',       ordersRoutes);
+app.use('/api/designs',      designsRoutes);
+app.use('/api/proofs',       proofsRoutes);
+app.use('/api/admin/dtf',    dtfAdminRoutes);
+app.use('/api/admin/orders', ordersAdminRoutes);
 app.use('/api/projects',   projectRoutes);
 // /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
@@ -95,7 +109,7 @@ app.use((err, req, res, next) => {
         dbHost = `${u.hostname}:${u.port}/${u.pathname.slice(1)}`;
       } catch { dbHost = '(invalid DATABASE_URL)'; }
     }
-    console.log(`\nHolm Graphics API running on port ${PORT}`);
+    console.log(`Holm Graphics API listening on port ${PORT}`);
     console.log(`   Health:     http://localhost:${PORT}/api/health`);
     console.log(`   Photos:     ${process.env.WHC_PUBLIC_BASE || '(WHC_PUBLIC_BASE unset)'}`);
     console.log(`   Postgres:   ${dbHost}\n`);

@@ -3,9 +3,17 @@
 // onto the Railway pg foundation: table names lowercased, mssql `dbQuery`
 // helper replaced with our pg `query`, `CAST(... AS NVARCHAR)` dropped.
 //
-// OAuth tokens live in memory for now — a Railway redeploy clears them,
-// and you'll have to hit /connect again. TODO: persist in a `qb_tokens`
-// table so tokens survive deploys.
+// OAuth tokens are persisted to the `qbo_tokens` table (migration 007), so
+// they survive Railway redeploys. Refresh-on-demand: tokens that are within
+// 60 s of expiry are refreshed before the next API call and the new pair is
+// written back to DB.
+//
+// SCOPES includes both `accounting` (for invoices/customers/items) and
+// `payment` (for QB Payments — used by the DTF online store to charge
+// customer cards inline at checkout). After deploying this change, a one-
+// time re-click of /api/quickbooks/connect is required so the QBO consent
+// screen grants the new payment scope. The connect flow detects when the
+// stored scope is narrower than what's requested and re-prompts.
 //
 // All routes are currently public (no auth). The frontend calls them from
 // the admin-quickbooks.html page. TODO: gate the mutating routes behind
@@ -13,15 +21,19 @@
 
 const express = require('express');
 const crypto  = require('crypto');
-const { query } = require('../db/connection');
+const { query, queryOne } = require('../db/connection');
+const {
+  REQUIRED_SCOPES: SCOPES,
+  QB_TOKEN_URL,
+  getTokens, saveTokens, clearTokens,
+  hasRequiredScopes, refreshAccessToken, activeTokens,
+} = require('../lib/qbo-tokens');
 
 const router = express.Router();
 
 // ─── QB endpoints ────────────────────────────────────────────────────────────
 const QB_AUTH_URL   = 'https://appcenter.intuit.com/connect/oauth2';
-const QB_TOKEN_URL  = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer';
 const QB_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
-const SCOPES        = 'com.intuit.quickbooks.accounting';
 
 function QB_BASE() {
   // NODE_ENV=production hits real QB; anything else hits sandbox.
@@ -48,51 +60,9 @@ function cleanEmail(raw) {
   return s;
 }
 
-// ─── In-memory token store ───────────────────────────────────────────────────
-let _tokens = null;
-async function getTokens()     { return _tokens; }
-async function saveTokens(t)   { _tokens = t; }
-async function clearTokens()   { _tokens = null; }
-
-// ─── Token refresh ───────────────────────────────────────────────────────────
-async function refreshAccessToken(tokens) {
-  const creds = Buffer.from(
-    `${process.env.QB_CLIENT_ID}:${process.env.QB_CLIENT_SECRET}`
-  ).toString('base64');
-
-  const res = await fetch(QB_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Basic ${creds}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: tokens.refresh_token,
-    }),
-  });
-  if (!res.ok) throw new Error('QB token refresh failed');
-
-  const data = await res.json();
-  const newTokens = {
-    access_token:  data.access_token,
-    refresh_token: data.refresh_token || tokens.refresh_token,
-    realm_id:      tokens.realm_id,
-    expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
-  };
-  await saveTokens(newTokens);
-  return newTokens;
-}
-
-// Return live tokens, refreshing if they're within 60s of expiry.
-async function activeTokens() {
-  let t = await getTokens();
-  if (!t) throw new Error('QuickBooks not connected');
-  if (new Date(t.expires_at) <= new Date(Date.now() + 60_000)) {
-    t = await refreshAccessToken(t);
-  }
-  return t;
-}
+// Token management (getTokens/saveTokens/refresh/activeTokens) lives in
+// lib/qbo-tokens.js so it can be reused by the QB Payments client without
+// circular imports. Imported above.
 
 // ─── QB HTTP helpers ─────────────────────────────────────────────────────────
 async function qbGet(path) {
@@ -178,10 +148,16 @@ router.get('/status', async (req, res) => {
     const tokens = await getTokens();
     if (!tokens) return res.json({ connected: false });
     res.json({
-      connected:   true,
-      realm_id:    tokens.realm_id,
-      expires_at:  tokens.expires_at,
-      is_expired:  new Date(tokens.expires_at) <= new Date(),
+      connected:        true,
+      realm_id:         tokens.realm_id,
+      expires_at:       tokens.expires_at,
+      is_expired:       new Date(tokens.expires_at) <= new Date(),
+      scopes:           tokens.scopes,
+      // True if our requested SCOPES are a subset of what's stored. False
+      // means the user needs to re-click /connect to grant the additional
+      // scope (e.g. com.intuit.quickbooks.payment).
+      scopes_complete:  hasRequiredScopes(tokens.scopes),
+      required_scopes:  SCOPES,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -222,11 +198,15 @@ router.get('/callback', async (req, res) => {
     });
     if (!tokenRes.ok) throw new Error('Token exchange failed');
     const data = await tokenRes.json();
+    // Intuit doesn't return granted scopes on the token response, so we
+    // record what we asked for. The consent screen guarantees the user
+    // saw and agreed to all of SCOPES, otherwise the callback wouldn't fire.
     await saveTokens({
+      realm_id:      realmId,
       access_token:  data.access_token,
       refresh_token: data.refresh_token,
-      realm_id:      realmId,
       expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
+      scopes:        SCOPES,
     });
     const base = process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca';
     res.redirect(`${base}/admin-quickbooks.html?connected=true`);
