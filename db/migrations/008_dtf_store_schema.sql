@@ -34,11 +34,25 @@ ALTER TABLE clients
   ADD COLUMN IF NOT EXISTS created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   ADD COLUMN IF NOT EXISTS updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
--- Case-insensitive unique index on email — required for registration
--- "already exists" lookups and for QBO existing-customer matching.
--- Existing rows with NULL or duplicate emails are tolerated; the partial
--- predicate skips NULLs entirely.
-CREATE UNIQUE INDEX IF NOT EXISTS clients_email_lower_unique
+-- Case-insensitive index on email — used by registration "already exists"
+-- lookups and QBO existing-customer matching.
+--
+-- NOTE: this is intentionally NOT unique because the existing `clients`
+-- table has historical duplicate emails (years of in-shop entry where the
+-- same person got entered twice). A unique index can't build over those
+-- duplicates. The app-level registration code in routes/customer-auth.js
+-- handles uniqueness for NEW signups by querying this index before insert.
+-- Once the duplicates are cleaned up (see admin tooling), a follow-up
+-- migration can promote this to a unique index.
+--
+-- To inspect duplicates yourself:
+--   SELECT LOWER(email) AS e, COUNT(*) AS n,
+--          ARRAY_AGG(id ORDER BY id) AS client_ids
+--     FROM clients
+--    WHERE email IS NOT NULL AND email <> ''
+--    GROUP BY LOWER(email)
+--   HAVING COUNT(*) > 1;
+CREATE INDEX IF NOT EXISTS clients_email_lower_idx
   ON clients (LOWER(email))
   WHERE email IS NOT NULL AND email <> '';
 
