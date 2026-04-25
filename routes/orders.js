@@ -139,7 +139,10 @@ router.post('/shipping-rates', async (req, res) => {
       error:  statusOut === 502
                 ? 'Shipping provider is unavailable. Please try again, or call us.'
                 : err.message,
-      detail: err.body,
+      // Always include err.message in detail so an upstream 401 with an
+      // empty body still surfaces the diagnostic (e.g. "ShipTime 401: ...")
+      // without having to dig in Railway logs.
+      detail: err.body || err.message || null,
     });
   }
 });
