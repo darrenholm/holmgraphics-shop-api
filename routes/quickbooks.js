@@ -208,11 +208,15 @@ router.get('/callback', async (req, res) => {
       expires_at:    new Date(Date.now() + data.expires_in * 1000).toISOString(),
       scopes:        SCOPES,
     });
-    const base = process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca';
-    res.redirect(`${base}/admin-quickbooks.html?connected=true`);
+    // QB admin lives on the staff subdomain. Path moved from
+    // /admin-quickbooks.html (old standalone marketing repo) to
+    // /admin-legacy/quickbooks.html when the marketing site folded
+    // into the SvelteKit project.
+    const base = process.env.STAFF_APP_URL || 'https://shop.holmgraphics.ca';
+    res.redirect(`${base}/admin-legacy/quickbooks.html?connected=true`);
   } catch (err) {
-    const base = process.env.CORS_ORIGINS?.split(',')[0] || 'https://holmgraphics.ca';
-    res.redirect(`${base}/admin-quickbooks.html?error=${encodeURIComponent(err.message)}`);
+    const base = process.env.STAFF_APP_URL || 'https://shop.holmgraphics.ca';
+    res.redirect(`${base}/admin-legacy/quickbooks.html?error=${encodeURIComponent(err.message)}`);
   }
 });
 
