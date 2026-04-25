@@ -103,10 +103,14 @@ router.post('/:id/ship', async (req, res) => {
 
     // Re-quote ShipTime to get a fresh quoteId. Use the stored carrier/service
     // pair from checkout to pick the matching quote.
+    // oi.supplier is the TEXT supplier code (e.g. "sanmar_ca"), not the
+    // INTEGER supplier.id — join through the supplier table to translate
+    // before joining supplier_product.
     const items = await query(
       `SELECT oi.quantity, sp.garment_category, sp.weight_grams
          FROM order_items oi
-         LEFT JOIN supplier_product sp ON sp.supplier_id = oi.supplier AND sp.style = oi.style
+         LEFT JOIN supplier s    ON s.code = oi.supplier
+         LEFT JOIN supplier_product sp ON sp.supplier_id = s.id AND sp.style = oi.style
         WHERE oi.order_id = $1`,
       [order.id]
     );

@@ -133,16 +133,21 @@ router.post('/shipping-rates', async (req, res) => {
 
 async function loadProductMeta(variants) {
   if (!variants.length) return [];
-  // Build a single query with supplier+style pairs.
-  // NB: supplier_product.style is the column (per migration 002), not
-  // style_number — earlier code used the wrong name and silently broke
-  // the shipping-rates endpoint with `column "style_number" does not exist`.
-  const conds = variants.map((_, i) => `(supplier_id = $${i*2+1} AND style = $${i*2+2})`);
+  // The cart stores supplier as a TEXT code (e.g. "sanmar_ca") in
+  // it.supplier, but supplier_product.supplier_id is an INTEGER FK to
+  // supplier.id. Join through the supplier table to translate, and
+  // return the code (not the id) so the call site's `m.supplier ===
+  // it.supplier` comparison works.
+  // NB: column on supplier_product is `style`, not `style_number`.
+  const conds = variants.map(
+    (_, i) => `(s.code = $${i*2+1} AND sp.style = $${i*2+2})`
+  );
   const params = variants.flatMap((v) => [v.supplier, v.style]);
   return query(
-    `SELECT supplier_id AS supplier, style,
-            garment_category, weight_grams
-       FROM supplier_product
+    `SELECT s.code AS supplier, sp.style,
+            sp.garment_category, sp.weight_grams
+       FROM supplier_product sp
+       JOIN supplier s ON s.id = sp.supplier_id
       WHERE ${conds.join(' OR ')}`,
     params
   );
