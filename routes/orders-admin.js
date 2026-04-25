@@ -106,7 +106,7 @@ router.post('/:id/ship', async (req, res) => {
     const items = await query(
       `SELECT oi.quantity, sp.garment_category, sp.weight_grams
          FROM order_items oi
-         LEFT JOIN supplier_product sp ON sp.supplier_id = oi.supplier AND sp.style_number = oi.style
+         LEFT JOIN supplier_product sp ON sp.supplier_id = oi.supplier AND sp.style = oi.style
         WHERE oi.order_id = $1`,
       [order.id]
     );

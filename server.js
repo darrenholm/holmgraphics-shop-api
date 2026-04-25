@@ -17,6 +17,8 @@ const dtfConfigRoutes    = require('./routes/dtf-config');
 const ordersRoutes       = require('./routes/orders');
 const designsRoutes      = require('./routes/designs');
 const proofsRoutes       = require('./routes/proofs');
+const paymentRoutes      = require('./routes/payment');
+const quoteRoutes        = require('./routes/quote');
 const dtfAdminRoutes     = require('./routes/dtf-admin');
 const ordersAdminRoutes  = require('./routes/orders-admin');
 
@@ -49,6 +51,8 @@ app.use('/api/dtf',          dtfConfigRoutes);
 app.use('/api/orders',       ordersRoutes);
 app.use('/api/designs',      designsRoutes);
 app.use('/api/proofs',       proofsRoutes);
+app.use('/api/payment',       paymentRoutes);
+app.use('/api/quote-request', quoteRoutes);
 app.use('/api/admin/dtf',    dtfAdminRoutes);
 app.use('/api/admin/orders', ordersAdminRoutes);
 app.use('/api/projects',   projectRoutes);

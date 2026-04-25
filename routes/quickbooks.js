@@ -28,69 +28,18 @@ const {
   getTokens, saveTokens, clearTokens,
   hasRequiredScopes, refreshAccessToken, activeTokens,
 } = require('../lib/qbo-tokens');
+// HTTP helpers + email sanitizer + QB_BASE live in lib/qbo-sync.js so this
+// route, lib/qb-payments.js, and lib/qbo-sync.js itself all use the same
+// implementation. Don't redefine them here.
+const {
+  QB_BASE, qbGet, qbPost, cleanEmail,
+} = require('../lib/qbo-sync');
 
 const router = express.Router();
 
 // ─── QB endpoints ────────────────────────────────────────────────────────────
 const QB_AUTH_URL   = 'https://appcenter.intuit.com/connect/oauth2';
 const QB_REVOKE_URL = 'https://developer.api.intuit.com/v2/oauth2/tokens/revoke';
-
-function QB_BASE() {
-  // NODE_ENV=production hits real QB; anything else hits sandbox.
-  return process.env.NODE_ENV === 'production'
-    ? 'https://quickbooks.api.intuit.com'
-    : 'https://sandbox-quickbooks.api.intuit.com';
-}
-
-// Sanitize an email before sending to QB. Strips trailing `#mailto:...`
-// artefacts from legacy Outlook-paste imports, surrounding `<...>`, and
-// whitespace. Returns '' if the cleaned value doesn't look like an email,
-// which tells callers to omit the field entirely (QB prefers no email
-// over a bad one — a bad one returns a 400 ValidationFault).
-function cleanEmail(raw) {
-  if (!raw) return '';
-  let s = String(raw).trim();
-  // Drop everything from the first `#` onward (handles foo@bar.com#mailto:foo@bar.com#).
-  const hash = s.indexOf('#');
-  if (hash >= 0) s = s.slice(0, hash).trim();
-  // Strip wrapping angle brackets.
-  s = s.replace(/^<|>$/g, '').trim();
-  // Minimal sanity check: one @, at least one dot after it, no spaces.
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return '';
-  return s;
-}
-
-// Token management (getTokens/saveTokens/refresh/activeTokens) lives in
-// lib/qbo-tokens.js so it can be reused by the QB Payments client without
-// circular imports. Imported above.
-
-// ─── QB HTTP helpers ─────────────────────────────────────────────────────────
-async function qbGet(path) {
-  const t = await activeTokens();
-  const res = await fetch(`${QB_BASE()}/v3/company/${t.realm_id}${path}`, {
-    headers: {
-      'Authorization': `Bearer ${t.access_token}`,
-      'Accept': 'application/json',
-    },
-  });
-  if (!res.ok) throw new Error(`QB API ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function qbPost(path, body) {
-  const t = await activeTokens();
-  const res = await fetch(`${QB_BASE()}/v3/company/${t.realm_id}${path}`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${t.access_token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`QB API ${res.status}: ${await res.text()}`);
-  return res.json();
-}
 
 // ─── PO# custom-field discovery ──────────────────────────────────────────────
 // QBO Online does NOT have a top-level PONumber on the Invoice entity (that

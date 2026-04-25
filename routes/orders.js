@@ -134,10 +134,13 @@ router.post('/shipping-rates', async (req, res) => {
 async function loadProductMeta(variants) {
   if (!variants.length) return [];
   // Build a single query with supplier+style pairs.
-  const conds = variants.map((_, i) => `(supplier_id = $${i*2+1} AND style_number = $${i*2+2})`);
+  // NB: supplier_product.style is the column (per migration 002), not
+  // style_number — earlier code used the wrong name and silently broke
+  // the shipping-rates endpoint with `column "style_number" does not exist`.
+  const conds = variants.map((_, i) => `(supplier_id = $${i*2+1} AND style = $${i*2+2})`);
   const params = variants.flatMap((v) => [v.supplier, v.style]);
   return query(
-    `SELECT supplier_id AS supplier, style_number AS style,
+    `SELECT supplier_id AS supplier, style,
             garment_category, weight_grams
        FROM supplier_product
       WHERE ${conds.join(' OR ')}`,
@@ -456,9 +459,15 @@ router.post('/', requireCustomer, async (req, res) => {
   }
 });
 
-// Stub — extracted from quickbooks.js when the QBO sync helper is built.
+// Fire-and-forget wrapper around the QBO sync helper. Throws are swallowed
+// at the call site (line 423) — the order is already persisted and the
+// card already charged, so a QBO sync failure must not surface as an error
+// to the customer. Admin can re-run later: createSalesReceiptFromOrder is
+// idempotent (skips if orders.qbo_invoice_id is already set).
 async function queueQboSalesReceipt(orderId) {
-  console.log(`[orders] TODO: create QBO Sales Receipt for order ${orderId}`);
+  const { createSalesReceiptFromOrder } = require('../lib/qbo-sync');
+  const qboId = await createSalesReceiptFromOrder(orderId);
+  console.log(`[orders] QBO SalesReceipt ${qboId} created for order ${orderId}`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
