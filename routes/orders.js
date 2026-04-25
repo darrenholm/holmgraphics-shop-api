@@ -127,7 +127,20 @@ router.post('/shipping-rates', async (req, res) => {
     res.json({ ok: true, rates });
   } catch (err) {
     console.error('shipping-rates failed:', err);
-    res.status(err.status || 500).json({ ok: false, error: err.message, detail: err.body });
+    // NEVER propagate an upstream 401 verbatim. The frontend's customer
+    // auth client treats any 401 as "customer JWT expired" and bounces
+    // to /shop/login -- which is wrong when it was actually ShipTime
+    // rejecting OUR API credentials. Map upstream auth failures to 502.
+    const statusOut = err.status === 401 || err.status === 403
+      ? 502
+      : (err.status || 500);
+    res.status(statusOut).json({
+      ok:     false,
+      error:  statusOut === 502
+                ? 'Shipping provider is unavailable. Please try again, or call us.'
+                : err.message,
+      detail: err.body,
+    });
   }
 });
 
