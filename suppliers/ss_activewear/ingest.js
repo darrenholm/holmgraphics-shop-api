@@ -40,6 +40,12 @@ require('dotenv').config();
 const { pool, query, queryOne } = require('../../db/connection');
 const { listStyles, listProducts, listInventory } = require('./client');
 const { IMAGE_BASE_URL } = require('./config');
+// Reuse SanMar's category canonicaliser — its regex rules are designed
+// supplier-agnostic (per the file's own header comment: "source strings
+// are supplier-specific... we match case-insensitively and bucket
+// aggressively"). When a third supplier shows up, lift this module to
+// suppliers/common/.
+const { canonicalize: canonicalizeCategory } = require('../sanmar/category-map');
 
 // Size sort order — duplicates the table in suppliers/sanmar/ingest.js.
 // Worth a small shared module if we add a third supplier; keeping inline
@@ -93,6 +99,12 @@ async function upsertProduct(client, supplierId, style, products) {
   const brand       = sample.brandName || null;
   const description = sample.description || null;
   const caseSize    = Number(sample.caseQty) || null;
+  // baseCategory is the storefront-facing category string from /V2/styles
+  // (e.g. "Fleece - Premium - Hood", "Polos & Knits - Performance").
+  // canonicalize maps it to the storefront's enum bucket; the raw string
+  // is stashed alongside so the backfill can re-bucket if rules change.
+  const categoryRaw = sample.baseCategory || null;
+  const category    = canonicalizeCategory(categoryRaw);
 
   const rawJson = {
     styleID:        sample.styleID,
@@ -113,19 +125,22 @@ async function upsertProduct(client, supplierId, style, products) {
       brand, discount_code, price_group,
       youth, case_size,
       is_sellable, is_discontinued,
+      category, category_raw,
       raw_json, last_synced_at
     )
-    VALUES ($1, $2, $3, NULL, $4, NULL, $5, NULL, NULL, FALSE, $6, TRUE, FALSE, $7::jsonb, NOW())
+    VALUES ($1, $2, $3, NULL, $4, NULL, $5, NULL, NULL, FALSE, $6, TRUE, FALSE, $7, $8, $9::jsonb, NOW())
     ON CONFLICT (supplier_id, style) DO UPDATE SET
       product_name     = EXCLUDED.product_name,
       description      = EXCLUDED.description,
       brand            = EXCLUDED.brand,
       case_size        = EXCLUDED.case_size,
+      category         = EXCLUDED.category,
+      category_raw     = EXCLUDED.category_raw,
       raw_json         = EXCLUDED.raw_json,
       last_synced_at   = NOW()
     RETURNING id
     `,
-    [supplierId, style, productName, description, brand, caseSize, JSON.stringify(rawJson)],
+    [supplierId, style, productName, description, brand, caseSize, category, categoryRaw, JSON.stringify(rawJson)],
   );
   return rows[0].id;
 }

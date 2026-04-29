@@ -57,13 +57,13 @@ const RULES = [
   [/\b(POLOS?|KNITS?)\b/i,                                                                                CATEGORIES.POLOS],
   [/\b(WOVENS?|BUTTON[- ]?UPS?|DRESS SHIRTS?|OXFORDS?|POPLIN|FLANNELS?|DENIM SHIRTS?)\b/i,                CATEGORIES.WOVEN],
   [/\b(HOODIES?|HOODED|SWEATSHIRTS?|CREWNECKS?|PULLOVERS?|FLEECE|SWEATERS?)\b/i,                          CATEGORIES.FLEECE],
-  [/\b(PANTS?|SHORTS?|JOGGERS?|SWEATPANTS?|LEGGINGS?|TROUSERS?|SKIRTS?)\b/i,                              CATEGORIES.BOTTOMS],
+  [/\b(PANTS?|SHORTS?|JOGGERS?|SWEATPANTS?|LEGGINGS?|TROUSERS?|SKIRTS?|BOTTOMS?)\b/i,                     CATEGORIES.BOTTOMS],
   [/\b(T[- ]?SHIRTS?|TEES?|TANKS?|MUSCLE)\b/i,                                                            CATEGORIES.T_SHIRTS],
   [/\b(ACTIVEWEAR|PERFORMANCE|ATHLETIC|SPORTS?)\b/i,                                                      CATEGORIES.ACTIVEWEAR],
   [/\b(WORKWEAR|HI-?VIS|SAFETY|COVERALLS?|MECHANIC)\b/i,                                                  CATEGORIES.WORKWEAR],
   [/\b(YOUTH|INFANT|TODDLER|BABY|KIDS?)\b/i,                                                              CATEGORIES.YOUTH],
   [/\b(LADIES|WOMEN'?S?|MATERNITY)\b/i,                                                                   CATEGORIES.LADIES],
-  [/\b(TOWELS?|BLANKETS?|SCARF|SCARVES|SOCKS?|GLOVES?|APRONS?|UMBRELLAS?|ACCESSOR)\b/i,                   CATEGORIES.ACCESSORIES],
+  [/\b(TOWELS?|BLANKETS?|SCARF|SCARVES|SOCKS?|GLOVES?|APRONS?|UMBRELLAS?|ACCESSORIES?)\b/i,               CATEGORIES.ACCESSORIES],
 ];
 
 /**
