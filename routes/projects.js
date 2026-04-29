@@ -2,9 +2,11 @@
 // Projects + their children (notes, items, measurements, photos, status).
 // Rewritten for Railway Postgres (pg driver, $1..$n placeholders).
 const express = require('express');
-const { query, queryOne } = require('../db/connection');
+const db = require('../db/connection');
+const { query, queryOne } = db;
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const { runBackfill } = require('../db/backfill-photos');
+const mailer = require('../lib/customer-mailer');
 const multer = require('multer');
 const path = require('path');
 const ftp = require('basic-ftp');
@@ -426,12 +428,19 @@ router.post('/:id/notes', requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/projects/:id/status ───────────────────────────────────────────
-// Updates the project's status and logs the change in audit_log.
+// Updates the project's status and logs the change in audit_log. If the
+// project is linked to an online order AND the new status is one with a
+// customer-facing email (Ordered/Proofing/Pickup-or-Delivery), fires the
+// transactional email post-commit. Idempotent via email_log — same status
+// won't double-send. Email failure is logged but never bubbles up to the
+// staff who clicked the button.
 router.post('/:id/status', requireStaff, async (req, res) => {
   const { statusId } = req.body;
   const projectId = parseInt(req.params.id);
   if (!statusId) return res.status(400).json({ message: 'statusId required' });
   try {
+    const newStatusId = parseInt(statusId);
+
     // Capture old value for a proper audit entry.
     const current = await queryOne(
       `SELECT status_id FROM projects WHERE id = $1`,
@@ -441,7 +450,7 @@ router.post('/:id/status', requireStaff, async (req, res) => {
 
     await query(
       `UPDATE projects SET status_id = $1 WHERE id = $2`,
-      [parseInt(statusId), projectId]
+      [newStatusId, projectId]
     );
     await query(
       `INSERT INTO audit_log
@@ -452,9 +461,25 @@ router.post('/:id/status', requireStaff, async (req, res) => {
         projectId,
         req.user?.id || null,
         current.status_id != null ? String(current.status_id) : null,
-        String(statusId),
+        String(newStatusId),
       ]
     );
+
+    // Fire any transactional email tied to this status. The dispatcher is
+    // a no-op for status_id values that don't have a tracked email kind,
+    // and idempotent for the ones that do — safe to call unconditionally.
+    // Look up the linked online order; pickup and ship orders use the same
+    // orders.id, only one row per project (see schema in 008).
+    const orderRow = await queryOne(
+      `SELECT id FROM orders WHERE job_id = $1 LIMIT 1`,
+      [projectId]
+    );
+    if (orderRow) {
+      // Fire-and-forget: never blocks the staff response, never throws.
+      mailer.sendForOrderStatus({ orderId: orderRow.id, statusId: newStatusId, db })
+        .catch((err) => console.warn(`status-email dispatch failed:`, err.message));
+    }
+
     res.json({ message: 'Status updated' });
   } catch (e) {
     console.error('POST /projects/:id/status:', e);
@@ -463,18 +488,51 @@ router.post('/:id/status', requireStaff, async (req, res) => {
 });
 
 // ─── GET /api/projects/:id/items ─────────────────────────────────────────────
+// Returns BOTH manual `items` rows (staff-entered, editable) and the read-only
+// mirror of `order_items` for any online order linked to this project. Online
+// orders never write into `items` — they're checkout-derived rows attached to
+// the project via orders.job_id. Without this UNION the job-detail page shows
+// "No items recorded" for online orders even though they have line items.
+//
+// Each row carries a `source`:
+//   * 'project' — staff manual entry. Editable via PUT/DELETE /items/:itemId.
+//   * 'order'   — online-order line item. Read-only here; edit via order admin.
+// Frontend should hide edit/delete controls for source='order'.
 router.get('/:id/items', requireAuth, async (req, res) => {
   try {
-    const rows = await query(
+    const projectId = parseInt(req.params.id);
+    const projectItems = await query(
       `SELECT id, description AS item_name, qty AS quantity,
               price AS unit_price, ext_price AS total,
-              qb_item_name
+              qb_item_name,
+              'project'::text AS source
          FROM items
         WHERE project_id = $1
         ORDER BY id`,
-      [parseInt(req.params.id)]
+      [projectId]
     );
-    res.json(rows);
+    // Online-order line items: format the display name as
+    // "<product>  (<color>, <size>)" so staff can read it like a manual row.
+    const orderItems = await query(
+      `SELECT oi.id,
+              CONCAT(
+                oi.product_name,
+                ' (', oi.color_name,
+                CASE WHEN COALESCE(oi.size, '') <> '' THEN ', ' || oi.size ELSE '' END,
+                ')'
+              ) AS item_name,
+              oi.quantity::numeric AS quantity,
+              oi.unit_price        AS unit_price,
+              oi.line_subtotal     AS total,
+              NULL                 AS qb_item_name,
+              'order'::text        AS source
+         FROM order_items oi
+         JOIN orders     o ON o.id = oi.order_id
+        WHERE o.job_id = $1
+        ORDER BY oi.id`,
+      [projectId]
+    );
+    res.json([...projectItems, ...orderItems]);
   } catch (e) {
     res.status(500).json({ message: 'Failed to load items', detail: e.message });
   }
