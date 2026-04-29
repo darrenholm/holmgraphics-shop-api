@@ -296,6 +296,10 @@ router.post('/', requireCustomer, async (req, res) => {
     }
     chargedId = chargeResult.charge_id;
 
+    // From here on, any thrown error must trigger a compensating refund.
+    // The inner try wraps everything that can fail post-charge so the catch
+    // can await the refund and report its outcome to the customer.
+    try {
     // ─── Persist everything in a single transaction ─────────────────────────
     const client = await pool.connect();
     let order;
@@ -307,8 +311,8 @@ router.post('/', requireCustomer, async (req, res) => {
       // We use a minimal set of columns; the rest will be NULL until staff
       // edit the job.
       const project = await client.query(
-        `INSERT INTO projects (client_id, status, created_at)
-              VALUES ($1, 'Quoted', NOW())
+        `INSERT INTO projects (client_id, status_id, created_at)
+              VALUES ($1, 1, NOW())
            RETURNING id`,
         [customer.id]
       );
@@ -472,18 +476,34 @@ router.post('/', requireCustomer, async (req, res) => {
       breakdown,
       took_ms: Date.now() - startedAt,
     });
-  } catch (err) {
-    console.error('POST /api/orders failed:', err);
-    // If the charge succeeded but we failed to persist, refund immediately
-    // so we don't leave the customer charged for nothing.
-    if (chargedId) {
-      qbPayments.refund({
-        chargeId:    chargedId,
-        description: 'Order persistence failed; auto-refund.',
-        requestId:   `auto-refund-${chargedId}`,
-      }).catch((e) => console.error('Auto-refund also failed:', e.message));
+    } catch (postChargeErr) {
+      // The card has been charged but persistence failed. Await the refund
+      // synchronously so we know whether the customer is whole, and report
+      // the outcome — never leave them charged silently.
+      console.error('POST /api/orders post-charge failure:', postChargeErr);
+      let refunded = false;
+      try {
+        const r = await qbPayments.refund({
+          chargeId:    chargedId,
+          description: 'Order persistence failed; auto-refund.',
+          requestId:   `auto-refund-${chargedId}`,
+        });
+        refunded = r?.ok !== false;
+      } catch (refundErr) {
+        console.error(`Auto-refund failed for charge ${chargedId}:`, refundErr);
+      }
+      return res.status(500).json({
+        error: refunded
+          ? 'Order creation failed after charge; your card has been refunded.'
+          : 'Order creation failed and the refund attempt also failed — please contact support with your charge id.',
+        charge_id: chargedId,
+        detail:    postChargeErr.message,
+      });
     }
-    // If we created a job before failing, leave it — staff can clean it up.
+  } catch (err) {
+    // Pre-charge failure (validation, pricing, shipping quote, charge denial,
+    // etc.). chargedId is null here — nothing to refund.
+    console.error('POST /api/orders failed:', err);
     res.status(500).json({ error: 'Order creation failed', detail: err.message });
   }
 });
