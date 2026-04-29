@@ -35,6 +35,7 @@ const { getConfig: getDtfConfig } = require('../lib/dtf-pricing-loader');
 const shiptime = require('../lib/shiptime');
 const qbPayments = require('../lib/qb-payments');
 const mailer = require('../lib/customer-mailer');
+const { maybePromoteJob } = require('../lib/promote-job');
 
 const router = express.Router();
 
@@ -431,6 +432,13 @@ router.post('/', requireCustomer, async (req, res) => {
           );
         }
       }
+
+      // Auto-promote the linked project: assign to production + advance to
+      // "Ordered". Both promotion preconditions (paid_at set, ≥1 design row)
+      // are guaranteed at this point — we just inserted both above. The
+      // helper re-checks idempotently and joins this transaction so a
+      // failed promotion rolls back the entire order.
+      await maybePromoteJob(client, order.id);
 
       await client.query('COMMIT');
     } catch (txErr) {
