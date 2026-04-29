@@ -148,6 +148,56 @@ router.post('/sanmar/ingest', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/suppliers/ss_activewear/ingest ────────────────────────────────
+// Run the S&S Activewear Canada REST ingest. Synchronous. Optional query
+// params scope the run to a single style for smoke testing — strongly
+// recommended on the first run after schema or mapping changes:
+//
+//   ?styleID=12618        — direct integer styleID
+//   ?style=A2009          — customer-facing style name; resolved via /V2/styles
+//
+// Without either, runs the full catalog (~1,121 styles / ~43k variants,
+// 3 unfiltered API calls).
+router.post('/ss_activewear/ingest', requireAdmin, async (req, res) => {
+  const logs = [];
+  try {
+    const { runSsActivewearIngest } = require('../suppliers/ss_activewear/ingest');
+    const { listStyles } = require('../suppliers/ss_activewear/client');
+
+    let styleID = null;
+    if (req.query.styleID) {
+      styleID = parseInt(req.query.styleID, 10);
+      if (!Number.isInteger(styleID)) {
+        return res.status(400).json({ ok: false, message: 'styleID must be an integer' });
+      }
+    } else if (req.query.style) {
+      // Resolve customer-facing style name → integer styleID via /V2/styles.
+      const wanted = String(req.query.style).trim().toUpperCase();
+      const all = await listStyles();
+      const match = all.items.find((s) => (s.styleName || '').toUpperCase() === wanted);
+      if (!match) {
+        return res.status(404).json({
+          ok: false,
+          message: `style "${req.query.style}" not found in S&S catalog`,
+        });
+      }
+      styleID = match.styleID;
+      logs.push(`Resolved style=${req.query.style} to styleID=${styleID}`);
+    }
+
+    const result = await runSsActivewearIngest({ styleID, log: (m) => logs.push(m) });
+    res.json({ ok: true, ...result, logs });
+  } catch (e) {
+    console.error('ss_activewear ingest:', e);
+    res.status(500).json({
+      ok: false,
+      message: 'S&S Activewear ingest failed',
+      detail: e.message,
+      logs,
+    });
+  }
+});
+
 // ─── GET /api/suppliers/sanmar/debug-media?style=ATC1000 ─────────────────────
 // Diagnostic: call getMediaContent for one style and return the parsed items
 // plus the raw XML-shape payload so we can see exactly where colour hex / per-

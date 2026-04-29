@@ -1,48 +1,37 @@
 // suppliers/ss_activewear/config.js
 //
-// S&S Activewear supplier adapter — CREDENTIALS PENDING.
-// PromoStandards-compliant. Once creds + endpoints arrive, this file +
-// an index.js wrapping ../promostandards/* is all that's needed.
+// S&S Activewear Canada — REST adapter config.
 //
-// Task #62 tracks the onboarding.
+// Loads credentials from SSACTIVEWEAR_ACCOUNT_NUMBER + SSACTIVEWEAR_API_KEY
+// (HTTP Basic). Throws at load time if either is missing — every code path
+// that would call S&S needs both, so failing fast beats producing 401s
+// halfway through an ingest.
+//
+// (We previously had a SOAP/PromoStandards stub here for an integration S&S
+// never actually offered. This file replaces it with the REST credentials
+// the live API expects. If they ever publish PromoStandards, we'd add a
+// separate file rather than overload this one.)
 
-const ENDPOINTS = {
-  // TODO(#62): fill in from S&S onboarding packet.
-  uat: {
-    productData:          null,
-    mediaContent:         null,
-    inventory:            null,
-    pricing:              null,
-    purchaseOrder:        null,
-    orderStatus:          null,
-    shipmentNotification: null,
-    invoice:              null,
-  },
-  production: {
-    productData:          null,
-    mediaContent:         null,
-    inventory:            null,
-    pricing:              null,
-    purchaseOrder:        null,
-    orderStatus:          null,
-    shipmentNotification: null,
-    invoice:              null,
-  },
-};
+'use strict';
+
+const BASE_URL = 'https://api-ca.ssactivewear.com';
+const IMAGE_BASE_URL = 'https://cdn.ssactivewear.com';   // .com CDN serves .ca images too
 
 function loadConfig() {
-  const env = (process.env.SS_ACTIVEWEAR_ENV || 'uat').toLowerCase();
-  const username = process.env.SS_ACTIVEWEAR_USERNAME;
-  const password = process.env.SS_ACTIVEWEAR_PASSWORD;
-  if (!username || !password) {
-    throw new Error('SS_ACTIVEWEAR_USERNAME and SS_ACTIVEWEAR_PASSWORD must be set');
+  const account = process.env.SSACTIVEWEAR_ACCOUNT_NUMBER;
+  const apiKey  = process.env.SSACTIVEWEAR_API_KEY;
+  if (!account || !apiKey) {
+    throw new Error(
+      'SSACTIVEWEAR_ACCOUNT_NUMBER and SSACTIVEWEAR_API_KEY must be set ' +
+      '(HTTP Basic auth for api-ca.ssactivewear.com/V2/)'
+    );
   }
   return {
-    supplierCode: 'ss_activewear',
-    env,
-    endpoints: ENDPOINTS[env],
-    credentials: { id: username, password },
+    supplierCode:  'ss_activewear_ca',
+    baseUrl:       BASE_URL,
+    imageBaseUrl:  IMAGE_BASE_URL,
+    credentials:   { account, apiKey },
   };
 }
 
-module.exports = { ENDPOINTS, loadConfig };
+module.exports = { BASE_URL, IMAGE_BASE_URL, loadConfig };
