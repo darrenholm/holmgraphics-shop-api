@@ -23,9 +23,10 @@
 const express = require('express');
 const multer  = require('multer');
 const path    = require('path');
-const { query, queryOne } = require('../db/connection');
+const { query, queryOne, pool } = require('../db/connection');
 const { requireCustomer } = require('../middleware/customer-auth');
 const filesBridge = require('../lib/files-bridge-client');
+const { maybePromoteJob } = require('../lib/promote-job');
 
 const router = express.Router();
 
@@ -111,35 +112,60 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
       mimeType:  req.file.mimetype,
     });
 
-    // Update the design row.
-    await query(
-      `UPDATE designs SET
-         artwork_path        = $1,
-         artwork_filename    = $2,
-         artwork_mime        = $3,
-         artwork_size_bytes  = $4
-       WHERE id = $5`,
-      [saved.path, safeFilename, req.file.mimetype, req.file.size, designId]
-    );
-
-    // If every design on this order now has artwork, advance the order.
-    const pending = await queryOne(
-      `SELECT COUNT(*)::int AS pending
-         FROM designs
-        WHERE order_id = $1
-          AND (artwork_path IS NULL OR artwork_path = '(pending upload)')`,
-      [row.order_id]
-    );
+    // Persist the artwork-path UPDATE, the order-status advancement, and the
+    // late-artwork promote-job re-check inside one transaction so a partial
+    // failure doesn't leave the design pointing at a saved file while the
+    // order/job stay stuck. The file itself is already on disk via the bridge
+    // — that step is unrolled (delete on failure) only by an admin sweep,
+    // never automatically. Same trade-off the original code made.
     let orderAdvanced = false;
-    if (pending.pending === 0) {
-      await query(
-        `UPDATE orders SET status = 'awaiting_proof' WHERE id = $1 AND status = 'awaiting_artwork'`,
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+
+      await dbClient.query(
+        `UPDATE designs SET
+           artwork_path        = $1,
+           artwork_filename    = $2,
+           artwork_mime        = $3,
+           artwork_size_bytes  = $4
+         WHERE id = $5`,
+        [saved.path, safeFilename, req.file.mimetype, req.file.size, designId]
+      );
+
+      // If every design on this order now has artwork, advance the order.
+      const pendingRes = await dbClient.query(
+        `SELECT COUNT(*)::int AS pending
+           FROM designs
+          WHERE order_id = $1
+            AND (artwork_path IS NULL OR artwork_path = '(pending upload)')`,
         [row.order_id]
       );
-      orderAdvanced = true;
-      // TODO: enqueue QBO Sales Receipt creation. For now we log so an
-      // admin can manually trigger from the order detail page.
-      console.log(`[designs] order ${row.order_number} advanced to awaiting_proof — QBO sync TODO`);
+      const pending = pendingRes.rows[0];
+      if (pending.pending === 0) {
+        await dbClient.query(
+          `UPDATE orders SET status = 'awaiting_proof' WHERE id = $1 AND status = 'awaiting_artwork'`,
+          [row.order_id]
+        );
+        orderAdvanced = true;
+        // TODO: enqueue QBO Sales Receipt creation. For now we log so an
+        // admin can manually trigger from the order detail page.
+        console.log(`[designs] order ${row.order_number} advanced to awaiting_proof — QBO sync TODO`);
+      }
+
+      // Late-artwork promotion: orders.js already calls maybePromoteJob at
+      // checkout time, but legacy orders or orders that were rolled back may
+      // arrive here un-promoted. The helper is idempotent — if the project
+      // is already past Quote, this is a no-op. The check matters for the
+      // case where the order was placed before auto-promote shipped.
+      await maybePromoteJob(dbClient, row.order_id);
+
+      await dbClient.query('COMMIT');
+    } catch (txErr) {
+      await dbClient.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      dbClient.release();
     }
 
     res.json({

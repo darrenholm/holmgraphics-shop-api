@@ -28,7 +28,8 @@
 'use strict';
 
 const express = require('express');
-const { query, queryOne, pool } = require('../db/connection');
+const db = require('../db/connection');
+const { query, queryOne, pool } = db;
 const { requireCustomer } = require('../middleware/customer-auth');
 const { priceCart } = require('../lib/dtf-pricing');
 const { getConfig: getDtfConfig } = require('../lib/dtf-pricing-loader');
@@ -319,6 +320,14 @@ router.post('/', requireCustomer, async (req, res) => {
       createdJobId = project.rows[0].id;
       const orderNumber = String(createdJobId);
 
+      // Resolve the notification email captured at checkout. ship_to.email
+      // (set on both ship and pickup forms) overrides the account email
+      // for this one order — see lib/customer-mailer.js sendForOrderStatus.
+      // Falls back to clients.email at send time if NULL/empty here.
+      const notificationEmail = (ship_to && typeof ship_to.email === 'string' && ship_to.email.trim())
+        ? ship_to.email.trim()
+        : null;
+
       // Build the QBO description from the breakdown so the Sales Receipt
       // shows itemized pricing in the customer's portal.
       const orderRow = await client.query(
@@ -331,6 +340,7 @@ router.post('/', requireCustomer, async (req, res) => {
             shipping_carrier, shipping_service, shipping_quote_id,
             qb_payment_id,
             customer_notes,
+            notification_email,
             paid_at
           ) VALUES (
             $1, $2, $3, 'online', 'awaiting_artwork',
@@ -340,6 +350,7 @@ router.post('/', requireCustomer, async (req, res) => {
             $17, $18, $19,
             $20,
             $21,
+            $22,
             NOW()
           )
           RETURNING id, order_number, status, grand_total`,
@@ -360,6 +371,7 @@ router.post('/', requireCustomer, async (req, res) => {
           freshQuoteId,
           chargedId,
           customer_notes || null,
+          notificationEmail,
         ]
       );
       order = orderRow.rows[0];
@@ -460,8 +472,11 @@ router.post('/', requireCustomer, async (req, res) => {
       console.warn(`QBO sales receipt for order ${order.id} failed:`, e.message)
     );
 
-    // Order confirmation email (also fire-and-forget — stub today).
-    mailer.sendOrderConfirmation({ email: customer.email, order }).catch(() => {});
+    // Order confirmation email — routed through the status-driven dispatcher
+    // so it logs to email_log (idempotent: maybePromoteJob inside the tx
+    // already advanced status_id to ORDERED=2). Fire-and-forget — never
+    // throws, never blocks the order response.
+    mailer.sendForOrderStatus({ orderId: order.id, statusId: 2, db }).catch(() => {});
 
     res.status(201).json({
       ok: true,
