@@ -27,6 +27,7 @@ const { query, queryOne, pool } = require('../db/connection');
 const { requireCustomer } = require('../middleware/customer-auth');
 const filesBridge = require('../lib/files-bridge-client');
 const { maybePromoteJob } = require('../lib/promote-job');
+const { slugify } = require('../lib/slugify');
 
 const router = express.Router();
 
@@ -73,6 +74,12 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
     const designId = req.params.id;
 
     // Look up the design + its order + the customer to verify ownership.
+    // first_position_name picks the print_location for THIS design's first
+    // decoration row -- a single design can technically be applied at
+    // multiple positions on the same order (left chest AND full back), but
+    // there's only one physical file on disk so the filename can only
+    // encode one position. First-by-id is good enough for the staff naming
+    // benefit; multi-position designs are rare in practice.
     const row = await queryOne(
       `SELECT d.id            AS design_id,
               d.order_id,
@@ -82,7 +89,13 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
               o.job_id,
               o.status        AS order_status,
               c.id            AS client_id,
-              c.fname, c.lname, c.company, c.files_folder
+              c.fname, c.lname, c.company, c.files_folder,
+              (SELECT pl.name
+                 FROM order_decorations od
+                 LEFT JOIN print_locations pl ON pl.id = od.print_location_id
+                WHERE od.design_id = d.id
+                ORDER BY od.id
+                LIMIT 1)        AS first_position_name
          FROM designs d
          JOIN orders  o ON o.id = d.order_id
          JOIN clients c ON c.id = o.client_id
@@ -99,7 +112,18 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
     }
 
     const clientName = resolveClientNameForBridge(row);
-    const safeFilename = `${designId}${ext}`;   // canonical: <design-uuid>.<ext>
+    // Build a meaningful filename so Brady can recognise files in the
+    // L:\...\designs\ folder without cross-referencing the dashboard.
+    // Pattern: Job{N}-{position}-{design-name}.{ext}
+    //   e.g.   Job9566-left-chest-front-left-chest-logo.png
+    // Falls back to 'custom' when the order_decoration uses a custom
+    // location (print_location_id IS NULL), and 'untitled' if the customer
+    // didn't enter a name. Collision risk: two designs with identical
+    // (job, position, name) would overwrite each other on disk -- rare in
+    // practice but worth noting if it ever bites.
+    const positionSlug = slugify(row.first_position_name, { fallback: 'custom' });
+    const designSlug   = slugify(row.design_name,         { maxLen: 40, fallback: 'untitled' });
+    const safeFilename = `Job${row.job_id}-${positionSlug}-${designSlug}${ext}`;
 
     // Push to files-bridge. This also auto-creates the client + job folders
     // if they don't exist yet (POST /upload calls /ensure semantics).

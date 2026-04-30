@@ -302,7 +302,32 @@ router.get('/:id', requireAuth, async (req, res) => {
       [id]
     );
 
-    res.json({ ...row, client_phones: phones, measurements });
+    // Decorations from any online order linked to this project. Empty array
+    // for staff-created projects (no online order → no order_decorations
+    // rows). position_name COALESCEs print_location.name with the custom
+    // string the customer typed when picking "Other" at checkout, so the
+    // frontend always has a label to render. Joining `designs` gives the
+    // artwork file metadata so the job page can link straight to the
+    // file via the holm:// protocol handler.
+    const decorations = await query(
+      `SELECT od.id                                  AS id,
+              od.design_id                           AS design_id,
+              COALESCE(pl.name, od.custom_location)  AS position_name,
+              od.width_in,
+              od.height_in,
+              d.name                                 AS design_name,
+              d.artwork_filename,
+              d.artwork_path
+         FROM order_decorations od
+         JOIN orders            o  ON o.id = od.order_id
+         LEFT JOIN print_locations pl ON pl.id = od.print_location_id
+         LEFT JOIN designs         d  ON d.id  = od.design_id
+        WHERE o.job_id = $1
+        ORDER BY od.id`,
+      [id]
+    );
+
+    res.json({ ...row, client_phones: phones, measurements, decorations });
   } catch (e) {
     console.error('GET /projects/:id:', e);
     res.status(500).json({ message: 'Failed to load project', detail: e.message });
