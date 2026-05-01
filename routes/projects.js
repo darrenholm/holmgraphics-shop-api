@@ -483,14 +483,24 @@ router.put('/:id', requireStaff, async (req, res) => {
 });
 
 // ─── GET /api/projects/:id/notes ─────────────────────────────────────────────
+// LEFT JOIN to employees so each note carries its author's name. The COALESCE
+// chain falls back to 'Staff' when the join is empty (legacy notes from
+// before created_by was populated, or rows where the employee was deleted)
+// — matches what the frontend already does as a safety fallback. employee_id
+// is exposed too so future UI can link to a profile or filter by author.
 router.get('/:id/notes', requireAuth, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, note AS note_text, created_at AS note_date,
-              'Staff' AS employee_name
-         FROM notes
-        WHERE project_id = $1
-        ORDER BY created_at DESC NULLS LAST, id DESC`,
+      `SELECT n.id,
+              n.note          AS note_text,
+              n.created_at    AS note_date,
+              COALESCE(NULLIF(TRIM(CONCAT_WS(' ', e.first_name, e.last_name)), ''),
+                       'Staff') AS employee_name,
+              n.created_by    AS employee_id
+         FROM notes n
+         LEFT JOIN employees e ON e.id = n.created_by
+        WHERE n.project_id = $1
+        ORDER BY n.created_at DESC NULLS LAST, n.id DESC`,
       [parseInt(req.params.id)]
     );
     res.json(rows);
@@ -500,14 +510,18 @@ router.get('/:id/notes', requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/projects/:id/notes ────────────────────────────────────────────
+// created_by captures the logged-in employee from the JWT (req.user.id, set
+// by middleware/auth.js requireAuth). Falls back to NULL if for any reason
+// the JWT didn't carry an id — the existing 'Staff' fallback in GET handles
+// that gracefully without a separate code path.
 router.post('/:id/notes', requireAuth, async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return res.status(400).json({ message: 'Note text required' });
   try {
     await query(
-      `INSERT INTO notes (project_id, note, created_at)
-       VALUES ($1, $2, NOW())`,
-      [parseInt(req.params.id), text.trim()]
+      `INSERT INTO notes (project_id, note, created_by, created_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [parseInt(req.params.id), text.trim(), req.user?.id || null]
     );
     res.status(201).json({ message: 'Note added' });
   } catch (e) {
