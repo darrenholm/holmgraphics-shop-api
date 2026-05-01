@@ -33,6 +33,7 @@ const {
 // implementation. Don't redefine them here.
 const {
   QB_BASE, qbGet, qbPost, cleanEmail,
+  findOrCreateQboCustomer,
 } = require('../lib/qbo-sync');
 
 const router = express.Router();
@@ -241,7 +242,29 @@ router.get('/taxcodes', async (req, res) => {
 router.post('/invoice/project/:id', async (req, res) => {
   try {
     const { client_name, description, items, project_number } = req.body;
-    const client_email = cleanEmail(req.body.client_email);
+    // BillEmail priority: form input wins (staff just typed it on the
+    // billing screen), then any per-order notification_email captured
+    // at checkout for the linked online order, then clients.email.
+    // Empty at every level => leave BillEmail unset and QB falls back to
+    // whatever's already on the existing Customer record.
+    const projectId = parseInt(req.params.id, 10);
+    const ctxRow = Number.isInteger(projectId)
+      ? await queryOne(
+          `SELECT c.email AS client_email, o.notification_email
+             FROM projects p
+             LEFT JOIN clients c ON c.id = p.client_id
+             LEFT JOIN orders   o ON o.job_id = p.id AND o.notification_email IS NOT NULL
+            WHERE p.id = $1
+            ORDER BY o.id DESC NULLS LAST
+            LIMIT 1`,
+          [projectId]
+        )
+      : null;
+    const billEmail =
+      cleanEmail(req.body.client_email) ||
+      cleanEmail(ctxRow?.notification_email) ||
+      cleanEmail(ctxRow?.client_email) ||
+      '';
     // Customer-supplied PO#. Optional. Rendered on the printed/emailed
     // invoice via CustomerMemo and stashed in PrivateNote for internal
     // search. QBO Online has no dedicated PONumber field on Invoice (that
@@ -252,22 +275,17 @@ router.post('/invoice/project/:id', async (req, res) => {
       return res.status(400).json({ error: 'client_name and items are required' });
     }
 
-    // Find or create QB customer.
-    const searchData = await qbGet(
-      `/query?query=${encodeURIComponent(
-        `SELECT * FROM Customer WHERE DisplayName = '${client_name.replace(/'/g, "\\'")}' MAXRESULTS 1`
-      )}`
-    );
-    let customerId = searchData?.QueryResponse?.Customer?.[0]?.Id;
-
-    if (!customerId) {
-      const newCust = await qbPost('/customer', {
-        DisplayName: client_name,
-        ...(client_email ? { PrimaryEmailAddr: { Address: client_email } } : {}),
-      });
-      customerId = newCust?.Customer?.Id;
-      if (!customerId) throw new Error('Failed to create QB customer');
-    }
+    // Find or create QB customer via the shared helper. Survives the
+    // 6240 (Duplicate Name Exists) trap that fires when the local
+    // client_name omits a suffix QB has on its record (e.g. local says
+    // "Holm Graphics", QB says "Holm Graphics Inc"). See lib/qbo-sync.js
+    // findOrCreateQboCustomer for the full fallback flow.
+    const customer = await findOrCreateQboCustomer({
+      displayName: client_name,
+      email:       billEmail,
+    });
+    const customerId = customer.Id;
+    if (!customerId) throw new Error('Failed to resolve QB customer Id');
 
     // Look up the 'Misc' fallback item.
     const itemSearch = await qbGet(
@@ -337,8 +355,8 @@ router.post('/invoice/project/:id', async (req, res) => {
       // Native "P.O. Number" field on the invoice — QBO stores it as a
       // custom field entry keyed by DefinitionId.
       ...(poField ? { CustomField: [poField] } : {}),
-      ...(client_email
-        ? { BillEmail: { Address: client_email }, EmailStatus: 'NeedToSend' }
+      ...(billEmail
+        ? { BillEmail: { Address: billEmail }, EmailStatus: 'NeedToSend' }
         : {}),
     });
 
