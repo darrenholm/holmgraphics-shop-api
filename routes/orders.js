@@ -89,7 +89,14 @@ router.post('/quote', async (req, res) => {
     validateCart(cart);
 
     const config = await getDtfConfig();
-    const shipTo = ship_to || {};
+    // Tax province: ship orders use the customer's ship-to province;
+    // pickup orders use the seller's location (Canadian "place of supply"
+    // rule for in-person pickups). SELLER_PROVINCE env var lets a future
+    // shop relocation be a single Railway change rather than a code edit.
+    const taxProvince = fulfillment_method === 'ship'
+      ? ship_to?.province
+      : (process.env.SELLER_PROVINCE || 'ON');
+    const shipTo = { ...(ship_to || {}), province: taxProvince };
     const shippingTotal = fulfillment_method === 'pickup' ? 0 : Number(shipping_total) || 0;
 
     const breakdown = priceCart({ cart, config, shipTo, shippingTotal });
@@ -258,10 +265,18 @@ router.post('/', requireCustomer, async (req, res) => {
       shippingTotal = chosenRate.total_charge;
     }
 
+    // Same tax-province logic as /api/orders/quote -- pickup orders use
+    // the seller's province (Canadian place-of-supply rule), ship orders
+    // use the customer's ship-to. Without this branch, pickup orders
+    // arrived at priceCart with no province, taxRateFor returned 0, and
+    // the order was persisted + charged with $0 tax instead of HST.
+    const taxProvince = fulfillment_method === 'ship'
+      ? ship_to?.province
+      : (process.env.SELLER_PROVINCE || 'ON');
     const breakdown = priceCart({
       cart,
       config,
-      shipTo: ship_to || {},
+      shipTo: { ...(ship_to || {}), province: taxProvince },
       shippingTotal,
     });
 
