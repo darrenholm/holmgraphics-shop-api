@@ -327,7 +327,70 @@ router.get('/:id', requireAuth, async (req, res) => {
       [id]
     );
 
-    res.json({ ...row, client_phones: phones, measurements, decorations });
+    // Financial summary for the linked online order, when one exists.
+    // Staff-created projects have no orders row → orderRow is null and
+    // we omit the order_summary key entirely (vs returning null) so the
+    // frontend can do a simple {#if project.order_summary} gate.
+    //
+    // items_subtotal on `orders` is garments-only per the migration 008
+    // comment ("Garment cost only — decoration cost lives on
+    // order_decorations"). Decorations + setup fees are summed from
+    // order_decorations so the frontend can render the breakdown the
+    // customer saw at checkout.
+    //
+    // tax_rate_pct is derived from the actual taxed total rather than a
+    // separate stored column — keeps the math honest if rounding ever
+    // makes the stored rate not exactly match what tax / pre_tax yields.
+    const orderRow = await queryOne(
+      `SELECT o.order_number,
+              o.items_subtotal::numeric                AS items_subtotal,
+              o.shipping_total::numeric                AS shipping_total,
+              o.tax_total::numeric                     AS tax_total,
+              o.grand_total::numeric                   AS grand_total,
+              o.fulfillment_method,
+              o.paid_at,
+              o.qb_payment_id,
+              o.notification_email,
+              (SELECT COALESCE(SUM(decoration_cost + setup_fee), 0)::numeric
+                 FROM order_decorations
+                WHERE order_id = o.id)                 AS decorations_subtotal
+         FROM orders o
+        WHERE o.job_id = $1
+        ORDER BY o.id DESC
+        LIMIT 1`,
+      [id]
+    );
+
+    let order_summary;
+    if (orderRow) {
+      const items   = Number(orderRow.items_subtotal)       || 0;
+      const decos   = Number(orderRow.decorations_subtotal) || 0;
+      const ship    = Number(orderRow.shipping_total)       || 0;
+      const tax     = Number(orderRow.tax_total)            || 0;
+      const preTax  = items + decos + ship;
+      const ratePct = preTax > 0 ? Number(((tax / preTax) * 100).toFixed(2)) : 0;
+      order_summary = {
+        order_number:         orderRow.order_number,
+        items_subtotal:       items,
+        decorations_subtotal: decos,
+        shipping_total:       ship,
+        tax_total:            tax,
+        tax_rate_pct:         ratePct,
+        grand_total:          Number(orderRow.grand_total) || 0,
+        fulfillment_method:   orderRow.fulfillment_method,
+        paid_at:              orderRow.paid_at,
+        qb_payment_id:        orderRow.qb_payment_id,
+        notification_email:   orderRow.notification_email,
+      };
+    }
+
+    res.json({
+      ...row,
+      client_phones: phones,
+      measurements,
+      decorations,
+      ...(order_summary ? { order_summary } : {}),
+    });
   } catch (e) {
     console.error('GET /projects/:id:', e);
     res.status(500).json({ message: 'Failed to load project', detail: e.message });
