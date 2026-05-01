@@ -21,6 +21,7 @@ const paymentRoutes      = require('./routes/payment');
 const quoteRoutes        = require('./routes/quote');
 const dtfAdminRoutes     = require('./routes/dtf-admin');
 const ordersAdminRoutes  = require('./routes/orders-admin');
+const uploadLinksRoutes  = require('./routes/upload-links');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -60,6 +61,10 @@ app.use('/api/projects',   projectRoutes);
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
 // (parsing "folder-mappings" as an integer id and crashing the query).
 app.use('/api/clients',    clientsRoutes);
+// uploadLinksRoutes serves both /api/jobs/:id/upload-links (staff) and
+// /api/upload-links/:token[/upload] (public). Mount before lookupRoutes
+// so its specific paths win over the catch-all.
+app.use('/api',            uploadLinksRoutes);
 app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
