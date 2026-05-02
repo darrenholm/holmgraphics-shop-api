@@ -62,7 +62,8 @@ router.get('/clients/:id', requireAuth, async (req, res) => {
     const [clients, addresses, phones] = await Promise.all([
       query(
         `SELECT id, company AS company_name, fname AS first_name,
-                lname AS last_name, email
+                lname AS last_name, email,
+                payment_terms_days, allow_invoice_checkout
            FROM clients
           WHERE id = $1`,
         [id]
