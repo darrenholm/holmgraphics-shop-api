@@ -222,17 +222,31 @@ router.post('/', requireCustomer, async (req, res) => {
     }
     validateCart(cart);
     if (fulfillment_method === 'ship') validateShipTo(ship_to);
-    if (!payment || (!payment.card_token && !payment.saved_card_id)) {
-      return res.status(400).json({ error: 'payment.card_token or saved_card_id required' });
-    }
 
     // ─── Load customer ──────────────────────────────────────────────────────
+    // We need allow_invoice_checkout BEFORE validating payment so a Net-30-
+    // approved client can submit the form without a card token. Customers
+    // without that flag take the existing card-required path.
     const customer = await queryOne(
-      `SELECT id, email, fname, lname, company, phone, qb_customer_id
+      `SELECT id, email, fname, lname, company, phone, qb_customer_id,
+              allow_invoice_checkout, payment_terms_days
          FROM clients WHERE id = $1`,
       [req.customer.id]
     );
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    // Net-terms branch: client is approved for invoice billing AND has a
+    // terms-days value (the DB CHECK should guarantee both move together,
+    // but the runtime check is cheap and prevents a NULL-due_date crash if
+    // the constraint ever drifts).
+    const useInvoiceCheckout =
+      Boolean(customer.allow_invoice_checkout) && Number.isInteger(customer.payment_terms_days);
+
+    if (!useInvoiceCheckout) {
+      if (!payment || (!payment.card_token && !payment.saved_card_id)) {
+        return res.status(400).json({ error: 'payment.card_token or saved_card_id required' });
+      }
+    }
 
     // ─── Recompute pricing server-side (authoritative) ──────────────────────
     const config = await getDtfConfig();
@@ -285,37 +299,44 @@ router.post('/', requireCustomer, async (req, res) => {
       shippingTotal,
     });
 
-    // ─── Charge the card ────────────────────────────────────────────────────
-    const orderRefForCharge = `HG-${Date.now()}`;
-    let card;
-    if (payment.card_token) {
-      card = { token: payment.card_token };
-    } else {
-      const saved = await queryOne(
-        `SELECT qb_card_token, card_brand, card_last4
-           FROM client_payment_methods
-          WHERE id = $1 AND client_id = $2`,
-        [payment.saved_card_id, customer.id]
-      );
-      if (!saved) return res.status(404).json({ error: 'Saved card not found' });
-      card = { token: saved.qb_card_token, brand: saved.card_brand, last4: saved.card_last4 };
-    }
+    // ─── Charge the card (skipped on Net-terms invoice path) ───────────────
+    // useInvoiceCheckout=TRUE clients have already passed the staff
+    // approval gate (clients.allow_invoice_checkout) and have a
+    // payment_terms_days value. Their order persists with
+    // payment_method='invoice_pending' and a QBO Invoice (not Sales
+    // Receipt) goes out post-commit. No card is taken in this path.
+    if (!useInvoiceCheckout) {
+      const orderRefForCharge = `HG-${Date.now()}`;
+      let card;
+      if (payment.card_token) {
+        card = { token: payment.card_token };
+      } else {
+        const saved = await queryOne(
+          `SELECT qb_card_token, card_brand, card_last4
+             FROM client_payment_methods
+            WHERE id = $1 AND client_id = $2`,
+          [payment.saved_card_id, customer.id]
+        );
+        if (!saved) return res.status(404).json({ error: 'Saved card not found' });
+        card = { token: saved.qb_card_token, brand: saved.card_brand, last4: saved.card_last4 };
+      }
 
-    const chargeResult = await qbPayments.charge({
-      token:       card.token,
-      amount:      breakdown.grand_total,
-      currency:    'CAD',
-      description: `Holm Graphics order — ${customer.email}`,
-      requestId:   orderRefForCharge,
-    });
-
-    if (!chargeResult.ok) {
-      return res.status(402).json({
-        error: `Card declined (${chargeResult.status}). Please try a different card.`,
-        decline_status: chargeResult.status,
+      const chargeResult = await qbPayments.charge({
+        token:       card.token,
+        amount:      breakdown.grand_total,
+        currency:    'CAD',
+        description: `Holm Graphics order — ${customer.email}`,
+        requestId:   orderRefForCharge,
       });
+
+      if (!chargeResult.ok) {
+        return res.status(402).json({
+          error: `Card declined (${chargeResult.status}). Please try a different card.`,
+          decline_status: chargeResult.status,
+        });
+      }
+      chargedId = chargeResult.charge_id;
     }
-    chargedId = chargeResult.charge_id;
 
     // From here on, any thrown error must trigger a compensating refund.
     // The inner try wraps everything that can fail post-charge so the catch
@@ -348,6 +369,18 @@ router.post('/', requireCustomer, async (req, res) => {
         ? ship_to.email.trim()
         : null;
 
+      // Net-terms branch: paid_at stays NULL; due_date = today + N days.
+      // Card branch: paid_at = NOW(); due_date stays NULL. payment_method
+      // is 'invoice_pending' on the Net path, 'card' otherwise (was
+      // implicitly NULL on online orders before; setting it explicitly
+      // makes reporting honest going forward).
+      const paymentMethodValue = useInvoiceCheckout ? 'invoice_pending' : 'card';
+      const dueDateValue       = useInvoiceCheckout
+        ? new Date(Date.now() + customer.payment_terms_days * 24 * 60 * 60 * 1000)
+            .toISOString().slice(0, 10)
+        : null;
+      const paidAtValue = useInvoiceCheckout ? null : new Date();
+
       // Build the QBO description from the breakdown so the Sales Receipt
       // shows itemized pricing in the customer's portal.
       const orderRow = await client.query(
@@ -361,6 +394,8 @@ router.post('/', requireCustomer, async (req, res) => {
             qb_payment_id,
             customer_notes,
             notification_email,
+            payment_method,
+            due_date,
             paid_at
           ) VALUES (
             $1, $2, $3, 'online', 'awaiting_artwork',
@@ -371,7 +406,9 @@ router.post('/', requireCustomer, async (req, res) => {
             $20,
             $21,
             $22,
-            NOW()
+            $23,
+            $24,
+            $25
           )
           RETURNING id, order_number, status, grand_total`,
         [
@@ -392,6 +429,9 @@ router.post('/', requireCustomer, async (req, res) => {
           chargedId,
           customer_notes || null,
           notificationEmail,
+          paymentMethodValue,
+          dueDateValue,
+          paidAtValue,
         ]
       );
       order = orderRow.rows[0];
@@ -485,12 +525,19 @@ router.post('/', requireCustomer, async (req, res) => {
     }
 
     // ─── Best-effort post-commit work (don't fail the order) ────────────────
-    // QBO Sales Receipt creation: fire-and-forget. If it fails, an admin
-    // can re-sync from the order detail page later. The card has already
-    // been charged so the customer's experience is unaffected.
-    queueQboSalesReceipt(order.id).catch((e) =>
-      console.warn(`QBO sales receipt for order ${order.id} failed:`, e.message)
-    );
+    // QBO sync: SalesReceipt for card-paid orders (money already in),
+    // Invoice for Net-terms orders (will be paid against the invoice
+    // due_date). Fire-and-forget either way -- failures get logged and
+    // an admin can re-sync from the order detail page.
+    if (useInvoiceCheckout) {
+      queueQboInvoice(order.id).catch((e) =>
+        console.warn(`QBO invoice for order ${order.id} failed:`, e.message)
+      );
+    } else {
+      queueQboSalesReceipt(order.id).catch((e) =>
+        console.warn(`QBO sales receipt for order ${order.id} failed:`, e.message)
+      );
+    }
 
     // Order confirmation email — routed through the status-driven dispatcher
     // so it logs to email_log (idempotent: maybePromoteJob inside the tx
@@ -552,6 +599,16 @@ async function queueQboSalesReceipt(orderId) {
   const { createSalesReceiptFromOrder } = require('../lib/qbo-sync');
   const qboId = await createSalesReceiptFromOrder(orderId);
   console.log(`[orders] QBO SalesReceipt ${qboId} created for order ${orderId}`);
+}
+
+// Sibling helper for Net-terms orders. Builds a QBO Invoice (with the
+// order's due_date), not a SalesReceipt -- those are for already-paid
+// transactions. Idempotent like the SalesReceipt path: if the order
+// already has qbo_invoice_id set, returns the existing one.
+async function queueQboInvoice(orderId) {
+  const { createInvoiceFromOrder } = require('../lib/qbo-sync');
+  const qboId = await createInvoiceFromOrder(orderId);
+  console.log(`[orders] QBO Invoice ${qboId} created for order ${orderId}`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

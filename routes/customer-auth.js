@@ -73,19 +73,26 @@ function isValidPassword(s) {
 // password_hash or any token fields.
 function publicProfile(client) {
   return {
-    id:                  client.id,
-    email:               client.email,
-    name:                [client.fname, client.lname].filter(Boolean).join(' ') ||
-                         client.company || client.email,
-    fname:               client.fname,
-    lname:               client.lname,
-    company:             client.company,
-    phone:               client.phone,
-    account_status:      client.account_status,
-    email_verified:      Boolean(client.email_verified_at),
-    qbo_linked:          Boolean(client.qb_customer_id),
-    pricing_tier_id:     client.pricing_tier_id,
-    created_at:          client.created_at,
+    id:                       client.id,
+    email:                    client.email,
+    name:                     [client.fname, client.lname].filter(Boolean).join(' ') ||
+                              client.company || client.email,
+    fname:                    client.fname,
+    lname:                    client.lname,
+    company:                  client.company,
+    phone:                    client.phone,
+    account_status:           client.account_status,
+    email_verified:           Boolean(client.email_verified_at),
+    qbo_linked:               Boolean(client.qb_customer_id),
+    pricing_tier_id:          client.pricing_tier_id,
+    // Net-terms billing approval. allow_invoice_checkout=TRUE means the
+    // checkout page hides the card form and the order POSTs through
+    // with payment_method='invoice_pending'. payment_terms_days drives
+    // the due_date + the "Net X" badge in the UI. NULL terms_days means
+    // pay-at-checkout (default for everyone before the staff approval).
+    allow_invoice_checkout:   Boolean(client.allow_invoice_checkout),
+    payment_terms_days:       client.payment_terms_days || null,
+    created_at:               client.created_at,
   };
 }
 
@@ -96,6 +103,7 @@ async function findClientById(id) {
             password_hash, account_status, activation_token, activation_sent_at,
             password_reset_token, password_reset_expires,
             pricing_tier_id, email_verified_at, last_login_at,
+            payment_terms_days, allow_invoice_checkout,
             created_at, updated_at
        FROM clients WHERE id = $1`,
     [id]

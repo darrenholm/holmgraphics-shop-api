@@ -668,29 +668,78 @@ router.patch('/led-signs/:id/module', requireStaff, async (req, res) => {
 // keep the edit surface here because it's grown into the client-scoped
 // namespace (LED signs, WiFi, modules) and this is where future work lands.
 
-const CLIENT_WRITABLE  = ['company', 'fname', 'lname', 'email'];
+const CLIENT_WRITABLE  = ['company', 'fname', 'lname', 'email',
+                          'payment_terms_days', 'allow_invoice_checkout'];
+const VALID_TERMS_DAYS = [15, 30, 60, 90];
 const ADDRESS_WRITABLE = ['address1', 'address2', 'town', 'province', 'postal_code', 'address_type'];
 const PHONE_WRITABLE   = ['number', 'ext', 'phone_type'];
 
 // ─── PUT /api/clients/:id ────────────────────────────────────────────────────
-// Update company / first name / last name / email. At least one of company
-// or last name must remain populated after the update (matches the POST
-// guard in lookup.js).
+// Update company / first name / last name / email / net-terms billing. At
+// least one of company or last name must remain populated after the update
+// (matches the POST guard in lookup.js). The net-terms fields are coupled
+// at the DB level via clients_invoice_checkout_requires_terms (allow_invoice
+// _checkout=TRUE → payment_terms_days NOT NULL); we mirror that here so the
+// UI sees a 400 instead of a 500 from the constraint.
 router.put('/:id', requireStaff, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid client id' });
 
-  const { cols, vals } = extractFields(req.body, CLIENT_WRITABLE);
+  // Hand-coerce the net-terms fields: extractFields' string-based cleanValue
+  // would mishandle the boolean/integer types here.
+  const body = { ...req.body };
+  if ('payment_terms_days' in body) {
+    const raw = body.payment_terms_days;
+    if (raw === null || raw === '' || raw === undefined) {
+      body.payment_terms_days = null;
+    } else {
+      const n = Number(raw);
+      if (!Number.isInteger(n) || !VALID_TERMS_DAYS.includes(n)) {
+        return res.status(400).json({
+          message: `payment_terms_days must be one of ${VALID_TERMS_DAYS.join(', ')} or null`,
+        });
+      }
+      body.payment_terms_days = n;
+    }
+  }
+  if ('allow_invoice_checkout' in body) {
+    const raw = body.allow_invoice_checkout;
+    if (raw === true || raw === false) {
+      body.allow_invoice_checkout = raw;
+    } else if (raw === 'true' || raw === 'false') {
+      body.allow_invoice_checkout = raw === 'true';
+    } else {
+      return res.status(400).json({ message: 'allow_invoice_checkout must be true or false' });
+    }
+  }
+
+  const { cols, vals } = extractFields(body, CLIENT_WRITABLE);
   if (cols.length === 0) return res.status(400).json({ message: 'No updatable fields provided' });
 
   // Guard against blanking out both company and last name at once. We read
   // the existing row and merge — the UI may only send the field it changed.
-  const current = await queryOne('SELECT company, lname FROM clients WHERE id = $1', [id]);
+  // Also pull terms columns so we can pre-validate the invoice-checkout
+  // coupling against the merged post-update state.
+  const current = await queryOne(
+    'SELECT company, lname, payment_terms_days, allow_invoice_checkout FROM clients WHERE id = $1',
+    [id]
+  );
   if (!current) return res.status(404).json({ message: 'Client not found' });
   const effCompany = cols.includes('company') ? vals[cols.indexOf('company')] : current.company;
   const effLname   = cols.includes('lname')   ? vals[cols.indexOf('lname')]   : current.lname;
   if (!effCompany && !effLname) {
     return res.status(400).json({ message: 'Company or last name is required' });
+  }
+  const effTerms = cols.includes('payment_terms_days')
+    ? vals[cols.indexOf('payment_terms_days')]
+    : current.payment_terms_days;
+  const effAllow = cols.includes('allow_invoice_checkout')
+    ? vals[cols.indexOf('allow_invoice_checkout')]
+    : current.allow_invoice_checkout;
+  if (effAllow && effTerms == null) {
+    return res.status(400).json({
+      message: 'Cannot enable invoice checkout without selecting payment terms (15/30/60/90 days)',
+    });
   }
 
   try {
@@ -701,7 +750,9 @@ router.put('/:id', requireStaff, async (req, res) => {
                  company AS company_name,
                  fname   AS first_name,
                  lname   AS last_name,
-                 email`,
+                 email,
+                 payment_terms_days,
+                 allow_invoice_checkout`,
       [...vals, id]
     );
     res.json(updated);
