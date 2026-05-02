@@ -483,14 +483,24 @@ router.put('/:id', requireStaff, async (req, res) => {
 });
 
 // ─── GET /api/projects/:id/notes ─────────────────────────────────────────────
+// LEFT JOIN employees so the staff name comes from notes.created_by when the
+// row has it. Historical rows (pre-attribution fix) have created_by NULL and
+// fall back to the literal 'Staff' — the COALESCE preserves that behaviour
+// rather than rendering "—" or empty.
 router.get('/:id/notes', requireAuth, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, note AS note_text, created_at AS note_date,
-              'Staff' AS employee_name
-         FROM notes
-        WHERE project_id = $1
-        ORDER BY created_at DESC NULLS LAST, id DESC`,
+      `SELECT n.id,
+              n.note AS note_text,
+              n.created_at AS note_date,
+              COALESCE(
+                NULLIF(TRIM(CONCAT_WS(' ', e.first_name, e.last_name)), ''),
+                'Staff'
+              ) AS employee_name
+         FROM notes n
+         LEFT JOIN employees e ON e.id = n.created_by
+        WHERE n.project_id = $1
+        ORDER BY n.created_at DESC NULLS LAST, n.id DESC`,
       [parseInt(req.params.id)]
     );
     res.json(rows);
@@ -500,14 +510,24 @@ router.get('/:id/notes', requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/projects/:id/notes ────────────────────────────────────────────
-router.post('/:id/notes', requireAuth, async (req, res) => {
+// requireStaff (not requireAuth): a customer JWT also carries an `id` field,
+// so without the role gate we would silently write a customer id into
+// notes.created_by — exactly the silent-NULL class of bug the previous
+// attribution attempt suffered. Guarding here ensures req.user.id refers to
+// employees(id). If it somehow doesn't, throw 500 rather than insert garbage.
+router.post('/:id/notes', requireStaff, async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return res.status(400).json({ message: 'Note text required' });
+  const employeeId = req.user?.id;
+  if (!Number.isInteger(employeeId)) {
+    console.error('POST /projects/:id/notes: requireStaff passed but req.user.id missing', req.user);
+    return res.status(500).json({ message: 'Auth context missing employee id' });
+  }
   try {
     await query(
-      `INSERT INTO notes (project_id, note, created_at)
-       VALUES ($1, $2, NOW())`,
-      [parseInt(req.params.id), text.trim()]
+      `INSERT INTO notes (project_id, note, created_by, created_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [parseInt(req.params.id), text.trim(), employeeId]
     );
     res.status(201).json({ message: 'Note added' });
   } catch (e) {
