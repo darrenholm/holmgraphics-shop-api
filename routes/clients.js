@@ -10,7 +10,7 @@
 // client_folder_name on /api/projects responses.
 
 const express = require('express');
-const { query, queryOne } = require('../db/connection');
+const { query, queryOne, pool } = require('../db/connection');
 const { requireAuth, requireStaff } = require('../middleware/auth');
 
 const router = express.Router();
@@ -829,6 +829,173 @@ router.delete('/phones/:id', requireStaff, async (req, res) => {
     console.error('DELETE /clients/phones/:id:', e);
     res.status(500).json({ message: 'Failed to delete phone', detail: e.message });
   }
+});
+
+// ─── POST /api/clients/:id/merge ─────────────────────────────────────────────
+// Merge `secondary_id` into `:id`. Atomic: every related row is re-parented
+// (or copied with dedup) inside one transaction; if anything fails, nothing
+// is touched. Secondary is soft-archived (merged_into_id + archived_at) so
+// the audit trail survives and a future "unmerge" feature stays possible.
+//
+// Validation:
+//   * Both ids must be integers and reference existing rows.
+//   * Cannot merge a client into itself.
+//   * Cannot merge if either side is already merged-out.
+//
+// Re-parent strategy per related table:
+//   * orders, projects, client_payment_methods, led_signs
+//       UPDATE client_id = primary  -- each row is uniquely meaningful.
+//   * client_addresses, client_phones
+//       INSERT secondary's rows that don't match any primary row, then
+//       DELETE secondary's rows. Dedup keys:
+//         addresses → address1+address2+town+postal_code
+//         phones    → number+ext+phone_type
+//   * client_preferences, client_wifi (typically singletons)
+//       Take secondary's row only if primary doesn't have one; either way
+//       drop secondary's leftover row at the end.
+//
+// Identity promotion: if primary's email/phone/qb_customer_id/files_folder
+// is empty AND secondary's is non-empty, copy secondary's value over. Never
+// overwrites primary data. Doesn't touch company/fname/lname (primary's
+// chosen canonical name wins).
+//
+// Audit: writes one row to audit_log with field_changed='client_merge',
+// old_value = secondary {id,label}, new_value = primary {id,label}.
+router.post('/:id/merge', requireStaff, async (req, res) => {
+  const primaryId   = parseInt(req.params.id, 10);
+  const secondaryId = parseInt(req.body?.secondary_id, 10);
+
+  if (!Number.isInteger(primaryId) || !Number.isInteger(secondaryId)) {
+    return res.status(400).json({ error: 'primary id (path) and secondary_id (body) must be integers' });
+  }
+  if (primaryId === secondaryId) {
+    return res.status(400).json({ error: 'Cannot merge a client into itself' });
+  }
+
+  // Pre-fetch both clients so we can validate + capture audit labels
+  // before opening the transaction.
+  const [primary, secondary] = await Promise.all([
+    queryOne(
+      `SELECT id, company, fname, lname, email, phone, qb_customer_id, files_folder, merged_into_id
+         FROM clients WHERE id = $1`,
+      [primaryId]
+    ),
+    queryOne(
+      `SELECT id, company, fname, lname, email, phone, qb_customer_id, files_folder, merged_into_id
+         FROM clients WHERE id = $1`,
+      [secondaryId]
+    ),
+  ]);
+  if (!primary)                  return res.status(404).json({ error: `primary client ${primaryId} not found` });
+  if (!secondary)                return res.status(404).json({ error: `secondary client ${secondaryId} not found` });
+  if (primary.merged_into_id)    return res.status(409).json({ error: `primary client #${primaryId} has already been merged into another client` });
+  if (secondary.merged_into_id)  return res.status(409).json({ error: `secondary client #${secondaryId} has already been merged` });
+
+  const labelOf = (c) =>
+    c.company || [c.fname, c.lname].filter(Boolean).join(' ').trim() || `Client #${c.id}`;
+
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+
+    // 1. Simple FK re-parents.
+    for (const table of ['orders', 'projects', 'client_payment_methods', 'led_signs']) {
+      await dbClient.query(
+        `UPDATE ${table} SET client_id = $1 WHERE client_id = $2`,
+        [primaryId, secondaryId]
+      );
+    }
+
+    // 2. client_addresses: copy non-dupes, then drop secondary's leftovers.
+    await dbClient.query(`
+      INSERT INTO client_addresses (client_id, address_type, address1, address2, town, province, postal_code)
+      SELECT $1, address_type, address1, address2, town, province, postal_code
+        FROM client_addresses sa
+       WHERE sa.client_id = $2
+         AND NOT EXISTS (
+           SELECT 1 FROM client_addresses pa
+            WHERE pa.client_id = $1
+              AND COALESCE(pa.address1, '')    = COALESCE(sa.address1, '')
+              AND COALESCE(pa.address2, '')    = COALESCE(sa.address2, '')
+              AND COALESCE(pa.town, '')        = COALESCE(sa.town, '')
+              AND COALESCE(pa.postal_code, '') = COALESCE(sa.postal_code, '')
+         )
+    `, [primaryId, secondaryId]);
+    await dbClient.query(`DELETE FROM client_addresses WHERE client_id = $1`, [secondaryId]);
+
+    // 3. client_phones: same pattern, dedup on number+ext+phone_type.
+    await dbClient.query(`
+      INSERT INTO client_phones (client_id, phone_type, number, ext)
+      SELECT $1, phone_type, number, ext
+        FROM client_phones sp
+       WHERE sp.client_id = $2
+         AND NOT EXISTS (
+           SELECT 1 FROM client_phones pp
+            WHERE pp.client_id = $1
+              AND COALESCE(pp.number, '')     = COALESCE(sp.number, '')
+              AND COALESCE(pp.ext, '')        = COALESCE(sp.ext, '')
+              AND COALESCE(pp.phone_type, '') = COALESCE(sp.phone_type, '')
+         )
+    `, [primaryId, secondaryId]);
+    await dbClient.query(`DELETE FROM client_phones WHERE client_id = $1`, [secondaryId]);
+
+    // 4. Singleton-ish tables: take secondary's row only if primary
+    //    doesn't have one. Then drop any leftover.
+    for (const table of ['client_preferences', 'client_wifi']) {
+      await dbClient.query(`
+        UPDATE ${table} SET client_id = $1
+         WHERE client_id = $2
+           AND NOT EXISTS (SELECT 1 FROM ${table} WHERE client_id = $1)
+      `, [primaryId, secondaryId]);
+      await dbClient.query(`DELETE FROM ${table} WHERE client_id = $1`, [secondaryId]);
+    }
+
+    // 5. Identity promotion -- only fills primary's empty slots; never
+    //    overwrites primary's existing values. updated_at gets bumped
+    //    automatically by the clients table's BEFORE UPDATE trigger.
+    await dbClient.query(`
+      UPDATE clients SET
+        email          = COALESCE(NULLIF(email, ''),        $2),
+        phone          = COALESCE(NULLIF(phone, ''),        $3),
+        qb_customer_id = COALESCE(qb_customer_id,           $4),
+        files_folder   = COALESCE(NULLIF(files_folder, ''), $5)
+       WHERE id = $1
+    `, [primaryId, secondary.email, secondary.phone, secondary.qb_customer_id, secondary.files_folder]);
+
+    // 6. Mark secondary archived with a pointer to primary.
+    await dbClient.query(`
+      UPDATE clients SET merged_into_id = $1, archived_at = NOW()
+       WHERE id = $2
+    `, [primaryId, secondaryId]);
+
+    // 7. Audit log -- field_changed='client_merge', old_value carries
+    //    the secondary's id+label, new_value the primary's. Future
+    //    "merge history" queries pivot on field_changed.
+    await dbClient.query(`
+      INSERT INTO audit_log (project_id, employee_id, field_changed, old_value, new_value, changed_at)
+      VALUES (NULL, $1, 'client_merge', $2, $3, NOW())
+    `, [
+      req.user?.id || null,
+      JSON.stringify({ id: secondary.id, label: labelOf(secondary) }),
+      JSON.stringify({ id: primary.id,   label: labelOf(primary) }),
+    ]);
+
+    await dbClient.query('COMMIT');
+  } catch (txErr) {
+    await dbClient.query('ROLLBACK');
+    console.error('client merge failed:', txErr);
+    return res.status(500).json({ error: 'Merge failed', detail: txErr.message });
+  } finally {
+    dbClient.release();
+  }
+
+  res.json({
+    ok:           true,
+    primary_id:   primaryId,
+    secondary_id: secondaryId,
+    primary_label:   labelOf(primary),
+    secondary_label: labelOf(secondary),
+  });
 });
 
 module.exports = router;

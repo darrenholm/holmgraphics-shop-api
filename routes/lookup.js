@@ -24,24 +24,34 @@ router.get('/clients', requireStaff, async (req, res) => {
     if (!Number.isFinite(limit) || limit <= 0) limit = 50;
     if (limit > 1000) limit = 1000;
 
+    // Soft-deleted (merged-out) clients are hidden by default. Pass
+    // ?include_merged=1 to opt in -- the staff "Show merged" toggle on
+    // /clients flips this so audit-trail rows can still be inspected.
+    const includeMerged = req.query.include_merged === '1' || req.query.include_merged === 'true';
+
     const params = [];
-    let where = '';
+    const conds  = [];
     if (search) {
       params.push(`%${search}%`);
       // ILIKE on raw stored phone strings -- no format normalisation
       // because the column carries every punctuation convention we have
       // (519-507-3001, (519) 507-3001, 5195073001). A contiguous chunk
       // typed by the user matches any row containing that chunk literally.
-      where = `WHERE company ILIKE $1
-                  OR fname   ILIKE $1
-                  OR lname   ILIKE $1
-                  OR email   ILIKE $1
-                  OR phone   ILIKE $1`;
+      conds.push(`(company ILIKE $${params.length}
+                    OR fname   ILIKE $${params.length}
+                    OR lname   ILIKE $${params.length}
+                    OR email   ILIKE $${params.length}
+                    OR phone   ILIKE $${params.length})`);
     }
+    if (!includeMerged) {
+      conds.push(`merged_into_id IS NULL`);
+    }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     params.push(limit);
 
     const rows = await query(
-      `SELECT id, company AS company_name, fname AS first_name, lname AS last_name, email, phone
+      `SELECT id, company AS company_name, fname AS first_name, lname AS last_name,
+              email, phone, merged_into_id, archived_at
          FROM clients
          ${where}
         ORDER BY COALESCE(company, lname)
