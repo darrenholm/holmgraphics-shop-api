@@ -31,12 +31,17 @@ const express = require('express');
 const db = require('../db/connection');
 const { query, queryOne, pool } = db;
 const { requireCustomer } = require('../middleware/customer-auth');
+const { requireStaff } = require('../middleware/auth');
 const { priceCart } = require('../lib/dtf-pricing');
 const { getConfig: getDtfConfig } = require('../lib/dtf-pricing-loader');
 const shiptime = require('../lib/shiptime');
 const qbPayments = require('../lib/qb-payments');
 const mailer = require('../lib/customer-mailer');
 const { maybePromoteJob } = require('../lib/promote-job');
+const {
+  validateUnitPriceOverrides,
+  applyUnitPriceOverrides,
+} = require('../lib/order-pricing-overrides');
 
 const router = express.Router();
 
@@ -586,6 +591,346 @@ router.get('/', requireCustomer, async (req, res) => {
     res.json({ orders });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /api/orders/office
+// Staff-side order entry. Different from POST /api/orders in:
+//   * Auth: requireStaff (existing handler is requireCustomer).
+//   * Client: looked up by client_id in body, NOT from a customer JWT.
+//   * Payment is optional / configurable. method='card' charges as
+//     existing online flow does; 'cash' / 'etransfer' record paid_at
+//     without a charge; 'invoice_pending' leaves paid_at NULL.
+//   * Per-line unit_price_overrides supported -- staff custom-quote
+//     scenarios can swap the catalog price for a specific line without
+//     touching the catalog.
+//   * source = 'office' (CHECK widened in migration 014).
+//   * No notification_email gate -- if the client has an email on file,
+//     order-confirmation fires; otherwise silent.
+//   * Skips ShipTime requote and QBO sales-receipt auto-sync (those are
+//     online-flow concerns; office orders pickup-by-default).
+//
+// Request body:
+//   {
+//     client_id: int,                                   -- existing client (required)
+//     new_client?: { ... },                             -- 501 in O2; comes in O3
+//     cart: { items: [...], designs: [...] },           -- same shape as POST /api/orders
+//     payment: { method: 'card'|'cash'|'etransfer'|'invoice_pending',
+//                card_token?, saved_card_id? },
+//     unit_price_overrides?: { [item_id]: number },     -- optional per-line
+//     fulfillment_method?: 'pickup'|'ship',             -- default 'pickup'
+//     ship_to?: { ... },                                -- only when ship
+//     customer_notes?: string,
+//   }
+router.post('/office', requireStaff, async (req, res) => {
+  const startedAt = Date.now();
+  let createdJobId = null;
+  let chargedId    = null;
+
+  try {
+    const {
+      client_id,
+      new_client,
+      cart,
+      payment = {},
+      unit_price_overrides,
+      fulfillment_method = 'pickup',
+      ship_to,
+      customer_notes,
+    } = req.body;
+
+    // ─── Validation ────────────────────────────────────────────────────────
+    if (new_client) {
+      return res.status(501).json({
+        error: 'Inline client create comes in Phase O3 — use /clients to create the client first.'
+      });
+    }
+    const cid = parseInt(client_id, 10);
+    if (!Number.isInteger(cid)) {
+      return res.status(400).json({ error: 'client_id (integer) is required (or new_client, in a future phase)' });
+    }
+    if (!['ship', 'pickup'].includes(fulfillment_method)) {
+      return res.status(400).json({ error: 'fulfillment_method must be "ship" or "pickup"' });
+    }
+    try { validateCart(cart); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    if (fulfillment_method === 'ship') {
+      try { validateShipTo(ship_to); }
+      catch (e) { return res.status(400).json({ error: e.message }); }
+    }
+
+    const validMethods = ['card', 'cash', 'etransfer', 'invoice_pending'];
+    if (!payment.method || !validMethods.includes(payment.method)) {
+      return res.status(400).json({ error: `payment.method must be one of: ${validMethods.join(', ')}` });
+    }
+    if (payment.method === 'card' && !payment.card_token && !payment.saved_card_id) {
+      return res.status(400).json({ error: 'card payment requires payment.card_token or payment.saved_card_id' });
+    }
+
+    let overrides;
+    try { overrides = validateUnitPriceOverrides(unit_price_overrides); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+
+    // ─── Resolve client ────────────────────────────────────────────────────
+    const customer = await queryOne(
+      `SELECT id, email, fname, lname, company, phone, qb_customer_id
+         FROM clients WHERE id = $1`,
+      [cid]
+    );
+    if (!customer) return res.status(404).json({ error: `client #${cid} not found` });
+
+    // ─── Price the cart with overrides applied ─────────────────────────────
+    // Same place-of-supply tax logic as the online endpoint: pickup uses
+    // SELLER_PROVINCE, ship uses ship_to.province.
+    const adjustedCart = applyUnitPriceOverrides(cart, overrides);
+    const config = await getDtfConfig();
+    const taxProvince = fulfillment_method === 'ship'
+      ? ship_to?.province
+      : (process.env.SELLER_PROVINCE || 'ON');
+    const breakdown = priceCart({
+      cart: adjustedCart,
+      config,
+      shipTo: { ...(ship_to || {}), province: taxProvince },
+      shippingTotal: 0,   // office orders don't quote ShipTime; staff hand-bills shipping if needed
+    });
+
+    // ─── Card charge (only when method='card') ─────────────────────────────
+    if (payment.method === 'card') {
+      let card;
+      if (payment.card_token) {
+        card = { token: payment.card_token };
+      } else {
+        const saved = await queryOne(
+          `SELECT qb_card_token, card_brand, card_last4
+             FROM client_payment_methods
+            WHERE id = $1 AND client_id = $2`,
+          [payment.saved_card_id, customer.id]
+        );
+        if (!saved) return res.status(404).json({ error: 'saved_card_id not found for this client' });
+        card = { token: saved.qb_card_token, brand: saved.card_brand, last4: saved.card_last4 };
+      }
+
+      const orderRefForCharge = `HG-OFFICE-${Date.now()}`;
+      const chargeResult = await qbPayments.charge({
+        token:       card.token,
+        amount:      breakdown.grand_total,
+        currency:    'CAD',
+        description: `Holm Graphics office order — ${customer.email || 'client #' + customer.id}`,
+        requestId:   orderRefForCharge,
+      });
+      if (!chargeResult.ok) {
+        return res.status(402).json({
+          error: `Card declined (${chargeResult.status}). Please try a different card.`,
+          decline_status: chargeResult.status,
+        });
+      }
+      chargedId = chargeResult.charge_id;
+    }
+
+    // ─── Persist in one transaction ────────────────────────────────────────
+    // Same shape as the online flow's persistence: project row, order row,
+    // designs (placeholders for now -- staff uploads via the existing
+    // upload-link flow or hand-drops on L:\), order_items, order_decorations,
+    // then maybePromoteJob to push the project to "Ordered" + assign Brady.
+    const dbClient = await pool.connect();
+    let order;
+    try {
+      await dbClient.query('BEGIN');
+
+      const project = await dbClient.query(
+        `INSERT INTO projects (client_id, status_id, created_at)
+              VALUES ($1, 1, NOW())
+           RETURNING id`,
+        [customer.id]
+      );
+      createdJobId = project.rows[0].id;
+      const orderNumber = String(createdJobId);
+
+      // paid_at: NOW() for card / cash / etransfer (money has changed
+      // hands or is committed); NULL for invoice_pending (will be set
+      // when the invoice payment lands later).
+      const setPaidNow = ['card', 'cash', 'etransfer'].includes(payment.method);
+
+      // notification_email: optional for office orders. If the client
+      // has an account email, route confirmations there. Staff can edit
+      // by hand on the order detail page later.
+      const notificationEmail = customer.email || null;
+
+      const orderRow = await dbClient.query(
+        `INSERT INTO orders (
+            order_number, job_id, client_id, source, status,
+            items_subtotal, shipping_total, tax_total, grand_total,
+            fulfillment_method,
+            ship_to_name, ship_to_addr1, ship_to_addr2, ship_to_city,
+            ship_to_province, ship_to_postal, ship_to_country, ship_to_phone,
+            qb_payment_id,
+            customer_notes,
+            notification_email,
+            payment_method,
+            paid_at
+          ) VALUES (
+            $1, $2, $3, 'office', 'awaiting_artwork',
+            $4, $5, $6, $7,
+            $8,
+            $9, $10, $11, $12, $13, $14, $15, $16,
+            $17,
+            $18,
+            $19,
+            $20,
+            ${setPaidNow ? 'NOW()' : 'NULL'}
+          )
+          RETURNING id, order_number, status, grand_total`,
+        [
+          orderNumber, createdJobId, customer.id,
+          breakdown.items_subtotal, breakdown.shipping_total, breakdown.tax_total, breakdown.grand_total,
+          fulfillment_method,
+          fulfillment_method === 'ship' ? ship_to.name  : null,
+          fulfillment_method === 'ship' ? ship_to.addr1 : null,
+          fulfillment_method === 'ship' ? (ship_to.addr2 || null) : null,
+          fulfillment_method === 'ship' ? ship_to.city  : null,
+          fulfillment_method === 'ship' ? ship_to.province.toUpperCase() : null,
+          fulfillment_method === 'ship' ? ship_to.postal : null,
+          fulfillment_method === 'ship' ? (ship_to.country || 'CA') : null,
+          fulfillment_method === 'ship' ? (ship_to.phone || null) : null,
+          chargedId,
+          customer_notes || null,
+          notificationEmail,
+          payment.method,
+        ]
+      );
+      order = orderRow.rows[0];
+
+      // Designs (placeholder rows -- staff or customer uploads later via
+      // /shop/order/<n>/upload or the upload-link flow).
+      const designIdMap = new Map();
+      for (const d of (cart.designs || [])) {
+        const insert = await dbClient.query(
+          `INSERT INTO designs (order_id, name, artwork_path, artwork_filename)
+                VALUES ($1, $2, $3, $4)
+             RETURNING id`,
+          [order.id, d.name || 'Untitled design', '(pending upload)', d.filename || 'pending']
+        );
+        designIdMap.set(d.id, insert.rows[0].id);
+      }
+      for (const item of adjustedCart.items) {
+        for (const dec of (item.decorations || [])) {
+          if (dec.design_id && !designIdMap.has(dec.design_id)) {
+            const insert = await dbClient.query(
+              `INSERT INTO designs (order_id, name, artwork_path, artwork_filename)
+                    VALUES ($1, $2, $3, $4)
+                 RETURNING id`,
+              [order.id, `Design ${designIdMap.size + 1}`, '(pending upload)', 'pending']
+            );
+            designIdMap.set(dec.design_id, insert.rows[0].id);
+          }
+        }
+      }
+
+      // Line items + decorations (using adjusted unit_price after override).
+      for (const item of adjustedCart.items) {
+        const insertItem = await dbClient.query(
+          `INSERT INTO order_items (
+              order_id, supplier, style, variant_id, product_name,
+              color_name, color_hex, size, quantity, unit_price, line_subtotal
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           RETURNING id`,
+          [
+            order.id,
+            item.supplier, item.style, item.variant_id, item.product_name || `${item.style}`,
+            item.color_name || '', item.color_hex || null,
+            item.size, item.quantity,
+            item.unit_price,
+            Number((item.quantity * item.unit_price).toFixed(2)),
+          ]
+        );
+        const orderItemId = insertItem.rows[0].id;
+
+        const lineBreak = breakdown.line_breakdown.find((lb) => lb.item_id === item.id) ||
+                          { decorations: [] };
+
+        for (const dec of (item.decorations || [])) {
+          const designDbId = designIdMap.get(dec.design_id);
+          const decBreak   = lineBreak.decorations.find((d) => d.decoration_id === dec.id) ||
+                             { line_cost: 0, setup_fee: 0 };
+          await dbClient.query(
+            `INSERT INTO order_decorations (
+                order_id, order_item_id, design_id,
+                print_location_id, custom_location, width_in, height_in,
+                decoration_cost, setup_fee
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [
+              order.id, orderItemId, designDbId,
+              dec.print_location_id || null,
+              dec.custom_location || null,
+              dec.width_in || null,
+              dec.height_in || null,
+              decBreak.line_cost,
+              decBreak.setup_fee,
+            ]
+          );
+        }
+      }
+
+      // Auto-promote (Brady auto-assign + status flip) if eligible. Same
+      // helper the online flow uses; no special-casing needed for office.
+      await maybePromoteJob(dbClient, order.id);
+
+      await dbClient.query('COMMIT');
+    } catch (txErr) {
+      await dbClient.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      dbClient.release();
+    }
+
+    // Order-confirmation email -- only when the client has an email on
+    // file (office walk-ins frequently don't) AND the order isn't
+    // invoice-pending (we'll send the QB invoice separately for those).
+    if (customer.email && payment.method !== 'invoice_pending') {
+      mailer.sendForOrderStatus({ orderId: order.id, statusId: 2, db }).catch(() => {});
+    }
+
+    res.status(201).json({
+      ok: true,
+      order: {
+        id:            order.id,
+        order_number:  order.order_number,
+        status:        order.status,
+        grand_total:   Number(order.grand_total),
+        job_id:        createdJobId,
+        payment_method: payment.method,
+      },
+      breakdown,
+      took_ms: Date.now() - startedAt,
+    });
+  } catch (err) {
+    // Post-charge persistence failure -- compensating refund, mirror
+    // what the online flow does so a charged-but-not-persisted card
+    // never silently leaves the customer out of pocket.
+    if (chargedId) {
+      console.error('POST /api/orders/office post-charge failure:', err);
+      let refunded = false;
+      try {
+        const r = await qbPayments.refund({
+          chargeId:    chargedId,
+          description: 'Office order persistence failed; auto-refund.',
+          requestId:   `auto-refund-${chargedId}`,
+        });
+        refunded = r?.ok !== false;
+      } catch (refundErr) {
+        console.error(`Auto-refund failed for charge ${chargedId}:`, refundErr);
+      }
+      return res.status(500).json({
+        error: refunded
+          ? 'Order creation failed after charge; the card has been refunded.'
+          : 'Order creation failed and the refund attempt also failed -- contact support with the charge id.',
+        charge_id: chargedId,
+        detail:    err.message,
+      });
+    }
+    console.error('POST /api/orders/office failed:', err);
+    res.status(500).json({ error: 'Order creation failed', detail: err.message });
   }
 });
 

@@ -23,6 +23,7 @@
 const express = require('express');
 const qbPayments = require('../lib/qb-payments');
 const { requireCustomer } = require('../middleware/customer-auth');
+const { requireStaff } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -50,7 +51,12 @@ function parseExp(raw) {
   return { expMonth: String(mm).padStart(2, '0'), expYear: yy };
 }
 
-router.post('/tokenize', requireCustomer, async (req, res) => {
+// The handler is the same regardless of whether a customer or a staff
+// member is tokenising. Auth gating differs (requireCustomer vs
+// requireStaff) but the body of work below is auth-agnostic -- it never
+// reads req.user. We register it on two paths with two different
+// middlewares so each side stays scoped to its own audience.
+async function tokenizeHandler(req, res) {
   // Extract & validate locally. NEVER reach into req.body inside an
   // error path; only echo specific safe fields (postal code, last4) if
   // we explicitly want to.
@@ -106,6 +112,12 @@ router.post('/tokenize', requireCustomer, async (req, res) => {
       detail: intuitMsg ? undefined : 'See server logs',
     });
   }
-});
+}
+
+router.post('/tokenize',       requireCustomer, tokenizeHandler);
+// Staff-side tokenize for the office-order entry page. Same body
+// schema, same Intuit call -- just lets staff users (with a staff JWT)
+// hit the endpoint without needing a customer JWT in the request.
+router.post('/staff-tokenize', requireStaff,    tokenizeHandler);
 
 module.exports = router;
