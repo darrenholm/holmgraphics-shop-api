@@ -23,6 +23,7 @@ const dtfAdminRoutes     = require('./routes/dtf-admin');
 const ordersAdminRoutes  = require('./routes/orders-admin');
 const uploadLinksRoutes  = require('./routes/upload-links');
 const timeRoutes         = require('./routes/time');
+const payPeriodsRoutes   = require('./routes/pay-periods');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -70,7 +71,8 @@ app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
 app.use('/api/catalog',    catalogRoutes);
-app.use('/api/time',       timeRoutes);
+app.use('/api/time',         timeRoutes);
+app.use('/api/pay-periods',  payPeriodsRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
