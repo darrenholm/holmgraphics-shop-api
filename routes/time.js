@@ -59,11 +59,16 @@ function formatEntry(row) {
 // SELECT clause used everywhere we return time_entries to the client. Joins
 // employees (and approver) and projects so the frontend gets readable names
 // instead of bare ids.
+//
+// NOTE: projects.description is the real "name" column on the projects table;
+// the rest of the codebase aliases it `AS project_name` (see routes/projects.js
+// lines 103, 254). We follow the same convention here so the frontend gets a
+// consistent shape regardless of which endpoint produced it.
 const SELECT_WITH_JOINS = `
   SELECT t.*,
          TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS employee_name,
          TRIM(CONCAT_WS(' ', a.first_name, a.last_name)) AS approved_by_name,
-         p.project_name AS project_name
+         p.description AS project_name
     FROM time_entries t
     LEFT JOIN employees e ON e.id = t.employee_id
     LEFT JOIN employees a ON a.id = t.approved_by
