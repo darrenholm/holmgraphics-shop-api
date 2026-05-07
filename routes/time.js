@@ -387,23 +387,50 @@ router.post('/admin/bulk-approve', requireAdmin, async (req, res) => {
 });
 
 // ─── GET /api/time/admin/export ──────────────────────────────────────────────
-// Query: ?from=YYYY-MM-DD&to=YYYY-MM-DD&include_open=true|false&mark_exported=true|false
+// Query: one of two modes:
+//   Pay-period mode (preferred):  ?pay_period_id=<int>
+//     Filters by pay_period_id directly. After successful export (when
+//     mark_exported=true) the pay_periods row is also marked exported with
+//     audit metadata: exported_at, exported_by, csv_filename, exported_count.
+//   Date-range mode (fallback):  ?from=YYYY-MM-DD&to=YYYY-MM-DD
+//     For ad-hoc exports outside the regular pay cycle.
 //
-// Streams CSV in QBO Time Tracking format. By default:
-//   - Excludes 'open' entries (no clock_out, can't compute duration).
-//   - Excludes 'exported' entries (already pulled into a previous payroll run).
-//   - Marks newly-exported entries as 'exported' so they don't double-count.
+// Common flags:
+//   ?include_open=true|false      default false (open entries have no
+//                                 clock_out, can't compute duration)
+//   ?mark_exported=true|false     default true; pass false for a "preview"
+//                                 download that doesn't flip status
 //
-// Pass mark_exported=false to get a "preview" without flipping status. Useful
-// for a download-then-decide UI.
+// Streams CSV in QBO Time Tracking format. By default excludes already-
+// 'exported' entries so re-running the same period doesn't double-count.
 router.get('/admin/export', requireAdmin, async (req, res) => {
-  const to   = parseDateParam(req.query.to)   || new Date();
-  const from = parseDateParam(req.query.from) || new Date(Date.now() - 14 * 86400 * 1000);
+  const payPeriodId = req.query.pay_period_id
+    ? parseInt(req.query.pay_period_id, 10)
+    : null;
   const includeOpen = req.query.include_open === 'true';
-  const markExported = req.query.mark_exported !== 'false'; // default true
+  const markExported = req.query.mark_exported !== 'false';
 
-  const wheres = ['t.clock_in >= $1', 't.clock_in < $2', "t.status <> 'exported'"];
-  const params = [from.toISOString(), to.toISOString()];
+  // Build the entry-selection WHERE based on which mode we're in.
+  let wheres = ["t.status <> 'exported'"];
+  const params = [];
+  let payPeriod = null;
+
+  if (Number.isInteger(payPeriodId)) {
+    payPeriod = await queryOne('SELECT * FROM pay_periods WHERE id = $1', [payPeriodId]);
+    if (!payPeriod) {
+      return res.status(404).json({ message: 'Pay period not found.' });
+    }
+    wheres.push(`t.pay_period_id = $${params.length + 1}`);
+    params.push(payPeriodId);
+  } else {
+    const to   = parseDateParam(req.query.to)   || new Date();
+    const from = parseDateParam(req.query.from) || new Date(Date.now() - 14 * 86400 * 1000);
+    wheres.push(`t.clock_in >= $${params.length + 1}`);
+    params.push(from.toISOString());
+    wheres.push(`t.clock_in <  $${params.length + 1}`);
+    params.push(to.toISOString());
+  }
+
   if (!includeOpen) {
     wheres.push("t.status <> 'open'");
   }
@@ -444,19 +471,45 @@ router.get('/admin/export', requireAdmin, async (req, res) => {
       ].join(','));
     }
 
+    // Filename reflects the source: pay period in pay-period mode, raw range
+    // in date-range mode. Easier to find on disk later when reconciling.
+    let filename;
+    if (payPeriod) {
+      filename = `timesheet-PP-${payPeriod.start_date}-to-${payPeriod.end_date}.csv`;
+    } else {
+      const from = parseDateParam(req.query.from) || new Date(Date.now() - 14 * 86400 * 1000);
+      const to   = parseDateParam(req.query.to)   || new Date();
+      filename = `timesheet-${from.toISOString().slice(0, 10)}-to-${to.toISOString().slice(0, 10)}.csv`;
+    }
+
     if (markExported && rows.length > 0) {
       const ids = rows.map(r => r.id);
+      // Flip individual entries first.
       await query(
         `UPDATE time_entries SET status = 'exported' WHERE id = ANY($1::int[])`,
         [ids]
       );
+      // If we're in pay-period mode, also stamp the period as exported with
+      // audit metadata. /admin/pay-periods/:id/reopen can revert if needed.
+      if (payPeriod) {
+        await query(
+          `UPDATE pay_periods
+              SET status = 'exported',
+                  exported_at = NOW(),
+                  exported_by = $2,
+                  csv_filename = $3,
+                  exported_count = $4
+            WHERE id = $1`,
+          [payPeriod.id, req.user.id, filename, rows.length]
+        );
+      }
     }
 
-    const filename = `timesheet-${from.toISOString().slice(0, 10)}-to-${to.toISOString().slice(0, 10)}.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.setHeader('X-Exported-Count', rows.length);
     res.setHeader('X-Marked-Exported', markExported ? 'true' : 'false');
+    if (payPeriod) res.setHeader('X-Pay-Period-Id', payPeriod.id);
     res.send(lines.join('\n') + '\n');
   } catch (e) {
     console.error('GET /api/time/admin/export failed:', e);
