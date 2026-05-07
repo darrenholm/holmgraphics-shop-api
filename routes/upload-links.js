@@ -155,6 +155,10 @@ router.post('/jobs/:id/upload-links', requireStaff, async (req, res) => {
     if (maxUploads < 1 || maxUploads > 100) {
       return res.status(400).json({ error: 'max_uploads must be between 1 and 100' });
     }
+    // Optional staff-authored note shown in the email body. Capped at
+    // 1000 chars to keep the email reasonable (roughly 200 words).
+    const noteRaw = String(req.body?.note || '').trim();
+    const note = noteRaw.slice(0, 1000) || null;
 
     // Verify the job exists and grab the recipient's display name (for
     // the email greeting).
@@ -190,6 +194,7 @@ router.post('/jobs/:id/upload-links', requireStaff, async (req, res) => {
       jobNumber:    job.id,
       uploadUrl:    url,
       expiresAt:    link.expires_at,
+      note,
     }).catch((e) => console.warn('upload-link email failed:', e.message));
 
     res.status(201).json({
