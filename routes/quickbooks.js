@@ -22,6 +22,7 @@
 const express = require('express');
 const crypto  = require('crypto');
 const { query, queryOne } = require('../db/connection');
+const { requireAdmin } = require('../middleware/auth');
 const {
   REQUIRED_SCOPES: SCOPES,
   QB_TOKEN_URL,
@@ -631,6 +632,231 @@ router.get('/employees', async (req, res) => {
     console.error('GET /api/quickbooks/employees failed:', err);
     res.status(500).json({ error: err.message, detail: err.qbDetail || null });
   }
+});
+
+// ─── Lunch deduction (mirror of routes/time.js logic) ────────────────────────
+// Per-day total > 4h ⇒ -30 min, deducted from the longest entry, cascading.
+// Duplicated here (rather than imported from routes/time.js) so this file
+// has no cross-route deps. Keep the constants and date-key formatter in
+// sync if the policy changes there.
+const LUNCH_THRESHOLD_MIN = 240;
+const LUNCH_DEDUCTION_MIN = 30;
+const SHOP_TZ = 'America/Toronto';
+const _LUNCH_DATE_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: SHOP_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+});
+function _localDateKey(iso) { return _LUNCH_DATE_FMT.format(new Date(iso)); }
+function _computeLunchDeductions(rows) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!r.clock_out) continue;
+    const minutes = Math.round((new Date(r.clock_out) - new Date(r.clock_in)) / 60000);
+    if (minutes <= 0) continue;
+    const key = `${r.employee_id}:${_localDateKey(r.clock_in)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ id: r.id, minutes });
+  }
+  const deductions = new Map();
+  for (const dayEntries of groups.values()) {
+    const total = dayEntries.reduce((s, e) => s + e.minutes, 0);
+    if (total <= LUNCH_THRESHOLD_MIN) continue;
+    const sorted = [...dayEntries].sort((a, b) => b.minutes - a.minutes);
+    let remaining = LUNCH_DEDUCTION_MIN;
+    for (const e of sorted) {
+      if (remaining <= 0) break;
+      const take = Math.min(e.minutes, remaining);
+      if (take > 0) {
+        deductions.set(e.id, (deductions.get(e.id) || 0) + take);
+        remaining -= take;
+      }
+    }
+  }
+  return deductions;
+}
+
+// ─── POST /api/quickbooks/sync-time-period/:id ───────────────────────────────
+// Push a pay period's time entries to QBO as TimeActivity records.
+//
+// For each entry that's status closed/approved AND not already synced
+// (qbo_time_activity_id IS NULL):
+//   - Skip if the employee isn't yet mapped (employees.qbo_employee_id IS NULL)
+//   - Build a TimeActivity payload from the PAID minutes (post-lunch-deduction)
+//   - POST to /v3/.../timeactivity
+//   - On success: store qbo_time_activity_id + qbo_synced_at, flip status='exported'
+//
+// Idempotent: re-running skips already-synced entries via qbo_time_activity_id.
+//
+// Billable mapping:
+//   - If the entry has a project AND that project's client has a qb_customer_id,
+//     mark BillableStatus='Billable' with CustomerRef pointed at the QBO customer.
+//   - Otherwise NotBillable.
+//
+// Response:
+//   {
+//     synced:               int,
+//     skipped_no_mapping:   int,   // employee not linked to QBO
+//     skipped_already_synced: int, // qbo_time_activity_id already set
+//     errors: [{ entry_id, employee_name, message, qbCode }],
+//   }
+//
+// On a fully-successful run, the pay_periods row is also flipped to
+// status='exported' with audit metadata. Partial runs leave the period
+// status alone so the admin can re-run after fixing the missing pieces.
+router.post('/sync-time-period/:id', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid pay period id' });
+  }
+  const payPeriod = await queryOne('SELECT * FROM pay_periods WHERE id = $1', [id]);
+  if (!payPeriod) {
+    return res.status(404).json({ message: 'Pay period not found.' });
+  }
+  // Pull all not-yet-synced entries for the period, joined with employee
+  // (for qbo_employee_id and display name) and project→client (for the
+  // billable customer linkage).
+  let rows;
+  try {
+    rows = await query(
+      `SELECT t.id, t.employee_id, t.clock_in, t.clock_out,
+              t.notes, t.status, t.project_id,
+              t.qbo_time_activity_id,
+              e.qbo_employee_id,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS employee_name,
+              p.description AS project_name,
+              c.qb_customer_id AS qbo_customer_id
+         FROM time_entries t
+         LEFT JOIN employees e ON e.id = t.employee_id
+         LEFT JOIN projects  p ON p.id = t.project_id
+         LEFT JOIN clients   c ON c.id = p.client_id
+        WHERE t.pay_period_id = $1
+          AND t.clock_out IS NOT NULL
+          AND t.status IN ('closed', 'approved', 'exported')
+        ORDER BY t.employee_id, t.clock_in`,
+      [id]
+    );
+  } catch (e) {
+    console.error('sync-time-period load failed:', e);
+    return res.status(500).json({ message: 'Lookup failed', detail: e.message });
+  }
+  // Compute lunch deductions across the entire pay period's rows so
+  // cross-day grouping is correct (and matches what /me & /admin show).
+  const deductions = _computeLunchDeductions(rows);
+
+  let synced = 0;
+  let skippedNoMapping = 0;
+  let skippedAlreadySynced = 0;
+  const errors = [];
+
+  for (const r of rows) {
+    if (r.qbo_time_activity_id) {
+      skippedAlreadySynced += 1;
+      continue;
+    }
+    if (!r.qbo_employee_id) {
+      skippedNoMapping += 1;
+      errors.push({
+        entry_id: r.id,
+        employee_name: r.employee_name,
+        message: 'Employee not linked to QBO yet — visit /admin/qbo-employees.',
+        qbCode: null,
+      });
+      continue;
+    }
+    const clockMinutes = Math.round(
+      (new Date(r.clock_out) - new Date(r.clock_in)) / 60000
+    );
+    const lunchMinutes = deductions.get(r.id) || 0;
+    const paidMinutes  = Math.max(0, clockMinutes - lunchMinutes);
+    if (paidMinutes <= 0) {
+      // Don't attempt to push a 0-minute activity; skip silently.
+      skippedAlreadySynced += 1;
+      continue;
+    }
+    const hours   = Math.floor(paidMinutes / 60);
+    const minutes = paidMinutes % 60;
+    const txnDate = _localDateKey(r.clock_in);
+
+    // Stitch a Description that gives payroll context — project + raw
+    // clock vs paid + admin's notes if any. Capped to 1000 chars (QBO).
+    const descBits = [];
+    if (r.project_id) descBits.push(`Job ${r.project_id}${r.project_name ? ' - ' + r.project_name : ''}`);
+    if (lunchMinutes > 0) descBits.push(`[lunch -${lunchMinutes}m]`);
+    if (r.notes) descBits.push(r.notes);
+    const description = descBits.join(' · ').slice(0, 1000);
+
+    const billable = !!r.qbo_customer_id;
+    const payload = {
+      TxnDate: txnDate,
+      NameOf:  'Employee',
+      EmployeeRef: { value: r.qbo_employee_id },
+      Hours:   hours,
+      Minutes: minutes,
+      Description: description || undefined,
+      BillableStatus: billable ? 'Billable' : 'NotBillable',
+    };
+    if (billable) {
+      payload.CustomerRef = { value: r.qbo_customer_id };
+    }
+
+    try {
+      const result = await qbPost('/timeactivity?minorversion=65', payload);
+      const newId = result?.TimeActivity?.Id;
+      if (!newId) {
+        throw new Error('QBO did not return a TimeActivity Id');
+      }
+      await query(
+        `UPDATE time_entries
+            SET qbo_time_activity_id = $1,
+                qbo_synced_at = NOW(),
+                status = 'exported'
+          WHERE id = $2`,
+        [newId, r.id]
+      );
+      synced += 1;
+    } catch (err) {
+      errors.push({
+        entry_id: r.id,
+        employee_name: r.employee_name,
+        message: err.qbDetail || err.message || String(err),
+        qbCode: err.qbCode || null,
+      });
+    }
+  }
+
+  // If everything succeeded (no errors and we actually pushed entries),
+  // flag the period as exported with audit metadata so the next pay-cycle
+  // run knows it's done.
+  if (errors.length === 0 && synced > 0) {
+    try {
+      await query(
+        `UPDATE pay_periods
+            SET status = 'exported',
+                exported_at = NOW(),
+                exported_by = $2,
+                csv_filename = $3,
+                exported_count = $4
+          WHERE id = $1`,
+        [
+          payPeriod.id,
+          req.user.id,
+          `qbo-timeactivity-PP-${payPeriod.start_date}-to-${payPeriod.end_date}`,
+          synced,
+        ]
+      );
+    } catch (e) {
+      console.error('Failed to mark pay period exported:', e);
+      // Don't fail the response — entries are synced; admin can mark
+      // the period via the UI manually if this somehow blew up.
+    }
+  }
+
+  res.json({
+    pay_period_id: payPeriod.id,
+    synced,
+    skipped_no_mapping: skippedNoMapping,
+    skipped_already_synced: skippedAlreadySynced,
+    errors,
+  });
 });
 
 module.exports = router;
