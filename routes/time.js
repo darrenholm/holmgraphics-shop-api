@@ -20,6 +20,12 @@
 //     so concurrent clock-in attempts fail loudly rather than silently double up.
 //   - Status flow: open → closed → approved → exported. Manual edits via PUT
 //     can reverse the closed↔approved step if needed.
+//
+//   - Lunch deduction: per the shop's policy, an employee who works more than
+//     4 hours total in a single calendar day (America/Toronto) has 30 minutes
+//     deducted as unpaid lunch. Employees stay clocked in through lunch, so
+//     the deduction is applied programmatically here rather than via a
+//     manual punch-out. See computeLunchDeductions() below.
 
 'use strict';
 
@@ -28,22 +34,120 @@ const { pool, query, queryOne } = require('../db/connection');
 const { requireStaff, requireAdmin } = require('../middleware/auth');
 const router = express.Router();
 
+// ─── Lunch deduction policy ──────────────────────────────────────────────────
+//
+// Shop policy: > 4h worked in a calendar day (local time) ⇒ 30-min unpaid
+// lunch. Applied to the longest entry of the day. If the longest entry is
+// shorter than 30 min, cascade the remainder to the next-longest, until the
+// full 30 minutes is accounted for. Open entries (clock_out IS NULL) are
+// excluded — they're not yet payable.
+//
+// Calendar day uses the shop's local timezone so a 22:00 → 02:00 overnight
+// shift (rare here, but) doesn't accidentally roll into two days under UTC.
+
+const LUNCH_THRESHOLD_MIN = 240; // 4 hours
+const LUNCH_DEDUCTION_MIN = 30;
+const SHOP_TZ = 'America/Toronto';
+
+const LOCAL_DATE_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: SHOP_TZ,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+});
+
+// "YYYY-MM-DD" in shop-local time for any ISO/Date input.
+function localDateKey(iso) {
+  return LOCAL_DATE_FMT.format(new Date(iso));
+}
+
+// Given an array of raw DB rows, return Map<row.id, deduction_minutes>
+// for the rows that should have a lunch deduction applied. Multi-entry
+// days that exceed 4h get a 30-min total deduction, distributed onto the
+// longest entry first, cascading if needed.
+function computeLunchDeductions(rows) {
+  const groups = new Map(); // key -> [{id, minutes}, ...]
+  for (const r of rows) {
+    if (!r.clock_out) continue;
+    const minutes = Math.round(
+      (new Date(r.clock_out) - new Date(r.clock_in)) / 60000
+    );
+    if (minutes <= 0) continue;
+    const key = `${r.employee_id}:${localDateKey(r.clock_in)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ id: r.id, minutes });
+  }
+
+  const deductions = new Map();
+  for (const dayEntries of groups.values()) {
+    const total = dayEntries.reduce((s, e) => s + e.minutes, 0);
+    if (total <= LUNCH_THRESHOLD_MIN) continue;
+
+    // Sort longest first; cascade until 30 min is fully deducted.
+    const sorted = [...dayEntries].sort((a, b) => b.minutes - a.minutes);
+    let remaining = LUNCH_DEDUCTION_MIN;
+    for (const e of sorted) {
+      if (remaining <= 0) break;
+      const take = Math.min(e.minutes, remaining);
+      if (take > 0) {
+        deductions.set(e.id, (deductions.get(e.id) || 0) + take);
+        remaining -= take;
+      }
+    }
+  }
+  return deductions;
+}
+
+// For single-entry endpoints (clock-out, edit, approve), we need the day's
+// other entries to know whether/how much lunch to deduct. Fetch a 36h
+// window around the entry, filter to the same local date, then compute.
+async function deductionsForSingleEntry(row) {
+  if (!row || !row.clock_in) return new Map();
+  const center = new Date(row.clock_in).getTime();
+  const lo = new Date(center - 36 * 3600 * 1000).toISOString();
+  const hi = new Date(center + 36 * 3600 * 1000).toISOString();
+  const siblings = await query(
+    `SELECT id, employee_id, clock_in, clock_out
+       FROM time_entries
+      WHERE employee_id = $1 AND clock_in >= $2 AND clock_in < $3`,
+    [row.employee_id, lo, hi]
+  );
+  const dayKey = localDateKey(row.clock_in);
+  const sameDay = siblings.filter(r => localDateKey(r.clock_in) === dayKey);
+  // Replace any stale sibling with our just-updated row, in case the
+  // caller hands us an in-memory row newer than what's in the DB.
+  const idx = sameDay.findIndex(r => r.id === row.id);
+  if (idx >= 0) sameDay[idx] = row;
+  else sameDay.push(row);
+  return computeLunchDeductions(sameDay);
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Shape a DB row into the JSON we send to the frontend. duration_minutes is
-// computed on the way out so the client doesn't have to redo the math.
-function formatEntry(row) {
+// Shape a DB row into the JSON we send to the frontend.
+//   clock_minutes:  raw clock-out − clock-in (what was on the clock)
+//   lunch_deduction_minutes: 0 or 30 (or whatever cascaded down)
+//   paid_minutes:   clock_minutes − lunch_deduction_minutes (the payable number)
+//   duration_minutes: alias for paid_minutes (the field the existing
+//     frontend reads for tables/totals — kept so the dashboards keep
+//     summing correctly without further frontend changes).
+function formatEntry(row, deductions) {
   if (!row) return null;
-  const durationMin = row.clock_out
+  const clockMinutes = row.clock_out
     ? Math.round((new Date(row.clock_out) - new Date(row.clock_in)) / 60000)
     : null;
+  const lunch = (deductions && deductions.get(row.id)) || 0;
+  const paidMinutes = clockMinutes == null
+    ? null
+    : Math.max(0, clockMinutes - lunch);
   return {
     id:                row.id,
     employee_id:       row.employee_id,
     employee_name:     row.employee_name || null,
     clock_in:          row.clock_in,
     clock_out:         row.clock_out,
-    duration_minutes:  durationMin,
+    clock_minutes:     clockMinutes,
+    lunch_deduction_minutes: lunch,
+    paid_minutes:      paidMinutes,
+    duration_minutes:  paidMinutes,
     project_id:        row.project_id,
     project_name:      row.project_name || null,
     notes:             row.notes,
@@ -148,7 +252,8 @@ router.post('/clock-out', requireStaff, async (req, res) => {
       [open.id, notes || null]
     );
     const full = await queryOne(`${SELECT_WITH_JOINS} WHERE t.id = $1`, [open.id]);
-    res.json(formatEntry(full));
+    const deductions = await deductionsForSingleEntry(full);
+    res.json(formatEntry(full, deductions));
   } catch (e) {
     console.error('POST /api/time/clock-out failed:', e);
     res.status(500).json({ message: 'Clock-out failed', detail: e.message });
@@ -228,6 +333,9 @@ router.get('/me/current', requireStaff, async (req, res) => {
 // ─── GET /api/time/me ────────────────────────────────────────────────────────
 // Query: ?from=ISO&to=ISO (optional; defaults to last 14 days)
 // Returns the caller's entries in the range, newest first, with totals.
+//
+// total_minutes / total_hours are the PAID totals (lunch deductions applied).
+// gross_minutes / gross_hours are the raw clock totals before deduction.
 router.get('/me', requireStaff, async (req, res) => {
   const employeeId = req.user?.id;
   const to   = parseDateParam(req.query.to)   || new Date();
@@ -241,13 +349,19 @@ router.get('/me', requireStaff, async (req, res) => {
         ORDER BY t.clock_in DESC`,
       [employeeId, from.toISOString(), to.toISOString()]
     );
-    const entries = rows.map(formatEntry);
-    const totalMinutes = entries.reduce((sum, e) => sum + (e.duration_minutes || 0), 0);
+    const deductions = computeLunchDeductions(rows);
+    const entries = rows.map(r => formatEntry(r, deductions));
+    const grossMinutes = entries.reduce((s, e) => s + (e.clock_minutes || 0), 0);
+    const lunchMinutes = entries.reduce((s, e) => s + (e.lunch_deduction_minutes || 0), 0);
+    const paidMinutes  = entries.reduce((s, e) => s + (e.paid_minutes || 0), 0);
     res.json({
       from: from.toISOString(),
       to:   to.toISOString(),
-      total_minutes: totalMinutes,
-      total_hours:   Math.round(totalMinutes / 60 * 100) / 100,
+      gross_minutes:           grossMinutes,
+      gross_hours:             Math.round(grossMinutes / 60 * 100) / 100,
+      lunch_deduction_minutes: lunchMinutes,
+      total_minutes:           paidMinutes,
+      total_hours:             Math.round(paidMinutes / 60 * 100) / 100,
       entries,
     });
   } catch (e) {
@@ -276,11 +390,12 @@ router.get('/admin', requireAdmin, async (req, res) => {
         ORDER BY t.employee_id, t.clock_in DESC`,
       params
     );
+    const deductions = computeLunchDeductions(rows);
     res.json({
       from: from.toISOString(),
       to:   to.toISOString(),
       count: rows.length,
-      entries: rows.map(formatEntry),
+      entries: rows.map(r => formatEntry(r, deductions)),
     });
   } catch (e) {
     console.error('GET /api/time/admin failed:', e);
@@ -318,7 +433,8 @@ router.put('/admin/:id', requireAdmin, async (req, res) => {
       return res.status(404).json({ message: 'Entry not found.' });
     }
     const full = await queryOne(`${SELECT_WITH_JOINS} WHERE t.id = $1`, [id]);
-    res.json(formatEntry(full));
+    const deductions = await deductionsForSingleEntry(full);
+    res.json(formatEntry(full, deductions));
   } catch (e) {
     // Edits can violate the CHECK constraints (e.g., setting clock_out before
     // clock_in, or setting status='open' while clock_out is set). Surface as 400.
@@ -355,7 +471,8 @@ router.post('/admin/:id/approve', requireAdmin, async (req, res) => {
       });
     }
     const full = await queryOne(`${SELECT_WITH_JOINS} WHERE t.id = $1`, [id]);
-    res.json(formatEntry(full));
+    const deductions = await deductionsForSingleEntry(full);
+    res.json(formatEntry(full, deductions));
   } catch (e) {
     console.error('POST /api/time/admin/:id/approve failed:', e);
     res.status(500).json({ message: 'Approve failed', detail: e.message });
@@ -401,8 +518,10 @@ router.post('/admin/bulk-approve', requireAdmin, async (req, res) => {
 //   ?mark_exported=true|false     default true; pass false for a "preview"
 //                                 download that doesn't flip status
 //
-// Streams CSV in QBO Time Tracking format. By default excludes already-
-// 'exported' entries so re-running the same period doesn't double-count.
+// Streams CSV in QBO Time Tracking format. The Duration column is PAID
+// hours (lunch deduction applied per shop policy: > 4h/day ⇒ -30 min).
+// By default excludes already-'exported' entries so re-running the same
+// period doesn't double-count.
 router.get('/admin/export', requireAdmin, async (req, res) => {
   const payPeriodId = req.query.pay_period_id
     ? parseInt(req.query.pay_period_id, 10)
@@ -443,6 +562,10 @@ router.get('/admin/export', requireAdmin, async (req, res) => {
       params
     );
 
+    // Lunch deduction is computed across all returned rows so each
+    // (employee, day) group sees its full set of entries.
+    const deductions = computeLunchDeductions(rows);
+
     // Build CSV. Header matches QBO Online's "Weekly Timesheet" import shape;
     // also paste-friendly into other payroll tools.
     const headers = ['Date', 'Employee', 'Job', 'Service', 'Duration', 'Notes', 'Billable'];
@@ -455,10 +578,19 @@ router.get('/admin/export', requireAdmin, async (req, res) => {
         ? `Job ${r.project_id}${r.project_name ? ' - ' + r.project_name : ''}`
         : '';
       const service = ''; // Phase 1: no Service Item mapping yet
-      const durationHours = r.clock_out
-        ? Math.round((new Date(r.clock_out) - new Date(r.clock_in)) / 36000) / 100
+      const clockMinutes = r.clock_out
+        ? Math.round((new Date(r.clock_out) - new Date(r.clock_in)) / 60000)
         : 0;
-      const notes = r.notes || '';
+      const lunchMinutes = deductions.get(r.id) || 0;
+      const paidMinutes  = Math.max(0, clockMinutes - lunchMinutes);
+      const durationHours = Math.round(paidMinutes / 60 * 100) / 100;
+      // Annotate the notes column when a deduction was applied so the
+      // payroll reviewer can see the reason at a glance.
+      let notes = r.notes || '';
+      if (lunchMinutes > 0) {
+        const tag = `[lunch -${lunchMinutes}m]`;
+        notes = notes ? `${notes} ${tag}` : tag;
+      }
       const billable = r.project_id ? 'Y' : 'N';
       lines.push([
         csvEscape(date),
