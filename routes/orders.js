@@ -544,6 +544,9 @@ router.post('/', requireCustomer, async (req, res) => {
     // already advanced status_id to ORDERED=2). Fire-and-forget — never
     // throws, never blocks the order response.
     mailer.sendForOrderStatus({ orderId: order.id, statusId: 2, db }).catch(() => {});
+    // Internal staff alert (Darren/Brady) — independent of the customer
+    // email. Recipients come from env SHOP_NEW_ORDER_TO. Idempotent.
+    mailer.sendStaffNewOrderAlert({ orderId: order.id, db }).catch(() => {});
 
     res.status(201).json({
       ok: true,
@@ -947,6 +950,9 @@ router.post('/office', requireStaff, async (req, res) => {
     if (customer.email && payment.method !== 'invoice_pending') {
       mailer.sendForOrderStatus({ orderId: order.id, statusId: 2, db }).catch(() => {});
     }
+    // Staff alert (Darren/Brady) — fires for ALL new orders, including
+    // walk-in/invoice-pending so the office knows production is queuing up.
+    mailer.sendStaffNewOrderAlert({ orderId: order.id, db }).catch(() => {});
 
     res.status(201).json({
       ok: true,
