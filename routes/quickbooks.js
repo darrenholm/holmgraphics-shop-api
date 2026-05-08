@@ -603,4 +603,34 @@ router.post('/clients/link', async (req, res) => {
   }
 });
 
+// ─── GET /api/quickbooks/employees ───────────────────────────────────────────
+// Fetch the list of active QBO Employee records from the connected company.
+// Used by the /admin/qbo-employees mapping page to populate the dropdowns.
+//
+// Returns: [{ id, given_name, family_name, display_name, primary_email,
+//             active }]
+//
+// QBO's Employee object docs: developer.intuit.com/docs/api/accounting/Employee
+router.get('/employees', async (req, res) => {
+  try {
+    const data = await qbGet(
+      `/query?query=${encodeURIComponent(
+        `SELECT * FROM Employee WHERE Active = true MAXRESULTS 200`
+      )}`
+    );
+    const list = (data?.QueryResponse?.Employee || []).map(e => ({
+      id:             e.Id,
+      given_name:     e.GivenName     || null,
+      family_name:    e.FamilyName    || null,
+      display_name:   e.DisplayName   || null,
+      primary_email:  e.PrimaryEmailAddr?.Address || null,
+      active:         e.Active !== false,
+    }));
+    res.json(list);
+  } catch (err) {
+    console.error('GET /api/quickbooks/employees failed:', err);
+    res.status(500).json({ error: err.message, detail: err.qbDetail || null });
+  }
+});
+
 module.exports = router;

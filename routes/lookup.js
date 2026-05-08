@@ -3,7 +3,7 @@
 // Rewritten for Railway Postgres (pg driver, $1..$n placeholders).
 const express = require('express');
 const { query } = require('../db/connection');
-const { requireAuth, requireStaff } = require('../middleware/auth');
+const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const router = express.Router();
 
 // ─── GET /api/clients ────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ router.post('/clients', requireStaff, async (req, res) => {
 router.get('/employees', requireStaff, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, first_name, last_name, email, role
+      `SELECT id, first_name, last_name, email, role, qbo_employee_id
          FROM employees
         WHERE active IS TRUE OR active IS NULL
         ORDER BY last_name, first_name`
@@ -120,6 +120,39 @@ router.get('/employees', requireStaff, async (req, res) => {
   } catch (e) {
     console.error('GET /employees:', e);
     res.status(500).json({ message: 'Failed to load employees', detail: e.message });
+  }
+});
+
+// ─── PUT /api/employees/:id/qbo-mapping ──────────────────────────────────────
+// Set or clear the QBO Employee linkage for a local employee. Required
+// before /admin/pay-periods can push entries to QBO TimeActivity.
+//
+// Body: { qbo_employee_id: string | null }
+//
+// Admin-only. Returns the updated row.
+router.put('/employees/:id/qbo-mapping', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  const raw = req.body?.qbo_employee_id;
+  // Treat empty string as "clear the mapping" so the UI can hand us either.
+  const qboId = (raw == null || raw === '') ? null : String(raw).trim();
+  try {
+    const result = await query(
+      `UPDATE employees
+          SET qbo_employee_id = $1
+        WHERE id = $2
+       RETURNING id, first_name, last_name, email, role, qbo_employee_id`,
+      [qboId, id]
+    );
+    if (result.length === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+    res.json(result[0]);
+  } catch (e) {
+    console.error('PUT /employees/:id/qbo-mapping:', e);
+    res.status(500).json({ message: 'Update failed', detail: e.message });
   }
 });
 
