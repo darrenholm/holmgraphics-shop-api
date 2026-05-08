@@ -403,6 +403,118 @@ router.get('/admin', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/time/admin ────────────────────────────────────────────────────
+// Body: { employee_id: int, clock_in: ISO, clock_out: ISO,
+//         project_id?: int, notes?: string, status?: 'closed'|'approved' }
+//
+// Admin-created manual entry — for backfilling shifts when an employee
+// forgot to clock in. Default status is 'closed' (matching what /clock-out
+// would have produced); admins can pre-approve by passing 'approved'.
+//
+// The pay_period_id column is auto-assigned by the trigger from
+// migration 017 based on clock_in's date.
+//
+// Notes are auto-tagged with [manual entry by <approver_name>] for audit
+// trail so payroll can see at a glance which entries were typed in vs
+// punched. Tag is appended to whatever the admin typed.
+router.post('/admin', requireAdmin, async (req, res) => {
+  const {
+    employee_id, clock_in, clock_out,
+    project_id, notes, status,
+  } = req.body || {};
+
+  if (!Number.isInteger(employee_id)) {
+    return res.status(400).json({ message: 'employee_id (integer) required' });
+  }
+  const inDate  = clock_in  ? new Date(clock_in)  : null;
+  const outDate = clock_out ? new Date(clock_out) : null;
+  if (!inDate || Number.isNaN(inDate.getTime())) {
+    return res.status(400).json({ message: 'clock_in (ISO datetime) required' });
+  }
+  if (!outDate || Number.isNaN(outDate.getTime())) {
+    return res.status(400).json({ message: 'clock_out (ISO datetime) required' });
+  }
+  if (outDate <= inDate) {
+    return res.status(400).json({ message: 'clock_out must be after clock_in' });
+  }
+  const finalStatus = status === 'approved' ? 'approved' : 'closed';
+
+  // Stamp the audit tag onto the notes. We look up the admin's display name
+  // so the manual tag is human-readable rather than just an id.
+  let approverName = null;
+  try {
+    const me = await queryOne(
+      `SELECT TRIM(CONCAT_WS(' ', first_name, last_name)) AS name
+         FROM employees WHERE id = $1`,
+      [req.user.id]
+    );
+    approverName = me?.name || null;
+  } catch { /* fall through — tag without name */ }
+  const tag = approverName
+    ? `[manual entry by ${approverName}]`
+    : '[manual entry]';
+  const finalNotes = notes
+    ? `${notes} ${tag}`
+    : tag;
+
+  // For 'approved' rows we also fill approved_by/at so the audit trail is
+  // consistent with entries that went through /admin/:id/approve.
+  const approvedBy = finalStatus === 'approved' ? req.user.id : null;
+  const approvedAt = finalStatus === 'approved' ? new Date().toISOString() : null;
+
+  try {
+    const inserted = await queryOne(
+      `INSERT INTO time_entries (
+         employee_id, clock_in, clock_out, project_id, notes, status,
+         approved_by, approved_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`,
+      [
+        employee_id,
+        inDate.toISOString(),
+        outDate.toISOString(),
+        project_id || null,
+        finalNotes,
+        finalStatus,
+        approvedBy,
+        approvedAt,
+      ]
+    );
+    const full = await queryOne(
+      `${SELECT_WITH_JOINS} WHERE t.id = $1`,
+      [inserted.id]
+    );
+    const deductions = await deductionsForSingleEntry(full);
+    res.status(201).json(formatEntry(full, deductions));
+  } catch (e) {
+    // 23503 = FK violation (bad employee_id or project_id)
+    if (e.code === '23503') {
+      return res.status(400).json({
+        message: 'Invalid employee_id or project_id',
+        detail: e.message,
+      });
+    }
+    // 23514 = CHECK constraint (clock_out_after_in, open_means_no_clock_out)
+    if (e.code === '23514') {
+      return res.status(400).json({
+        message: 'Entry violates a constraint',
+        detail: e.message,
+      });
+    }
+    // 23505 = unique violation. Shouldn't fire for closed/approved entries
+    // (the one-open-per-employee index only matches WHERE status='open'),
+    // but surface as 409 if it ever does.
+    if (e.code === '23505') {
+      return res.status(409).json({
+        message: 'Conflicting entry already exists',
+        detail: e.message,
+      });
+    }
+    console.error('POST /api/time/admin failed:', e);
+    res.status(500).json({ message: 'Create failed', detail: e.message });
+  }
+});
+
 // ─── PUT /api/time/admin/:id ─────────────────────────────────────────────────
 // Body: any subset of { clock_in, clock_out, project_id, notes, status }
 // For correcting forgotten punches, fixing typos, manual approval reversal.
