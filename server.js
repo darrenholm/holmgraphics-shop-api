@@ -24,6 +24,7 @@ const ordersAdminRoutes  = require('./routes/orders-admin');
 const uploadLinksRoutes  = require('./routes/upload-links');
 const timeRoutes         = require('./routes/time');
 const payPeriodsRoutes   = require('./routes/pay-periods');
+const ledModulesRoutes   = require('./routes/led-modules');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -73,6 +74,7 @@ app.use('/api/suppliers',  suppliersRoutes);
 app.use('/api/catalog',    catalogRoutes);
 app.use('/api/time',         timeRoutes);
 app.use('/api/pay-periods',  payPeriodsRoutes);
+app.use('/api/led-modules',  ledModulesRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
