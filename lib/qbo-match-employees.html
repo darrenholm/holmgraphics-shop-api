@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QBO Employee Matching</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    header {
+      background: white;
+      padding: 20px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    h1 { font-size: 28px; margin-bottom: 10px; }
+    .subtitle { color: #666; font-size: 14px; }
+
+    .button-group {
+      display: flex;
+      gap: 10px;
+      margin: 20px 0;
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: #0066cc;
+      color: white;
+    }
+    .btn-primary:hover { background: #0052a3; }
+    .btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+
+    .btn-secondary {
+      background: #e8e8e8;
+      color: #333;
+    }
+    .btn-secondary:hover { background: #d0d0d0; }
+
+    .section {
+      background: white;
+      padding: 20px;
+      border-radius: 4px;
+      margin-bottom: 20px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .section h2 {
+      font-size: 18px;
+      margin-bottom: 15px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 10px;
+    }
+
+    .status-bar {
+      display: flex;
+      gap: 20px;
+      margin: 15px 0;
+      padding: 15px;
+      background: #f9f9f9;
+      border-left: 4px solid #0066cc;
+      border-radius: 2px;
+    }
+    .status-item {
+      text-align: center;
+    }
+    .status-number {
+      font-size: 24px;
+      font-weight: bold;
+      color: #0066cc;
+    }
+    .status-label {
+      font-size: 12px;
+      color: #666;
+      margin-top: 4px;
+    }
+
+    .card {
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      padding: 15px;
+      margin-bottom: 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-left {
+      flex: 1;
+    }
+    .card-title {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .card-meta {
+      font-size: 12px;
+      color: #666;
+    }
+
+    .candidate-list {
+      margin: 10px 0;
+      padding-left: 20px;
+    }
+    .candidate-item {
+      padding: 8px;
+      background: #f5f5f5;
+      border-radius: 2px;
+      margin-bottom: 5px;
+      font-size: 13px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .confidence-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .confidence-high { background: #c8e6c9; color: #2e7d32; }
+    .confidence-medium { background: #fff9c4; color: #f57f17; }
+    .confidence-low { background: #ffccbc; color: #d84315; }
+
+    select, input {
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #999;
+    }
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 10px;
+    }
+
+    .alert {
+      padding: 12px 15px;
+      border-radius: 4px;
+      margin-bottom: 15px;
+      font-size: 14px;
+    }
+    .alert-success {
+      background: #c8e6c9;
+      color: #2e7d32;
+      border-left: 4px solid #2e7d32;
+    }
+    .alert-error {
+      background: #ffcdd2;
+      color: #c62828;
+      border-left: 4px solid #c62828;
+    }
+    .alert-info {
+      background: #b3e5fc;
+      color: #01579b;
+      border-left: 4px solid #01579b;
+    }
+
+    .loading {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #f3f3f3;
+      border-top: 2px solid #0066cc;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 8px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>QBO Employee Matching</h1>
+      <p class="subtitle">Link your local employees to QuickBooks Online employees so timesheets can sync.</p>
+    </header>
+
+    <div id="alerts"></div>
+
+    <div class="section">
+      <h2>Step 1: Run Matcher</h2>
+      <p>Click below to analyze all unmapped employees and find QuickBooks matches.</p>
+      <button class="btn-primary" id="btnRunMatcher" onclick="runMatcher()">
+        <span id="matcherSpinner"></span>
+        Run Matcher
+      </button>
+    </div>
+
+    <div class="status-bar" id="statusBar" style="display: none;">
+      <div class="status-item">
+        <div class="status-number" id="autoMatchCount">0</div>
+        <div class="status-label">Auto-Matched</div>
+      </div>
+      <div class="status-item">
+        <div class="status-number" id="reviewCount">0</div>
+        <div class="status-label">Need Review</div>
+      </div>
+      <div class="status-item">
+        <div class="status-number" id="unmappedCount">0</div>
+        <div class="status-label">No Candidates</div>
+      </div>
+    </div>
+
+    <!-- Auto-Matches: High confidence, already linked -->
+    <div class="section" id="autoMatchesSection" style="display: none;">
+      <h2>✓ Auto-Matched (<span id="autoMatchesCount">0</span>)</h2>
+      <p style="color: #666; margin-bottom: 15px;">These high-confidence matches were automatically linked.</p>
+      <div id="autoMatchesList"></div>
+    </div>
+
+    <!-- Manual Review: Need admin to pick the right one -->
+    <div class="section" id="reviewSection" style="display: none;">
+      <h2>⚠ Needs Review (<span id="reviewCount2">0</span>)</h2>
+      <p style="color: #666; margin-bottom: 15px;">Select the correct QuickBooks employee for each person below, then confirm.</p>
+      <div id="reviewList"></div>
+    </div>
+
+    <!-- Unmapped: No candidates found -->
+    <div class="section" id="unmappedSection" style="display: none;">
+      <h2>✕ No Candidates (<span id="unmappedCount2">0</span>)</h2>
+      <p style="color: #666; margin-bottom: 15px;">These employees have no matching candidates in QuickBooks. You may need to:</p>
+      <ul style="margin-left: 20px; margin-bottom: 15px;">
+        <li>Create the employee in QuickBooks</li>
+        <li>Ensure their name matches (or is close to) the local employee name</li>
+      </ul>
+      <div id="unmappedList"></div>
+    </div>
+
+    <!-- Empty state -->
+    <div class="empty-state" id="emptyState" style="display: none;">
+      <div class="empty-state-icon">✓</div>
+      <h3>All Employees Mapped</h3>
+      <p>All local employees are already linked to QuickBooks!</p>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = `${window.location.protocol}//${window.location.host}/api`;
+
+    function showAlert(message, type = 'info') {
+      const alertEl = document.createElement('div');
+      alertEl.className = `alert alert-${type}`;
+      alertEl.textContent = message;
+      document.getElementById('alerts').appendChild(alertEl);
+      setTimeout(() => alertEl.remove(), 5000);
+    }
+
+    async function runMatcher() {
+      const btn = document.getElementById('btnRunMatcher');
+      const spinner = document.getElementById('matcherSpinner');
+
+      btn.disabled = true;
+      spinner.innerHTML = '<span class="loading"></span>';
+
+      try {
+        const response = await fetch(`${API_BASE}/qbo-match/match-employees`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(err.error || 'Matcher failed');
+        }
+
+        const results = await response.json();
+        displayResults(results);
+
+        if (results.auto_linked > 0) {
+          showAlert(`${results.auto_linked} employee(s) auto-linked!`, 'success');
+        }
+      } catch (error) {
+        showAlert(error.message, 'error');
+      } finally {
+        btn.disabled = false;
+        spinner.innerHTML = '';
+      }
+    }
+
+    function displayResults(results) {
+      const statusBar = document.getElementById('statusBar');
+      const autoSection = document.getElementById('autoMatchesSection');
+      const reviewSection = document.getElementById('reviewSection');
+      const unmappedSection = document.getElementById('unmappedSection');
+      const emptyState = document.getElementById('emptyState');
+
+      // Hide all sections initially
+      autoSection.style.display = 'none';
+      reviewSection.style.display = 'none';
+      unmappedSection.style.display = 'none';
+      emptyState.style.display = 'none';
+      statusBar.style.display = 'none';
+
+      // Update status bar
+      document.getElementById('autoMatchCount').textContent = results.auto_matches.length;
+      document.getElementById('reviewCount').textContent = results.review_matches.length;
+      document.getElementById('unmappedCount').textContent = results.unmapped.length;
+
+      const hasAny = results.auto_matches.length > 0 || results.review_matches.length > 0 || results.unmapped.length > 0;
+      if (!hasAny) {
+        emptyState.style.display = 'block';
+        return;
+      }
+
+      statusBar.style.display = 'flex';
+
+      // Auto-matches
+      if (results.auto_matches.length > 0) {
+        autoSection.style.display = 'block';
+        document.getElementById('autoMatchesCount').textContent = results.auto_matches.length;
+        const list = document.getElementById('autoMatchesList');
+        list.innerHTML = results.auto_matches.map(m => `
+          <div class="card">
+            <div class="card-left">
+              <div class="card-title">${escapeHtml(m.local_name)}</div>
+              <div class="card-meta">→ ${escapeHtml(m.qbo_display_name)}</div>
+              <div style="margin-top: 4px;">
+                <span class="confidence-badge confidence-high">${Math.round(m.confidence * 100)}% confidence</span>
+              </div>
+            </div>
+          </div>
+        `).join('');
+      }
+
+      // Review matches
+      if (results.review_matches.length > 0) {
+        reviewSection.style.display = 'block';
+        document.getElementById('reviewCount2').textContent = results.review_matches.length;
+        const list = document.getElementById('reviewList');
+        list.innerHTML = results.review_matches.map(r => `
+          <div class="card">
+            <div class="card-left">
+              <div class="card-title">${escapeHtml(r.local_name)}</div>
+              <div class="card-meta">${r.local_email ? escapeHtml(r.local_email) : 'no email'}</div>
+              <div class="candidate-list">
+                <strong style="font-size: 12px;">Candidates:</strong>
+                ${r.candidates.map((c, idx) => `
+                  <div class="candidate-item">
+                    <div>
+                      <div style="font-weight: 500;">${escapeHtml(c.qbo_display_name)}</div>
+                      <div style="color: #999; font-size: 11px;">${c.match_reason || 'fuzzy match'}</div>
+                    </div>
+                    <div style="flex-shrink: 0;">
+                      <span class="confidence-badge ${getConfidenceClass(c.confidence)}">
+                        ${Math.round(c.confidence * 100)}%
+                      </span>
+                      <button class="btn-secondary" style="margin-left: 10px;" onclick="confirmMatch(${r.local_id}, '${c.qbo_employee_id}')">
+                        Select
+                      </button>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+        `).join('');
+      }
+
+      // Unmapped
+      if (results.unmapped.length > 0) {
+        unmappedSection.style.display = 'block';
+        document.getElementById('unmappedCount2').textContent = results.unmapped.length;
+        const list = document.getElementById('unmappedList');
+        list.innerHTML = results.unmapped.map(u => `
+          <div class="card">
+            <div class="card-left">
+              <div class="card-title">${escapeHtml(u.local_name)}</div>
+              <div class="card-meta">No matching QuickBooks employees found</div>
+            </div>
+          </div>
+        `).join('');
+      }
+    }
+
+    function getConfidenceClass(confidence) {
+      if (confidence >= 0.80) return 'confidence-high';
+      if (confidence >= 0.60) return 'confidence-medium';
+      return 'confidence-low';
+    }
+
+    async function confirmMatch(localEmployeeId, qboEmployeeId) {
+      try {
+        const response = await fetch(`${API_BASE}/qbo-match/confirm-match`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ local_employee_id: localEmployeeId, qbo_employee_id: qboEmployeeId }),
+        });
+
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(err.error || 'Confirmation failed');
+        }
+
+        showAlert('Match confirmed!', 'success');
+
+        // Reload pending matches
+        loadPendingMatches();
+      } catch (error) {
+        showAlert(error.message, 'error');
+      }
+    }
+
+    async function loadPendingMatches() {
+      try {
+        const response = await fetch(`${API_BASE}/qbo-match/pending-matches`);
+        if (!response.ok) throw new Error('Failed to load pending matches');
+
+        const pending = await response.json();
+        if (pending.length === 0) {
+          document.getElementById('reviewSection').style.display = 'none';
+          showAlert('All matches have been reviewed!', 'success');
+        }
+      } catch (error) {
+        console.error('Load pending failed:', error);
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Load on page load
+    window.addEventListener('load', loadPendingMatches);
+  </script>
+</body>
+</html>

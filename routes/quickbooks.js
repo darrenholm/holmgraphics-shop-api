@@ -742,24 +742,25 @@ router.post('/sync-time-period/:id', requireAdmin, async (req, res) => {
   // cross-day grouping is correct (and matches what /me & /admin show).
   const deductions = _computeLunchDeductions(rows);
 
+  // Pre-check: reject the entire sync if ANY entry has an unmapped employee.
+  // This prevents partial syncs and makes it clear what needs to be fixed.
+  const unmappedEntries = rows.filter(r => !r.qbo_employee_id && !r.qbo_time_activity_id);
+  if (unmappedEntries.length > 0) {
+    return res.status(409).json({
+      message: 'Cannot sync: unmapped employees detected. Run the QBO employee matcher first.',
+      unmapped_employees: Array.from(new Set(unmappedEntries.map(e => e.employee_name))),
+      action: 'Visit /admin-legacy/qbo-match-employees to link employees to QuickBooks.',
+      unmapped_count: unmappedEntries.length,
+    });
+  }
+
   let synced = 0;
-  let skippedNoMapping = 0;
   let skippedAlreadySynced = 0;
   const errors = [];
 
   for (const r of rows) {
     if (r.qbo_time_activity_id) {
       skippedAlreadySynced += 1;
-      continue;
-    }
-    if (!r.qbo_employee_id) {
-      skippedNoMapping += 1;
-      errors.push({
-        entry_id: r.id,
-        employee_name: r.employee_name,
-        message: 'Employee not linked to QBO yet — visit /admin/qbo-employees.',
-        qbCode: null,
-      });
       continue;
     }
     const clockMinutes = Math.round(
@@ -853,7 +854,6 @@ router.post('/sync-time-period/:id', requireAdmin, async (req, res) => {
   res.json({
     pay_period_id: payPeriod.id,
     synced,
-    skipped_no_mapping: skippedNoMapping,
     skipped_already_synced: skippedAlreadySynced,
     errors,
   });

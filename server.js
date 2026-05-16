@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
+const path    = require('path');
 
 const { runMigrations } = require('./db/migrate');
 
@@ -24,6 +25,7 @@ const ordersAdminRoutes  = require('./routes/orders-admin');
 const uploadLinksRoutes  = require('./routes/upload-links');
 const timeRoutes         = require('./routes/time');
 const payPeriodsRoutes   = require('./routes/pay-periods');
+const qboMatchRoutes     = require('./routes/qbo-employee-match');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -69,6 +71,7 @@ app.use('/api/clients',    clientsRoutes);
 app.use('/api',            uploadLinksRoutes);
 app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
+app.use('/api/qbo-match',  qboMatchRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
 app.use('/api/catalog',    catalogRoutes);
 app.use('/api/time',         timeRoutes);
@@ -90,6 +93,12 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     db: dbHost,
   });
+});
+
+// ─── Admin UI Pages ────────────────────────────────────────────────────────────
+// Serve QBO employee matching UI for admins
+app.get('/admin-legacy/qbo-match-employees.html', (req, res) => {
+  res.sendFile(path.join(__dirname, 'lib/qbo-match-employees.html'));
 });
 
 // ─── 404 ──────────────────────────────────────────────────────────────────────
