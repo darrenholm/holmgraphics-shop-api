@@ -24,12 +24,13 @@ CREATE TABLE IF NOT EXISTS employee_match_candidates (
   confirmed_by    INTEGER REFERENCES employees(id),
   confirmed_at    TIMESTAMPTZ,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-  -- Only one confirmation per local employee
-  CONSTRAINT one_confirmed_per_employee UNIQUE (local_employee_id)
-    WHERE user_confirmed = TRUE
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Partial unique index: only one confirmation per local employee
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_confirmed_per_employee
+  ON employee_match_candidates (local_employee_id)
+  WHERE user_confirmed = TRUE;
 
 -- Index for quick lookup of candidates for a local employee (for review UI)
 CREATE INDEX IF NOT EXISTS idx_match_candidates_local_employee
