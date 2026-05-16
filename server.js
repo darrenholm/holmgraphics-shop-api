@@ -103,14 +103,6 @@ app.get('/admin-legacy/qbo-match-employees.html', (req, res) => {
   res.sendFile(path.join(__dirname, 'lib/qbo-match-employees.html'));
 });
 
-// Serve timesheet admin UI (mounted from the shop website folder)
-app.get('/admin-legacy/timesheets.html', (req, res) => {
-  // Load from the shop website folder at ../holmgraphics-ca/admin-timesheets.html
-  // For development, this works if both repos are in the same parent directory
-  const shopPath = path.join(__dirname, '../../holmgraphics-ca/admin-timesheets.html');
-  res.sendFile(shopPath);
-});
-
 // ─── 404 ──────────────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ message: `Route not found: ${req.method} ${req.path}` });
