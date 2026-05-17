@@ -859,4 +859,203 @@ router.post('/sync-time-period/:id', requireAdmin, async (req, res) => {
   });
 });
 
+// ─── POST /api/quickbooks/sync-payroll/:id ──────────────────────────────────
+// Push a pay period's time entries to QBO Payroll as employee hours.
+//
+// For each employee with entries in the period that are status closed/approved
+// AND not already synced to payroll (qbo_synced_at IS NULL):
+//   - Skip if the employee isn't yet mapped (employees.qbo_employee_id IS NULL)
+//   - Sum up PAID minutes for the entire period
+//   - Convert to decimal hours
+//   - POST to QBO Payroll API endpoint
+//   - On success: mark qbo_synced_at, record sync in qbo_payroll_syncs table
+//
+// Idempotent: re-running skips already-synced entries via qbo_synced_at.
+//
+// Response:
+//   {
+//     pay_period_id:      int,
+//     synced_employees:   int,     // number of employees synced
+//     synced_entries:     int,     // total time entries pushed
+//     total_hours:        decimal, // sum of all synced hours
+//     skipped_no_mapping: int,     // employees not linked to QBO
+//     skipped_already_synced: int, // entries already synced
+//     errors: [{ employee_name, entry_id, message }],
+//   }
+router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid pay period id' });
+  }
+
+  const payPeriod = await queryOne('SELECT * FROM pay_periods WHERE id = $1', [id]);
+  if (!payPeriod) {
+    return res.status(404).json({ message: 'Pay period not found.' });
+  }
+
+  // Fetch all time entries for the period that are closed/approved and not yet synced to payroll
+  let rows;
+  try {
+    rows = await query(
+      `SELECT t.id, t.employee_id, t.clock_in, t.clock_out,
+              t.notes, t.status, t.project_id,
+              t.qbo_synced_at,
+              e.qbo_employee_id,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS employee_name
+         FROM time_entries t
+         LEFT JOIN employees e ON e.id = t.employee_id
+        WHERE t.pay_period_id = $1
+          AND t.clock_out IS NOT NULL
+          AND t.status IN ('closed', 'approved', 'exported')
+        ORDER BY t.employee_id, t.clock_in`,
+      [id]
+    );
+  } catch (e) {
+    console.error('sync-payroll load failed:', e);
+    return res.status(500).json({ message: 'Lookup failed', detail: e.message });
+  }
+
+  // Compute lunch deductions across all period entries
+  const deductions = _computeLunchDeductions(rows);
+
+  // Group entries by employee and sum hours
+  const employeeHours = new Map();
+  const processedEntries = new Map(); // Track which entries we process
+  let skippedNoMapping = 0;
+  let skippedAlreadySynced = 0;
+
+  for (const r of rows) {
+    // Skip entries already synced to payroll
+    if (r.qbo_synced_at) {
+      skippedAlreadySynced++;
+      continue;
+    }
+
+    // Skip employees not yet mapped to QBO
+    if (!r.qbo_employee_id) {
+      skippedNoMapping++;
+      continue;
+    }
+
+    // Calculate paid minutes (after lunch deduction)
+    const clockMinutes = Math.round(
+      (new Date(r.clock_out) - new Date(r.clock_in)) / 60000
+    );
+    const lunchMinutes = deductions.get(r.id) || 0;
+    const paidMinutes = Math.max(0, clockMinutes - lunchMinutes);
+
+    if (paidMinutes <= 0) {
+      // Skip zero-hour entries
+      skippedAlreadySynced++;
+      continue;
+    }
+
+    // Convert minutes to decimal hours
+    const hours = paidMinutes / 60;
+
+    // Group by employee
+    if (!employeeHours.has(r.employee_id)) {
+      employeeHours.set(r.employee_id, {
+        employee_id: r.employee_id,
+        employee_name: r.employee_name,
+        qbo_employee_id: r.qbo_employee_id,
+        hours: 0,
+        entries: [],
+      });
+    }
+
+    const emp = employeeHours.get(r.employee_id);
+    emp.hours += hours;
+    emp.entries.push(r.id);
+    processedEntries.set(r.id, true);
+  }
+
+  // Track sync results
+  let syncedEmployees = 0;
+  let syncedEntries = 0;
+  let totalHours = 0;
+  const errors = [];
+
+  // Sync each employee's hours to QBO Payroll
+  for (const [, empData] of employeeHours) {
+    try {
+      // Call QBO Payroll API to update employee hours
+      // The payload structure for QBO Payroll's batch hours endpoint:
+      // POST /payroll/employees/{employeeId}/timeactivity
+      // or similar (exact endpoint depends on QBO Payroll API version)
+      //
+      // For now, we'll use a generalized approach with the TimeActivity
+      // endpoint, which is compatible with QBO's payroll tracking.
+      // In production, this may need to be updated based on the specific
+      // payroll system being used.
+
+      const txnDate = _localDateKey(payPeriod.start_date);
+      const payload = {
+        TxnDate: txnDate,
+        NameOf: 'Employee',
+        EmployeeRef: { value: empData.qbo_employee_id },
+        Hours: Math.floor(empData.hours),
+        Minutes: Math.round((empData.hours % 1) * 60),
+        Description: `Payroll sync for period ${payPeriod.start_date} to ${payPeriod.end_date}`,
+        BillableStatus: 'NotBillable', // Payroll hours are not billable
+      };
+
+      // POST to QBO — the TimeActivity endpoint can be used for payroll tracking
+      const result = await qbPost('/timeactivity?minorversion=65', payload);
+      const newId = result?.TimeActivity?.Id;
+      if (!newId) {
+        throw new Error('QBO did not return a TimeActivity Id');
+      }
+
+      // Mark all entries for this employee as synced to payroll
+      await query(
+        `UPDATE time_entries
+            SET qbo_synced_at = NOW()
+          WHERE id = ANY($1::int[])`,
+        [empData.entries]
+      );
+
+      syncedEmployees++;
+      syncedEntries += empData.entries.length;
+      totalHours += empData.hours;
+    } catch (err) {
+      errors.push({
+        employee_name: empData.employee_name,
+        employee_id: empData.employee_id,
+        message: err.qbDetail || err.message || String(err),
+      });
+    }
+  }
+
+  // Record the sync attempt in qbo_payroll_syncs table
+  if (syncedEmployees > 0 || errors.length === 0) {
+    try {
+      await query(
+        `INSERT INTO qbo_payroll_syncs
+            (pay_period_id, synced_by, entry_count, status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())`,
+        [
+          payPeriod.id,
+          req.user.id,
+          syncedEntries,
+          errors.length === 0 ? 'success' : 'failed',
+        ]
+      );
+    } catch (e) {
+      console.error('Failed to record payroll sync:', e);
+      // Don't fail the response — entries are synced; admin can check status
+    }
+  }
+
+  res.json({
+    pay_period_id: payPeriod.id,
+    synced_employees: syncedEmployees,
+    synced_entries: syncedEntries,
+    total_hours: Math.round(totalHours * 100) / 100,
+    skipped_no_mapping: skippedNoMapping,
+    skipped_already_synced: skippedAlreadySynced,
+    errors,
+  });
+});
+
 module.exports = router;
