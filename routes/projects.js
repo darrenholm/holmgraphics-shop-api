@@ -71,6 +71,35 @@ function normalizeCategory(raw) {
   return PHOTO_CATEGORIES.includes(v) ? v : 'other';
 }
 
+// ─── GET /api/projects/tv/status-board ──────────────────────────────────────
+// PUBLIC — no auth required. Used by the TV status board display.
+// Returns active projects grouped by status for the TV display.
+// MUST be declared before the generic '/' route so Express doesn't match
+// '/tv/status-board' as a query on the authenticated endpoint.
+router.get('/tv/status-board', async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT p.id,
+              p.description AS project_name,
+              p.client_id,
+              p.status_id,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              s.name AS status_name,
+              p.created_date AS date_created,
+              p.due_date
+         FROM projects p
+         LEFT JOIN clients c ON p.client_id = c.id
+         LEFT JOIN status  s ON p.status_id  = s.id
+        ORDER BY p.created_date DESC NULLS LAST, p.id DESC`,
+      []
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /projects/tv/status-board:', e);
+    res.status(500).json({ message: 'Failed to load projects', detail: e.message });
+  }
+});
+
 // ─── GET /api/projects ───────────────────────────────────────────────────────
 router.get('/', requireAuth, async (req, res) => {
   try {
