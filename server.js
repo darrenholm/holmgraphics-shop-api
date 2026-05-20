@@ -27,7 +27,6 @@ const timeRoutes         = require('./routes/time');
 const payPeriodsRoutes   = require('./routes/pay-periods');
 const qboMatchRoutes     = require('./routes/qbo-employee-match');
 const ledModulesRoutes   = require('./routes/led-modules');
-const internalPaymentsRoutes = require('./routes/internal-payments');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -79,10 +78,6 @@ app.use('/api/catalog',    catalogRoutes);
 app.use('/api/time',         timeRoutes);
 app.use('/api/pay-periods',  payPeriodsRoutes);
 app.use('/api/led-modules',  ledModulesRoutes);
-// Bridge endpoints used by the LED rental marketplace (led.holmgraphics.ca)
-// — server-to-server charge with shared secret, plus a public-but-rate-limited
-// tokenize endpoint for the rental site's card form.
-app.use('/api/internal',     internalPaymentsRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
