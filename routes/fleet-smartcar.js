@@ -25,6 +25,7 @@ const { queryOne, query, pool } = require('../db/connection');
 const { requireStaff, requireAdmin } = require('../middleware/auth');
 const sc = require('../lib/smartcar-client');
 const { encrypt, decrypt, isConfigured: encConfigured } = require('../lib/encryption');
+const { validateVin } = require('../lib/vin');
 
 const router = express.Router();
 
@@ -114,6 +115,8 @@ router.get('/smartcar/connect-url', requireStaff, async (req, res, next) => {
     if (!vehicle)               return res.status(404).json({ message: 'vehicle not found' });
     if (vehicle.type !== 'truck') return res.status(400).json({ message: 'Only trucks can be connected — trailers have no modem.' });
     if (!vehicle.vin)           return res.status(400).json({ message: 'Vehicle is missing a VIN. Add the VIN before connecting.' });
+    const v = validateVin(vehicle.vin);
+    if (!v.valid) return res.status(400).json({ message: `VIN looks wrong: ${v.reason} Fix it on the vehicle's Edit page before connecting Smartcar.` });
 
     // Hard cap on connected vehicles (cost guardrail).
     const counts = await queryOne(`SELECT COUNT(*)::int AS n FROM vehicle_smartcar_links WHERE status = 'active'`);
