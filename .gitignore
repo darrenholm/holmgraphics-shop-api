@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.*
+!.env.example
 *.log
 
 # Contains plaintext passwords — edit locally, never commit

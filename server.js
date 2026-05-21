@@ -29,6 +29,7 @@ const qboMatchRoutes     = require('./routes/qbo-employee-match');
 const ledModulesRoutes   = require('./routes/led-modules');
 const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
+const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -81,6 +82,9 @@ app.use('/api/time',         timeRoutes);
 app.use('/api/pay-periods',  payPeriodsRoutes);
 app.use('/api/led-modules',  ledModulesRoutes);
 app.use('/api/builder',      builderOrdersRoutes);
+// Smartcar telematics mounted BEFORE the generic fleet router so its
+// specific paths (e.g. /vehicles/:id/location) win over /vehicles/:id.
+app.use('/api/fleet',        fleetSmartcarRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
