@@ -27,6 +27,7 @@ const timeRoutes         = require('./routes/time');
 const payPeriodsRoutes   = require('./routes/pay-periods');
 const qboMatchRoutes     = require('./routes/qbo-employee-match');
 const ledModulesRoutes   = require('./routes/led-modules');
+const builderOrdersRoutes = require('./routes/builder-orders');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -78,6 +79,7 @@ app.use('/api/catalog',    catalogRoutes);
 app.use('/api/time',         timeRoutes);
 app.use('/api/pay-periods',  payPeriodsRoutes);
 app.use('/api/led-modules',  ledModulesRoutes);
+app.use('/api/builder',      builderOrdersRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
