@@ -223,8 +223,8 @@ router.get('/vehicles/:id/smartcar', requireStaff, async (req, res, next) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: 'invalid id' });
     const link = await queryOne(
-      `SELECT id, smartcar_vehicle_id, connected_at, last_synced_at,
-              token_expires_at, status, last_error,
+      `SELECT l.id, l.smartcar_vehicle_id, l.connected_at, l.last_synced_at,
+              l.token_expires_at, l.status, l.last_error,
               (e.first_name || ' ' || e.last_name) AS connected_by_name
          FROM vehicle_smartcar_links l
          LEFT JOIN employees e ON e.id = l.connected_by
