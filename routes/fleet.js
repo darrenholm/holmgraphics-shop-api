@@ -40,9 +40,15 @@ const upload = multer({
   limits:  { fileSize: storage.MAX_BYTES }
 });
 
-// Annual inspection (PMVI yellow sticker) applies to both trucks and
-// trailers; CVOR is truck-only.
-const DOC_TYPES = ['ownership', 'insurance', 'cvor', 'inspection'];
+// Per-vehicle document types. CVOR moved to the operator-level table
+// (fleet_operator_documents) in migration 027 — it's issued to the
+// business, not individual vehicles.
+const DOC_TYPES = ['ownership', 'insurance', 'inspection'];
+
+// Operator-level document types — currently just CVOR, but the table
+// and code paths accommodate adding more (operating authority,
+// liability cert, etc).
+const OPERATOR_DOC_TYPES = ['cvor'];
 
 function statusForDoc(doc) {
   if (!doc || !doc.id) return 'missing';
@@ -70,25 +76,26 @@ function ipOf(req) {
   return req.ip || req.socket?.remoteAddress || null;
 }
 
-async function logAccess({ userId, documentId, action, req }) {
+async function logAccess({ userId, documentId, action, source = 'vehicle', req }) {
   try {
     await query(
       `INSERT INTO fleet_document_access_log
-         (user_id, document_id, action, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5)`,
+         (user_id, document_id, action, ip_address, user_agent, source)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         userId,
         documentId,
         action,
         ipOf(req),
-        (req.headers['user-agent'] || '').slice(0, 500) || null
+        (req.headers['user-agent'] || '').slice(0, 500) || null,
+        source
       ]
     );
   } catch (e) {
     // Logging is critical for CVOR posture, but a failed log row must not
     // block the driver from showing the document to an officer. Surface
     // the failure to server logs and continue.
-    console.warn(`[fleet] access log insert failed for doc ${documentId}:`, e.message);
+    console.warn(`[fleet] access log insert failed for doc ${documentId} (${source}):`, e.message);
   }
 }
 
@@ -158,15 +165,12 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
               v.created_at, v.updated_at,
               o.id AS o_id, o.expiry_date AS o_expiry,
               i.id AS i_id, i.expiry_date AS i_expiry,
-              c.id AS c_id, c.expiry_date AS c_expiry,
               n.id AS n_id, n.expiry_date AS n_expiry
          FROM vehicles v
          LEFT JOIN fleet_documents o
            ON o.vehicle_id = v.id AND o.doc_type = 'ownership' AND o.is_current = TRUE
          LEFT JOIN fleet_documents i
            ON i.vehicle_id = v.id AND i.doc_type = 'insurance' AND i.is_current = TRUE
-         LEFT JOIN fleet_documents c
-           ON c.vehicle_id = v.id AND c.doc_type = 'cvor' AND c.is_current = TRUE
          LEFT JOIN fleet_documents n
            ON n.vehicle_id = v.id AND n.doc_type = 'inspection' AND n.is_current = TRUE
         ${includeInactive ? '' : 'WHERE v.active = TRUE'}
@@ -186,9 +190,6 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
       documents: {
         ownership:  { id: r.o_id, expiry_date: r.o_expiry, status: statusForDoc({ id: r.o_id, expiry_date: r.o_expiry }) },
         insurance:  { id: r.i_id, expiry_date: r.i_expiry, status: statusForDoc({ id: r.i_id, expiry_date: r.i_expiry }) },
-        cvor:       r.type === 'trailer'
-          ? null
-          : { id: r.c_id, expiry_date: r.c_expiry, status: statusForDoc({ id: r.c_id, expiry_date: r.c_expiry }) },
         inspection: { id: r.n_id, expiry_date: r.n_expiry, status: statusForDoc({ id: r.n_id, expiry_date: r.n_expiry }) }
       }
     }));
@@ -281,9 +282,12 @@ async function vehicleDetailHandler(req, res, next) {
 
     const grouped = { ownership:  { current: null, history: [] },
                       insurance:  { current: null, history: [] },
-                      cvor:       { current: null, history: [] },
                       inspection: { current: null, history: [] } };
     for (const d of docs) {
+      // Legacy per-vehicle CVOR rows (retired by migration 027) are no
+      // longer surfaced here — skip them so the UI sees CVOR only via
+      // the operator-documents endpoint.
+      if (!grouped[d.doc_type]) continue;
       const stat = statusForDoc(d);
       const entry = { ...d, status: stat };
       if (d.is_current) grouped[d.doc_type].current = entry;
@@ -365,9 +369,6 @@ async function handleUpload(req, res) {
 
   const vehicle = await queryOne(`SELECT id, type FROM vehicles WHERE id = $1`, [vehicleId]);
   if (!vehicle) return res.status(404).json({ message: 'vehicle not found' });
-  if (vehicle.type === 'trailer' && doc_type === 'cvor') {
-    return res.status(400).json({ message: "Trailers don't carry CVOR documents — skip this section." });
-  }
 
   if (issued_date) {
     const today = new Date(); today.setHours(0,0,0,0);
@@ -433,12 +434,179 @@ async function handleUpload(req, res) {
   }
 }
 
+// ─── Operator-level documents (CVOR etc) ───────────────────────────────────
+// CVOR is issued to the BUSINESS, not individual vehicles — one current
+// CVOR covers the whole fleet. These endpoints mirror the per-vehicle
+// document API but against fleet_operator_documents.
+
+// GET /operator-documents — current + history grouped by doc_type.
+router.get('/operator-documents', requireStaff, async (req, res, next) => {
+  try {
+    const docs = await query(
+      `SELECT d.id, d.doc_type, d.file_mime, d.file_size_bytes,
+              d.issued_date, d.expiry_date, d.uploaded_at, d.is_current, d.notes,
+              d.uploaded_by,
+              (e.first_name || ' ' || e.last_name) AS uploaded_by_name,
+              e.email AS uploaded_by_email
+         FROM fleet_operator_documents d
+         LEFT JOIN employees e ON e.id = d.uploaded_by
+        ORDER BY d.uploaded_at DESC`
+    );
+    const grouped = {};
+    for (const t of OPERATOR_DOC_TYPES) grouped[t] = { current: null, history: [] };
+    for (const d of docs) {
+      if (!grouped[d.doc_type]) continue;
+      const entry = { ...d, status: statusForDoc(d) };
+      if (d.is_current) grouped[d.doc_type].current = entry;
+      else              grouped[d.doc_type].history.push(entry);
+    }
+    res.json({ documents: grouped });
+  } catch (err) { next(err); }
+});
+
+// POST /operator-documents — multipart upload (new "current").
+router.post('/operator-documents', requireStaff, (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE')
+        return res.status(413).json({ message: 'File too large, please send via email after submitting.' });
+      return next(err);
+    }
+    handleOperatorUpload(req, res).catch(next);
+  });
+});
+
+async function handleOperatorUpload(req, res) {
+  const file = req.file;
+  if (!file) return res.status(400).json({ message: 'file required (multipart field "file")' });
+
+  const doc_type    = (req.body.doc_type || '').trim();
+  const issued_date = req.body.issued_date || null;
+  const expiry_date = req.body.expiry_date || null;
+  const notes       = req.body.notes || null;
+  if (!OPERATOR_DOC_TYPES.includes(doc_type)) return res.status(400).json({ message: 'invalid doc_type' });
+  if (issued_date && !isISODate(issued_date)) return res.status(400).json({ message: 'issued_date must be YYYY-MM-DD' });
+  if (expiry_date && !isISODate(expiry_date)) return res.status(400).json({ message: 'expiry_date must be YYYY-MM-DD' });
+
+  if (issued_date) {
+    const today = new Date(); today.setHours(0,0,0,0);
+    if (new Date(issued_date) > today) {
+      return res.status(400).json({ message: 'Issued date cannot be in the future.' });
+    }
+  }
+  if (issued_date && expiry_date && new Date(expiry_date) < new Date(issued_date)) {
+    return res.status(400).json({ message: 'Expiry date cannot be before issued date.' });
+  }
+
+  let saved;
+  try {
+    saved = await storage.saveOperatorDocument({
+      docType: doc_type, buffer: file.buffer, mime: file.mimetype
+    });
+  } catch (e) {
+    if (e.code === 'FILE_TOO_LARGE')   return res.status(413).json({ message: e.message });
+    if (e.code === 'UNSUPPORTED_MIME') return res.status(415).json({ message: e.message });
+    throw e;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE fleet_operator_documents
+          SET is_current = FALSE
+        WHERE doc_type = $1 AND is_current = TRUE`,
+      [doc_type]
+    );
+    const ins = await client.query(
+      `INSERT INTO fleet_operator_documents
+         (doc_type, file_path, file_mime, file_size_bytes,
+          issued_date, expiry_date, uploaded_by, notes, is_current)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
+       RETURNING id, uploaded_at`,
+      [
+        doc_type, saved.file_path, saved.file_mime, saved.file_size_bytes,
+        issued_date, expiry_date, req.user.id, notes
+      ]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({
+      id:           ins.rows[0].id,
+      uploaded_at:  ins.rows[0].uploaded_at,
+      doc_type,
+      file_mime:    saved.file_mime,
+      file_size_bytes: saved.file_size_bytes,
+      issued_date, expiry_date,
+      status:       statusForDoc({ id: ins.rows[0].id, expiry_date })
+    });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch {}
+    try { await storage.deleteDocument(saved.file_path); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// GET /operator-documents/:id/file — stream + access-log.
+router.get('/operator-documents/:id/file', requireStaff, async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ message: 'invalid document id' });
+    }
+
+    const doc = await queryOne(
+      `SELECT id, doc_type, file_path, file_mime, file_size_bytes
+         FROM fleet_operator_documents
+        WHERE id = $1`,
+      [id]
+    );
+    if (!doc) return res.status(404).json({ message: 'document not found' });
+
+    let stat;
+    try {
+      stat = await storage.statDocument(doc.file_path);
+    } catch (e) {
+      console.warn(`[fleet] operator file missing on disk for doc ${id} (${doc.file_path}):`, e.message);
+      return res.status(404).json({ message: 'document file missing on storage' });
+    }
+
+    const download = req.query.download === '1' || req.query.download === 'true';
+    await logAccess({
+      userId:     req.user.id,
+      documentId: doc.id,
+      action:     download ? 'download' : 'view',
+      source:     'operator',
+      req
+    });
+
+    res.setHeader('Content-Type',   doc.file_mime);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Cache-Control',  'private, no-store');
+    res.setHeader('Content-Disposition',
+      download
+        ? `attachment; filename="fleet-operator-${doc.doc_type}-${doc.id}.${doc.file_path.split('.').pop()}"`
+        : 'inline'
+    );
+
+    const stream = storage.streamDocument(doc.file_path);
+    stream.on('error', (err) => {
+      console.warn(`[fleet] stream error for operator doc ${id}:`, err.message);
+      if (!res.headersSent) res.status(500);
+      res.end();
+    });
+    stream.pipe(res);
+  } catch (err) { next(err); }
+});
+
 // ─── GET /expiry-summary  — admin landing dashboard counts ─────────────────
 // Counts of CURRENT docs by status across the active fleet plus a list of
 // up to 20 documents expiring soonest, for the admin landing page. "Missing"
-// is computed as (expected slots − actual current docs): each active truck
-// expects 4 docs (ownership/insurance/cvor/inspection), each active trailer
-// expects 3 (no CVOR).
+// is computed as (expected slots − actual current docs): every active
+// vehicle expects 3 per-vehicle docs (ownership/insurance/inspection).
+// CVOR moved to the operator-level table and is counted separately on
+// the dashboard.
 
 router.get('/expiry-summary', requireStaff, async (req, res, next) => {
   try {
@@ -459,9 +627,9 @@ router.get('/expiry-summary', requireStaff, async (req, res, next) => {
          FROM vehicles WHERE active = TRUE`
     );
 
-    // Each active truck expects 4 docs (ownership, insurance, cvor, inspection);
-    // each active trailer expects 3 (ownership, insurance, inspection — no CVOR).
-    const expected = (Number(fleet.trucks) || 0) * 4 + (Number(fleet.trailers) || 0) * 3;
+    // Every active vehicle expects 3 per-vehicle docs (ownership, insurance,
+    // inspection). CVOR is operator-level and tracked separately.
+    const expected = (Number(fleet.trucks) || 0) * 3 + (Number(fleet.trailers) || 0) * 3;
     const actual   = Number(counts.expired) + Number(counts.expiring_soon) + Number(counts.valid);
     const missing  = Math.max(0, expected - actual);
 
@@ -532,21 +700,25 @@ router.get('/access-log', requireStaff, async (req, res, next) => {
     }
 
     args.push(limit, offset);
+    // document_id references either fleet_documents (source='vehicle')
+    // or fleet_operator_documents (source='operator') — LEFT JOIN both
+    // and COALESCE so each log row resolves to whichever table owns it.
     const entries = await query(
-      `SELECT l.id, l.action, l.created_at, l.ip_address,
+      `SELECT l.id, l.action, l.created_at, l.ip_address, l.source,
               e.id AS user_id,
               (e.first_name || ' ' || e.last_name) AS user_name,
               e.email AS user_email,
-              d.id   AS document_id,
-              d.doc_type,
-              d.is_current,
+              COALESCE(d.id, od.id)                AS document_id,
+              COALESCE(d.doc_type, od.doc_type)    AS doc_type,
+              COALESCE(d.is_current, od.is_current) AS is_current,
               v.id   AS vehicle_id,
               v.unit_number,
               v.type AS vehicle_type
          FROM fleet_document_access_log l
-         LEFT JOIN employees      e ON e.id = l.user_id
-         LEFT JOIN fleet_documents d ON d.id = l.document_id
-         LEFT JOIN vehicles        v ON v.id = d.vehicle_id
+         LEFT JOIN employees                e ON e.id = l.user_id
+         LEFT JOIN fleet_documents          d  ON d.id  = l.document_id AND l.source = 'vehicle'
+         LEFT JOIN fleet_operator_documents od ON od.id = l.document_id AND l.source = 'operator'
+         LEFT JOIN vehicles                 v  ON v.id  = d.vehicle_id
          ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
          ORDER BY l.created_at DESC
          LIMIT $${i++} OFFSET $${i++}`,
