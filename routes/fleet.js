@@ -40,7 +40,9 @@ const upload = multer({
   limits:  { fileSize: storage.MAX_BYTES }
 });
 
-const DOC_TYPES = ['ownership', 'insurance', 'cvor'];
+// Annual inspection (PMVI yellow sticker) applies to both trucks and
+// trailers; CVOR is truck-only.
+const DOC_TYPES = ['ownership', 'insurance', 'cvor', 'inspection'];
 
 function statusForDoc(doc) {
   if (!doc || !doc.id) return 'missing';
@@ -156,7 +158,8 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
               v.created_at, v.updated_at,
               o.id AS o_id, o.expiry_date AS o_expiry,
               i.id AS i_id, i.expiry_date AS i_expiry,
-              c.id AS c_id, c.expiry_date AS c_expiry
+              c.id AS c_id, c.expiry_date AS c_expiry,
+              n.id AS n_id, n.expiry_date AS n_expiry
          FROM vehicles v
          LEFT JOIN fleet_documents o
            ON o.vehicle_id = v.id AND o.doc_type = 'ownership' AND o.is_current = TRUE
@@ -164,6 +167,8 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
            ON i.vehicle_id = v.id AND i.doc_type = 'insurance' AND i.is_current = TRUE
          LEFT JOIN fleet_documents c
            ON c.vehicle_id = v.id AND c.doc_type = 'cvor' AND c.is_current = TRUE
+         LEFT JOIN fleet_documents n
+           ON n.vehicle_id = v.id AND n.doc_type = 'inspection' AND n.is_current = TRUE
         ${includeInactive ? '' : 'WHERE v.active = TRUE'}
         ORDER BY v.unit_number`
     );
@@ -179,11 +184,12 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
       created_at: r.created_at,
       updated_at: r.updated_at,
       documents: {
-        ownership: { id: r.o_id, expiry_date: r.o_expiry, status: statusForDoc({ id: r.o_id, expiry_date: r.o_expiry }) },
-        insurance: { id: r.i_id, expiry_date: r.i_expiry, status: statusForDoc({ id: r.i_id, expiry_date: r.i_expiry }) },
-        cvor:      r.type === 'trailer'
+        ownership:  { id: r.o_id, expiry_date: r.o_expiry, status: statusForDoc({ id: r.o_id, expiry_date: r.o_expiry }) },
+        insurance:  { id: r.i_id, expiry_date: r.i_expiry, status: statusForDoc({ id: r.i_id, expiry_date: r.i_expiry }) },
+        cvor:       r.type === 'trailer'
           ? null
-          : { id: r.c_id, expiry_date: r.c_expiry, status: statusForDoc({ id: r.c_id, expiry_date: r.c_expiry }) }
+          : { id: r.c_id, expiry_date: r.c_expiry, status: statusForDoc({ id: r.c_id, expiry_date: r.c_expiry }) },
+        inspection: { id: r.n_id, expiry_date: r.n_expiry, status: statusForDoc({ id: r.n_id, expiry_date: r.n_expiry }) }
       }
     }));
     res.json({ vehicles });
@@ -273,9 +279,10 @@ async function vehicleDetailHandler(req, res, next) {
       [id]
     );
 
-    const grouped = { ownership: { current: null, history: [] },
-                      insurance: { current: null, history: [] },
-                      cvor:      { current: null, history: [] } };
+    const grouped = { ownership:  { current: null, history: [] },
+                      insurance:  { current: null, history: [] },
+                      cvor:       { current: null, history: [] },
+                      inspection: { current: null, history: [] } };
     for (const d of docs) {
       const stat = statusForDoc(d);
       const entry = { ...d, status: stat };
@@ -430,7 +437,8 @@ async function handleUpload(req, res) {
 // Counts of CURRENT docs by status across the active fleet plus a list of
 // up to 20 documents expiring soonest, for the admin landing page. "Missing"
 // is computed as (expected slots − actual current docs): each active truck
-// expects 3 docs (ownership/insurance/cvor), each active trailer expects 2.
+// expects 4 docs (ownership/insurance/cvor/inspection), each active trailer
+// expects 3 (no CVOR).
 
 router.get('/expiry-summary', requireStaff, async (req, res, next) => {
   try {
@@ -451,7 +459,9 @@ router.get('/expiry-summary', requireStaff, async (req, res, next) => {
          FROM vehicles WHERE active = TRUE`
     );
 
-    const expected = (Number(fleet.trucks) || 0) * 3 + (Number(fleet.trailers) || 0) * 2;
+    // Each active truck expects 4 docs (ownership, insurance, cvor, inspection);
+    // each active trailer expects 3 (ownership, insurance, inspection — no CVOR).
+    const expected = (Number(fleet.trucks) || 0) * 4 + (Number(fleet.trailers) || 0) * 3;
     const actual   = Number(counts.expired) + Number(counts.expiring_soon) + Number(counts.valid);
     const missing  = Math.max(0, expected - actual);
 
