@@ -1,45 +1,40 @@
 // routes/fleet-smartcar.js
-// Phase 2 of the fleet portal — Smartcar telematics endpoints. Mounted at
-// /api/fleet/smartcar + /api/fleet/vehicles/:id/location by server.js.
+// Smartcar V3 (Connect 2.0) integration. Mounted at /api/fleet by server.js.
 //
-// Flow:
-//   1. Admin clicks "Connect via Smartcar" on a vehicle.
-//      Frontend → GET /smartcar/connect-url?vehicle_id=N
-//      Returns { url } pointing at Smartcar's OAuth dialog (state JWT
-//      already embedded). Admin's browser is redirected there.
-//   2. After authorizing the OEM account (FordPass / etc.):
-//      Smartcar → GET /smartcar/callback?code=...&state=...
-//      We verify state, exchange code for tokens, look up the VIN from
-//      Smartcar, find the matching row in `vehicles`, store encrypted
-//      tokens, redirect back to the admin UI.
-//   3. Disconnect: POST /vehicles/:id/smartcar/disconnect — revokes
-//      Smartcar's grant and deletes the link row.
-//   4. Location: GET /vehicles/:id/location — refreshes token if needed,
-//      calls Smartcar, writes a snapshot, returns coordinates. 60s
-//      per-vehicle in-memory cache to respect rate limits.
+// V3 architecture:
+//   1. Admin clicks "Connect via Smartcar" → frontend GET /smartcar/connect-url
+//      → response is a Smartcar Connect URL with application_id, redirect_uri,
+//        signed state JWT.
+//   2. Admin authorizes Ford / OEM account → Smartcar redirects to our
+//      callback with ?code=&state=.
+//   3. Callback verifies state, exchanges the code at iam.smartcar.com to
+//      finalize the connection, then lists /v3/connections with the M2M
+//      token to find the new link by VIN. Stores sc_vehicle_id + sc_user_id
+//      in vehicle_smartcar_links (no per-user OAuth tokens in V3).
+//   4. Location: GET /vehicles/:id/location → fetch M2M token (cached),
+//      call /v3/vehicles/{sc_vehicle_id}/signals/location-preciselocation
+//      with sc-user-id header. Snapshot rowed for audit + history.
+//   5. Disconnect: POST /vehicles/:id/smartcar/disconnect → wipes the
+//      local link row. (V3 has no public revoke endpoint; the user must
+//      remove the app from their Ford/OEM account if they want to fully
+//      cut access — usually fine since the M2M model means the link
+//      stops working once removed locally.)
 
 'use strict';
 
 const express = require('express');
-const { queryOne, query, pool } = require('../db/connection');
-const { requireStaff, requireAdmin } = require('../middleware/auth');
+const { queryOne, query } = require('../db/connection');
+const { requireStaff } = require('../middleware/auth');
 const sc = require('../lib/smartcar-client');
-const { encrypt, decrypt, isConfigured: encConfigured } = require('../lib/encryption');
 const { validateVin } = require('../lib/vin');
 
 const router = express.Router();
-
-// ─── helpers ────────────────────────────────────────────────────────────────
 
 const PUBLIC_SHOP_URL = process.env.PUBLIC_SHOP_URL || 'https://holmgraphics.ca';
 
 function ensureEnvReady(res) {
   if (!sc.isConfigured()) {
     res.status(503).json({ message: 'Smartcar is not configured on the server (missing env vars).' });
-    return false;
-  }
-  if (!encConfigured()) {
-    res.status(503).json({ message: 'Encryption is not configured on the server (missing ENCRYPTION_KEY).' });
     return false;
   }
   return true;
@@ -59,34 +54,9 @@ function cacheSet(id, result) {
   locationCache.set(id, { result, expiresAt: Date.now() + LOCATION_TTL_MS });
 }
 
-async function decryptedTokens(link) {
-  return {
-    accessToken:  decrypt(link.access_token),
-    refreshToken: decrypt(link.refresh_token)
-  };
-}
+function normVin(v) { return (v || '').replace(/\s+/g, '').toUpperCase(); }
 
-// Persist refreshed tokens back to the DB encrypted. Smartcar's exchangeRefreshToken
-// also rotates the refresh token; both must be saved.
-async function saveRefreshedTokens(linkId, tokens) {
-  await query(
-    `UPDATE vehicle_smartcar_links
-        SET access_token     = $1,
-            refresh_token    = $2,
-            token_expires_at = $3,
-            status           = 'active',
-            last_error       = NULL
-      WHERE id = $4`,
-    [
-      encrypt(tokens.accessToken),
-      encrypt(tokens.refreshToken),
-      tokens.expiration,
-      linkId
-    ]
-  );
-}
-
-// ─── GET /smartcar/status  — for admin dashboards ───────────────────────────
+// ─── GET /smartcar/status ────────────────────────────────────────────────────
 
 router.get('/smartcar/status', requireStaff, async (req, res, next) => {
   try {
@@ -94,7 +64,7 @@ router.get('/smartcar/status', requireStaff, async (req, res, next) => {
       `SELECT COUNT(*)::int AS n FROM vehicle_smartcar_links WHERE status = 'active'`
     );
     res.json({
-      configured: sc.isConfigured() && encConfigured(),
+      configured: sc.isConfigured(),
       mode:       sc.getMode(),
       connected:  connected.n,
       cap:        sc.getMaxVehicles()
@@ -102,7 +72,7 @@ router.get('/smartcar/status', requireStaff, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ─── GET /smartcar/connect-url?vehicle_id=N  — kicks off OAuth ──────────────
+// ─── GET /smartcar/connect-url?vehicle_id=N ─────────────────────────────────
 
 router.get('/smartcar/connect-url', requireStaff, async (req, res, next) => {
   try {
@@ -118,7 +88,6 @@ router.get('/smartcar/connect-url', requireStaff, async (req, res, next) => {
     const v = validateVin(vehicle.vin);
     if (!v.valid) return res.status(400).json({ message: `VIN looks wrong: ${v.reason} Fix it on the vehicle's Edit page before connecting Smartcar.` });
 
-    // Hard cap on connected vehicles (cost guardrail).
     const counts = await queryOne(`SELECT COUNT(*)::int AS n FROM vehicle_smartcar_links WHERE status = 'active'`);
     if (counts.n >= sc.getMaxVehicles()) {
       const alreadyLinked = await queryOne(`SELECT id FROM vehicle_smartcar_links WHERE vehicle_id = $1 AND status = 'active'`, [vehicleId]);
@@ -132,17 +101,25 @@ router.get('/smartcar/connect-url', requireStaff, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// ─── GET /smartcar/callback  — OAuth redirect target ────────────────────────
-// Note: this route is hit by the BROWSER (not as XHR), so it returns an HTML
-// redirect on success/failure rather than JSON. It's still public — the JWT
-// state token is the auth + CSRF.
+// ─── GET /smartcar/callback ─────────────────────────────────────────────────
+// Browser-facing redirect target. Returns HTML redirects, not JSON.
+//
+// V3 flow:
+//   a. Verify state JWT (CSRF)
+//   b. Exchange the auth code at iam.smartcar.com — this finalizes the
+//      connection on Smartcar's side. We don't actually need the tokens
+//      it returns (V3 uses M2M for data fetches) but the exchange itself
+//      is what makes the connection visible in /v3/connections.
+//   c. List /v3/connections with the M2M token, find the connection whose
+//      VIN matches the vehicle being connected. Capture sc_vehicle_id +
+//      sc_user_id.
+//   d. Upsert the link row.
 
 router.get('/smartcar/callback', async (req, res) => {
-  if (!sc.isConfigured() || !encConfigured()) {
-    return res.status(503).send('Smartcar / encryption not configured on the server.');
+  if (!sc.isConfigured()) {
+    return res.status(503).send('Smartcar is not configured on the server.');
   }
 
-  // Smartcar can return error=... on cancel / failure
   if (req.query.error) {
     return res.redirect(`${PUBLIC_SHOP_URL}/fleet-admin?smartcar_error=${encodeURIComponent(String(req.query.error_description || req.query.error))}`);
   }
@@ -165,51 +142,53 @@ router.get('/smartcar/callback', async (req, res) => {
   try {
     const vehicle = await queryOne(`SELECT id, vin FROM vehicles WHERE id = $1`, [vehicleId]);
     if (!vehicle) throw new Error('Vehicle no longer exists.');
+    const targetVin = normVin(vehicle.vin);
+    if (!targetVin) throw new Error('Vehicle has no VIN on file.');
 
-    const tokens = await sc.exchangeCode(code);
-
-    // Smartcar returns the set of vehicles the user authorized — typically
-    // one for FordPass single-vehicle accounts, sometimes more. We match by
-    // VIN against the row the admin was connecting.
-    const ids = await sc.listVehicles(tokens.accessToken);
-    if (!ids || ids.length === 0) throw new Error('Smartcar returned no vehicles for this authorization.');
-
-    let matchedSmartcarId = null;
-    let matchedVin        = null;
-    for (const sid of ids) {
-      let vin;
-      try { vin = await sc.getVehicleVin(sid, tokens.accessToken); } catch { continue; }
-      if (vin && vehicle.vin && vin.replace(/\s+/g, '').toUpperCase() === vehicle.vin.replace(/\s+/g, '').toUpperCase()) {
-        matchedSmartcarId = sid;
-        matchedVin = vin;
-        break;
-      }
-    }
-    if (!matchedSmartcarId) {
-      throw new Error(`The Smartcar account doesn't contain a vehicle with VIN ${vehicle.vin}. Make sure you authorized the right OEM account.`);
+    // (b) Finalize the connection. The response shape isn't strictly
+    // documented — we log it for diagnostics but rely on (c) for the data.
+    let exchangeResult;
+    try {
+      exchangeResult = await sc.exchangeCode(code);
+    } catch (e) {
+      // The exchange CAN error (single-use code, slow network) without
+      // the connection being fully lost. Try (c) anyway; if no matching
+      // connection appears, surface the exchange error.
+      console.warn('[smartcar callback] code exchange threw:', e.message);
     }
 
-    // Persist (upsert) the link row, encrypted.
+    // (c) Find the newly-linked connection by VIN.
+    const connections = await sc.listConnections({ pageSize: 200 });
+    const match = connections.find((c) => normVin(c.vin) === targetVin);
+    if (!match) {
+      const got = connections.map((c) => c.vin).filter(Boolean).join(', ') || '(none)';
+      const exchangeNote = exchangeResult ? '' : ' Code exchange may have failed — retry the Connect button.';
+      throw new Error(`Smartcar didn't return a connection for VIN ${vehicle.vin}. Authorized VINs: ${got}.${exchangeNote}`);
+    }
+
+    const scVehicleId = match.id || match.vehicleId || match.vehicle_id;
+    const scUserId    = match.userId || match.user_id || match.sc_user_id;
+    if (!scVehicleId || !scUserId) {
+      throw new Error(`Smartcar connection is missing id/userId fields: ${JSON.stringify(match)}`);
+    }
+
     await query(
       `INSERT INTO vehicle_smartcar_links
-         (vehicle_id, smartcar_vehicle_id, access_token, refresh_token, token_expires_at, connected_by, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'active')
+         (vehicle_id, smartcar_vehicle_id, sc_user_id,
+          access_token, refresh_token, token_expires_at,
+          connected_by, status)
+       VALUES ($1, $2, $3, NULL, NULL, NULL, $4, 'active')
        ON CONFLICT (vehicle_id) DO UPDATE SET
          smartcar_vehicle_id = EXCLUDED.smartcar_vehicle_id,
-         access_token        = EXCLUDED.access_token,
-         refresh_token       = EXCLUDED.refresh_token,
-         token_expires_at    = EXCLUDED.token_expires_at,
+         sc_user_id          = EXCLUDED.sc_user_id,
+         access_token        = NULL,
+         refresh_token       = NULL,
+         token_expires_at    = NULL,
          connected_by        = EXCLUDED.connected_by,
          connected_at        = NOW(),
          status              = 'active',
          last_error          = NULL`,
-      [
-        vehicleId, matchedSmartcarId,
-        encrypt(tokens.accessToken),
-        encrypt(tokens.refreshToken),
-        tokens.expiration,
-        adminId
-      ]
+      [vehicleId, String(scVehicleId), String(scUserId), adminId]
     );
 
     return res.redirect(`${PUBLIC_SHOP_URL}/fleet-admin/vehicles/${vehicleId}?smartcar=connected`);
@@ -219,15 +198,15 @@ router.get('/smartcar/callback', async (req, res) => {
   }
 });
 
-// ─── GET /vehicles/:id/smartcar  — per-vehicle link status ──────────────────
+// ─── GET /vehicles/:id/smartcar ─────────────────────────────────────────────
 
 router.get('/vehicles/:id/smartcar', requireStaff, async (req, res, next) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: 'invalid id' });
     const link = await queryOne(
-      `SELECT l.id, l.smartcar_vehicle_id, l.connected_at, l.last_synced_at,
-              l.token_expires_at, l.status, l.last_error,
+      `SELECT l.id, l.smartcar_vehicle_id, l.sc_user_id, l.connected_at, l.last_synced_at,
+              l.status, l.last_error,
               (e.first_name || ' ' || e.last_name) AS connected_by_name
          FROM vehicle_smartcar_links l
          LEFT JOIN employees e ON e.id = l.connected_by
@@ -235,7 +214,7 @@ router.get('/vehicles/:id/smartcar', requireStaff, async (req, res, next) => {
       [id]
     );
     res.json({
-      configured: sc.isConfigured() && encConfigured(),
+      configured: sc.isConfigured(),
       mode:       sc.getMode(),
       linked:     !!link,
       link:       link || null
@@ -250,27 +229,22 @@ router.post('/vehicles/:id/smartcar/disconnect', requireStaff, async (req, res, 
     if (!ensureEnvReady(res)) return;
     const id = parseInt(req.params.id, 10);
     const link = await queryOne(
-      `SELECT id, access_token, smartcar_vehicle_id FROM vehicle_smartcar_links WHERE vehicle_id = $1`,
+      `SELECT id FROM vehicle_smartcar_links WHERE vehicle_id = $1`,
       [id]
     );
     if (!link) return res.status(404).json({ message: 'no smartcar link for this vehicle' });
 
-    // Best-effort revoke at Smartcar's side. Even if it fails, we wipe the
-    // row locally — better to leak a token than to leave a dead link the
-    // admin can't get rid of.
-    try {
-      const accessToken = decrypt(link.access_token);
-      await sc.revoke(link.smartcar_vehicle_id, accessToken);
-    } catch (e) {
-      console.warn('[smartcar disconnect] revoke failed (proceeding with local delete):', e.message);
-    }
+    // V3 doesn't expose a per-link revoke endpoint via the M2M API. The
+    // user can disconnect at the OEM-account level (FordPass etc.) if
+    // they want a hard revoke; for this app's purposes, removing the
+    // local row stops all reads.
     await query(`DELETE FROM vehicle_smartcar_links WHERE id = $1`, [link.id]);
     locationCache.delete(id);
     res.json({ ok: true });
   } catch (err) { next(err); }
 });
 
-// ─── GET /vehicles/:id/location  — on-demand fetch ──────────────────────────
+// ─── GET /vehicles/:id/location ─────────────────────────────────────────────
 
 router.get('/vehicles/:id/location', requireStaff, async (req, res, next) => {
   try {
@@ -285,54 +259,48 @@ router.get('/vehicles/:id/location', requireStaff, async (req, res, next) => {
     }
 
     const link = await queryOne(
-      `SELECT id, smartcar_vehicle_id, access_token, refresh_token, token_expires_at, status
+      `SELECT id, smartcar_vehicle_id, sc_user_id, status
          FROM vehicle_smartcar_links WHERE vehicle_id = $1`,
       [id]
     );
     if (!link) return res.status(404).json({ message: 'vehicle is not connected to Smartcar' });
     if (link.status === 'revoked') return res.status(409).json({ message: 'this Smartcar link has been revoked — reconnect from the admin page' });
+    if (!link.sc_user_id) return res.status(409).json({ message: 'this link predates V3 migration — disconnect and reconnect to refresh' });
 
-    let { accessToken, refreshToken } = await decryptedTokens(link);
-
-    // Refresh if expired (or expiring in <60s).
-    const expSoon = new Date(link.token_expires_at).getTime() - Date.now() < 60_000;
-    if (expSoon) {
-      try {
-        const refreshed = await sc.refreshAccess(refreshToken);
-        await saveRefreshedTokens(link.id, refreshed);
-        accessToken = refreshed.accessToken;
-      } catch (e) {
-        await query(`UPDATE vehicle_smartcar_links SET status='error', last_error=$1 WHERE id=$2`, [e.message.slice(0, 500), link.id]);
-        return res.status(502).json({ message: 'token refresh failed — reconnect required', detail: e.message });
-      }
-    }
-
-    let location, odometer, fuel;
+    let location;
     try {
-      location = await sc.getVehicleLocation(link.smartcar_vehicle_id, accessToken);
-      odometer = await sc.getVehicleOdometer(link.smartcar_vehicle_id, accessToken);
-      fuel     = await sc.getVehicleFuel(link.smartcar_vehicle_id, accessToken);
+      location = await sc.fetchLocation({
+        scVehicleId: link.smartcar_vehicle_id,
+        scUserId:    link.sc_user_id
+      });
     } catch (e) {
       await query(`UPDATE vehicle_smartcar_links SET status='error', last_error=$1 WHERE id=$2`, [e.message.slice(0, 500), link.id]);
       return res.status(502).json({ message: 'Smartcar fetch failed', detail: e.message });
     }
 
-    const lat = Number(location?.latitude ?? location?.data?.latitude);
-    const lng = Number(location?.longitude ?? location?.data?.longitude);
-    const scTs = location?.meta?.dataAge ? new Date(location.meta.dataAge) :
-                 (location?.meta?.requestTimestamp ? new Date(location.meta.requestTimestamp) : null);
+    // Defensive parsing — the V3 signal response shape isn't fully
+    // pinned down. Try a few common paths.
+    const d   = location?.data || location;
+    const lat = Number(d?.latitude);
+    const lng = Number(d?.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      await query(`UPDATE vehicle_smartcar_links SET status='error', last_error=$1 WHERE id=$2`,
+        [`Could not extract lat/lng from response: ${JSON.stringify(location).slice(0,400)}`, link.id]);
+      return res.status(502).json({ message: 'Smartcar returned location without valid coordinates' });
+    }
+    const scTs = location?.meta?.timestamp ? new Date(location.meta.timestamp) :
+                 location?.meta?.dataAge   ? new Date(location.meta.dataAge)   :
+                 null;
 
-    // odometer.distance is in km when Smartcar mode is metric (the default)
-    const odoKm = odometer?.distance != null ? Number(odometer.distance) : null;
-    const fuelPct = fuel?.percentRemaining != null ? Number(fuel.percentRemaining) * 100 : null;
-
-    // Write a snapshot (this IS our audit row — fetched_by + fetched_at).
+    // Snapshot row (audit + history). V3's PreciseLocation signal doesn't
+    // include odometer / fuel — those would be separate signal endpoints,
+    // wired later if needed.
     const ins = await queryOne(
       `INSERT INTO vehicle_location_snapshots
          (vehicle_id, latitude, longitude, odometer_km, fuel_percent_remaining, smartcar_timestamp, fetched_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       VALUES ($1, $2, $3, NULL, NULL, $4, $5)
        RETURNING id, fetched_at`,
-      [id, lat, lng, odoKm, fuelPct, scTs, req.user.id]
+      [id, lat, lng, scTs, req.user.id]
     );
 
     await query(`UPDATE vehicle_smartcar_links SET last_synced_at = NOW(), status='active', last_error=NULL WHERE id = $1`, [link.id]);
@@ -341,8 +309,8 @@ router.get('/vehicles/:id/location', requireStaff, async (req, res, next) => {
       vehicle_id:        id,
       latitude:          lat,
       longitude:         lng,
-      odometer_km:       odoKm,
-      fuel_percent:      fuelPct,
+      odometer_km:       null,
+      fuel_percent:      null,
       smartcar_timestamp: scTs,
       fetched_at:        ins.fetched_at,
       snapshot_id:       ins.id,
