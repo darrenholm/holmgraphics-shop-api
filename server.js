@@ -19,6 +19,7 @@ const ordersRoutes       = require('./routes/orders');
 const designsRoutes      = require('./routes/designs');
 const proofsRoutes       = require('./routes/proofs');
 const paymentRoutes      = require('./routes/payment');
+const internalPaymentsRoutes = require('./routes/internal-payments');
 const quoteRoutes        = require('./routes/quote');
 const dtfAdminRoutes     = require('./routes/dtf-admin');
 const ordersAdminRoutes  = require('./routes/orders-admin');
@@ -61,6 +62,9 @@ app.use('/api/orders',       ordersRoutes);
 app.use('/api/designs',      designsRoutes);
 app.use('/api/proofs',       proofsRoutes);
 app.use('/api/payment',       paymentRoutes);
+// /api/internal — public tokenize endpoint for holmgraphics.ca/advertise
+// + shared-secret charge endpoint for led.holmgraphics.ca. Has its own CORS.
+app.use('/api/internal',     internalPaymentsRoutes);
 app.use('/api/quote-request', quoteRoutes);
 app.use('/api/admin/dtf',    dtfAdminRoutes);
 app.use('/api/admin/orders', ordersAdminRoutes);
