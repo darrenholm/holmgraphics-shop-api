@@ -25,6 +25,7 @@
 const express = require('express');
 const cors = require('cors');
 const qbPayments = require('../lib/qb-payments');
+const { query, queryOne } = require('../db/connection');
 
 const router = express.Router();
 
@@ -154,6 +155,126 @@ router.post('/charge', requireInternalKey, async (req, res) => {
     return res.status(status).json({
       error: err.message || 'charge failed',
     });
+  }
+});
+
+// ─── POST /upsert-client (server-to-server only) ──────────────────────────────
+//
+// Find-or-create a client row keyed primarily by email. If business is
+// provided, prefer matching on (email + company) so two different orgs sharing
+// a personal email don't collide. Returns the client id either way.
+
+router.post('/upsert-client', requireInternalKey, async (req, res) => {
+  const { email, name, business, phone } = req.body || {};
+  if (!email || typeof email !== 'string') {
+    return res.status(400).json({ error: 'email is required' });
+  }
+  const normEmail = email.trim().toLowerCase();
+  const company = (business || '').trim();
+  const fullName = (name || '').trim();
+
+  try {
+    // Match strategy:
+    //   1. If business given: exact company + email match.
+    //   2. Otherwise: email match where company is null/blank (so we don't
+    //      attach a personal booking onto an unrelated business client).
+    let match;
+    if (company) {
+      match = await queryOne(
+        `SELECT id FROM clients
+          WHERE LOWER(email) = $1
+            AND LOWER(COALESCE(company, '')) = LOWER($2)
+          LIMIT 1`,
+        [normEmail, company],
+      );
+    } else {
+      match = await queryOne(
+        `SELECT id FROM clients
+          WHERE LOWER(email) = $1
+            AND (company IS NULL OR company = '')
+          LIMIT 1`,
+        [normEmail],
+      );
+    }
+    if (match) {
+      return res.json({ id: match.id, created: false });
+    }
+
+    // Split "First Last" → fname / lname for individuals.
+    let fname = null;
+    let lname = null;
+    if (fullName) {
+      const parts = fullName.split(/\s+/);
+      fname = parts.shift() || null;
+      lname = parts.length > 0 ? parts.join(' ') : null;
+    }
+
+    const created = await queryOne(
+      `INSERT INTO clients (company, fname, lname, email)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [company || null, fname, lname, normEmail],
+    );
+    return res.status(201).json({ id: created.id, created: true });
+  } catch (err) {
+    console.error('[/api/internal/upsert-client]', err);
+    return res.status(500).json({ error: err.message || 'upsert-client failed' });
+  }
+});
+
+// ─── POST /create-project (server-to-server only) ─────────────────────────────
+//
+// Mints a new project row. Used by the LED ad-rental flow on payment so the
+// rental shows up alongside regular jobs on the staff jobs board.
+
+router.post('/create-project', requireInternalKey, async (req, res) => {
+  const {
+    clientId,
+    description,
+    contactName,
+    contactPhone,
+    contactEmail,
+    statusId,
+    projectTypeId,
+    dueDate,
+    poNumber,
+  } = req.body || {};
+
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  if (!description || typeof description !== 'string') {
+    return res.status(400).json({ error: 'description is required' });
+  }
+
+  try {
+    const row = await queryOne(
+      `INSERT INTO projects (
+          description, client_id, project_type_id, status_id,
+          contact_name, contact_phone, contact_email,
+          due_date, po_number, created_date
+       ) VALUES (
+          $1, $2, $3, $4,
+          $5, $6, $7,
+          $8, $9, CURRENT_DATE
+       )
+       RETURNING id`,
+      [
+        description,
+        parseInt(clientId, 10),
+        projectTypeId ? parseInt(projectTypeId, 10) : null,
+        statusId ? parseInt(statusId, 10) : 2,   // 2 = "Ordered" — paid + awaiting work
+        contactName || null,
+        contactPhone || null,
+        contactEmail || null,
+        dueDate ? new Date(dueDate) : null,
+        poNumber ? String(poNumber).trim() || null : null,
+      ],
+    );
+    return res.status(201).json({ id: row.id });
+  } catch (err) {
+    console.error('[/api/internal/create-project]', err);
+    return res.status(500).json({ error: err.message || 'create-project failed' });
   }
 });
 
