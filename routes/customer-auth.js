@@ -484,7 +484,10 @@ router.put('/me', requireCustomer, async (req, res) => {
 // CUSTOMER PORTAL — projects ("current jobs")
 // ═════════════════════════════════════════════════════════════════════════════
 
-const crypto = require('crypto');
+// `crypto` is already required at the top of this file. Don't redeclare —
+// SyntaxError on boot crashes every customer endpoint (login, register,
+// activate, projects), which presents to users as "Failed to fetch" on
+// any /shop/* or /portal/* page.
 
 // What counts as a "current" project for the customer hub:
 //   * status_id BETWEEN 2 AND 10 inclusive — Ordered through "Billing"
@@ -538,6 +541,189 @@ router.get('/projects', requireCustomer, async (req, res) => {
   } catch (err) {
     console.error('GET /customer/projects:', err);
     res.status(500).json({ message: 'Failed to load projects', detail: err.message });
+  }
+});
+
+// GET /api/customer/projects/:id
+//
+// Full detail of one of the customer's projects: header, line items (both
+// manual `items` rows and any joined online-order rows), photos, and the
+// QBO invoice link (if the project has an associated paid order).
+// Authorization is owner-only: project.client_id must equal the JWT id.
+router.get('/projects/:id', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+
+    const project = await queryOne(
+      `SELECT p.id,
+              p.description       AS project_name,
+              p.client_id,
+              p.status_id,
+              s.name              AS status_name,
+              p.due_date,
+              p.created_date,
+              p.po_number,
+              p.contact_email,
+              p.contact_name      AS contact,
+              p.contact_phone,
+              p.production_emp_id AS assigned_id,
+              CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_to,
+              e.email                                   AS assigned_email,
+              pt.name             AS project_type
+         FROM projects p
+         LEFT JOIN status       s  ON p.status_id        = s.id
+         LEFT JOIN project_type pt ON p.project_type_id  = pt.id
+         LEFT JOIN employees    e  ON p.production_emp_id = e.id
+        WHERE p.id = $1
+        LIMIT 1`,
+      [projectId]
+    );
+    if (!project) return res.status(404).json({ message: 'Project not found' });
+    if (project.client_id !== req.customer.id) {
+      // Same 404 as not-found to avoid id enumeration. Treat foreign
+      // project ids as if they don't exist for this customer.
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    // Line items: union of manual items + online-order items.
+    const items = await query(
+      `SELECT id, description AS item_name, qty AS quantity,
+              price AS unit_price, ext_price AS total,
+              'project'::text AS source
+         FROM items
+        WHERE project_id = $1
+        UNION ALL
+       SELECT oi.id,
+              CONCAT(
+                oi.product_name,
+                ' (', oi.color_name,
+                CASE WHEN COALESCE(oi.size, '') <> '' THEN ', ' || oi.size ELSE '' END,
+                ')'
+              ) AS item_name,
+              oi.quantity::numeric AS quantity,
+              oi.unit_price        AS unit_price,
+              oi.line_subtotal     AS total,
+              'order'::text        AS source
+         FROM order_items oi
+         JOIN orders     o ON o.id = oi.order_id
+        WHERE o.job_id = $2`,
+      [projectId, projectId],
+    );
+
+    // Photos (gallery-visible only — customer doesn't need to see staff-internal photos).
+    const photos = await query(
+      `SELECT id, filename, public_url, category, caption, taken_at, created_at
+         FROM project_photos
+        WHERE project_id = $1
+          AND show_in_gallery IS NOT FALSE
+        ORDER BY COALESCE(taken_at, created_at) DESC`,
+      [projectId],
+    );
+
+    // QBO invoice link: look up the linked online order (if any). Most
+    // signage / sign-by-staff projects won't have one — that's fine,
+    // the UI just hides the download/pay buttons in that case.
+    const order = await queryOne(
+      `SELECT id, order_number, qbo_invoice_id, grand_total, payment_method,
+              fulfillment_method
+         FROM orders
+        WHERE job_id = $1
+        ORDER BY id DESC
+        LIMIT 1`,
+      [projectId],
+    );
+
+    // Items total — used by the pay-invoice flow when QBO doesn't have
+    // the invoice yet but the project has line items.
+    const itemsTotal = items.reduce((sum, it) => sum + Number(it.total || 0), 0);
+
+    res.json({
+      project,
+      items,
+      photos,
+      order: order
+        ? {
+            id: order.id,
+            order_number: order.order_number,
+            qbo_invoice_id: order.qbo_invoice_id,
+            grand_total: Number(order.grand_total || 0),
+            payment_method: order.payment_method,
+            fulfillment_method: order.fulfillment_method,
+          }
+        : null,
+      itemsTotal,
+    });
+  } catch (err) {
+    console.error('GET /customer/projects/:id:', err);
+    res.status(500).json({ message: 'Failed to load project', detail: err.message });
+  }
+});
+
+// GET /api/customer/projects/:id/invoice-pdf
+//
+// Streams the QBO Invoice PDF for the customer's project. Only works
+// when the project has a linked online order with qbo_invoice_id set
+// (i.e. our existing /createSalesReceiptFromOrder or /createInvoice
+// flow has already pushed the receipt/invoice to QBO).
+router.get('/projects/:id/invoice-pdf', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+
+    // Owner check + invoice id lookup in one query.
+    const row = await queryOne(
+      `SELECT p.client_id, o.qbo_invoice_id, o.order_number
+         FROM projects p
+         LEFT JOIN orders o ON o.job_id = p.id
+        WHERE p.id = $1
+        ORDER BY o.id DESC
+        LIMIT 1`,
+      [projectId],
+    );
+    if (!row || row.client_id !== req.customer.id) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+    if (!row.qbo_invoice_id) {
+      return res.status(404).json({ message: 'No invoice on file yet for this project.' });
+    }
+
+    // qboSync.qbGet returns parsed JSON; for the PDF we need the raw
+    // bytes, so call the underlying token + fetch directly. Mirrors
+    // the same auth path as the rest of the QBO integration.
+    const { activeTokens } = require('../lib/qbo-tokens');
+    const t = await activeTokens();
+    const base = process.env.NODE_ENV === 'production'
+      ? 'https://quickbooks.api.intuit.com'
+      : 'https://sandbox-quickbooks.api.intuit.com';
+    const url = `${base}/v3/company/${t.realm_id}/invoice/${encodeURIComponent(row.qbo_invoice_id)}/pdf`;
+
+    const qboRes = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${t.access_token}`,
+        Accept:        'application/pdf',
+      },
+    });
+    if (!qboRes.ok) {
+      const text = await qboRes.text();
+      console.error(`QBO invoice PDF fetch failed (${qboRes.status}):`, text.slice(0, 400));
+      return res.status(502).json({ message: 'Could not fetch invoice PDF from QuickBooks.' });
+    }
+
+    const buf = Buffer.from(await qboRes.arrayBuffer());
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="invoice-${row.order_number || row.qbo_invoice_id}.pdf"`,
+    );
+    res.send(buf);
+  } catch (err) {
+    console.error('GET /customer/projects/:id/invoice-pdf:', err);
+    res.status(500).json({ message: 'Invoice PDF unavailable', detail: err.message });
   }
 });
 
