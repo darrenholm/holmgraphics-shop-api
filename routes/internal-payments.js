@@ -325,7 +325,10 @@ router.post('/create-sales-receipt', requireInternalKey, async (req, res) => {
     }
 
     const qbCustomerId = await qboSync.ensureQboCustomer(client);
-    const miscItemId   = await qboSync.findMiscItemId();
+    // Book LED ad rentals against the dedicated ComMarketBoard item so the
+    // income posts to its own ledger. Falls back to Misc internally if the
+    // named item isn't set up in QBO yet.
+    const itemId       = await qboSync.findComMarketBoardItemId();
 
     const amountDollars = cents / 100;
     const txnDate = (() => {
@@ -340,7 +343,7 @@ router.post('/create-sales-receipt', requireInternalKey, async (req, res) => {
       DetailType:  'SalesItemLineDetail',
       Description: String(lineDescription).slice(0, 4000),
       SalesItemLineDetail: {
-        ItemRef:    { value: miscItemId },
+        ItemRef:    { value: itemId },
         UnitPrice:  amountDollars,
         Qty:        1,
         TaxCodeRef: { value: '7' }, // matches the order-receipt convention
