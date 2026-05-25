@@ -662,6 +662,187 @@ router.get('/projects/:id', requireCustomer, async (req, res) => {
   }
 });
 
+// POST /api/customer/projects/:id/pay
+//
+// Customer-initiated payment for one of their projects. Two parts:
+//
+//   1. Tokenize-then-charge via QB Payments (same flow as the LED ad
+//      rental pay path). Card data is tokenized client-side first via
+//      /api/internal/tokenize-public so we never see the raw PAN here.
+//   2. If the project has a linked QBO invoice (orders.qbo_invoice_id),
+//      post a QBO Payment record applying the charge to that invoice
+//      so the customer's balance is marked paid in the accounting
+//      ledger. Best-effort: a QBO Payment failure logs a warning but
+//      doesn't roll back the card charge (the money's already taken;
+//      reconciling the invoice manually is safer than refunding).
+//
+// If the project has NO QBO invoice yet, the charge still goes through
+// — staff can apply it manually in QBO. We don't auto-mint a sales
+// receipt here because that path would skip the staff-side review.
+
+const qbPayments = require('../lib/qb-payments');
+const qboSync = require('../lib/qbo-sync');
+
+router.post('/projects/:id/pay', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const { token, amount, cardBrand, cardLast4 } = req.body || {};
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ message: 'token is required (tokenize the card first via /api/internal/tokenize-public)' });
+    }
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ message: 'amount must be a positive number (dollars)' });
+    }
+
+    // Owner check + invoice link + customer ref for the QBO payment record.
+    const row = await queryOne(
+      `SELECT p.client_id, p.description AS project_name,
+              o.id AS order_id, o.qbo_invoice_id, o.order_number,
+              c.qb_customer_id, c.email AS client_email
+         FROM projects p
+         LEFT JOIN orders  o ON o.job_id = p.id
+         LEFT JOIN clients c ON c.id = p.client_id
+        WHERE p.id = $1
+        ORDER BY o.id DESC
+        LIMIT 1`,
+      [projectId],
+    );
+    if (!row || row.client_id !== req.customer.id) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    // 1. Charge the card. Throws on decline (with err.status=402).
+    let charge;
+    try {
+      charge = await qbPayments.charge({
+        token,
+        amount: amt,
+        currency: 'CAD',
+        description: `Job #${projectId}${row.project_name ? ` — ${row.project_name.slice(0, 80)}` : ''}`,
+        requestId: `proj-${projectId}-${Date.now()}`,  // idempotency
+      });
+    } catch (err) {
+      const isDecline = err.status === 402 ||
+                         /decline/i.test(err.message || '') ||
+                         /CARD_DECLINED/i.test(JSON.stringify(err.body || ''));
+      const status = isDecline ? 402 : 502;
+      return res.status(status).json({
+        message: err.message || 'Charge failed',
+        code: isDecline ? 'card_declined' : 'gateway_error',
+      });
+    }
+
+    // 2. If we have a QBO invoice on file, apply the payment so the
+    //    invoice balance reflects reality. Skip silently otherwise —
+    //    staff will reconcile when they create the invoice.
+    let qboPaymentId = null;
+    if (row.qbo_invoice_id && row.qb_customer_id) {
+      try {
+        const payload = {
+          TotalAmt:    amt,
+          CustomerRef: { value: row.qb_customer_id },
+          PaymentRefNum: String(charge.charge_id).slice(0, 21),
+          PrivateNote: `Customer self-serve payment via /portal for job #${projectId}` +
+                       (row.order_number ? ` (order #${row.order_number})` : ''),
+          Line: [{
+            Amount: amt,
+            LinkedTxn: [{ TxnId: row.qbo_invoice_id, TxnType: 'Invoice' }],
+          }],
+        };
+        const result = await qboSync.qbPost('/payment?minorversion=65', payload);
+        qboPaymentId = result?.Payment?.Id || null;
+      } catch (e) {
+        // Money's taken; the QBO ledger discrepancy is recoverable.
+        console.warn(`[customer/pay] QBO payment apply failed for project ${projectId}:`, e.message);
+      }
+    }
+
+    res.json({
+      ok: true,
+      charge_id: charge.charge_id,
+      amount: amt,
+      currency: 'CAD',
+      card_brand: cardBrand ?? charge.card_brand ?? null,
+      card_last4: cardLast4 ?? charge.card_last4 ?? null,
+      qbo_payment_id: qboPaymentId,
+      applied_to_invoice: !!qboPaymentId,
+    });
+  } catch (err) {
+    console.error('POST /customer/projects/:id/pay:', err);
+    res.status(500).json({ message: 'Payment failed', detail: err.message });
+  }
+});
+
+// POST /api/customer/projects/:id/reorder
+//
+// Re-orders the items from a previous project as a fresh quote. New
+// project's status_id is set to 1 (Quote) and the description is
+// prefixed "Re-order: …". Line items from the source project's `items`
+// rows are copied verbatim; order_items aren't copied because those
+// are tied to a paid online order — re-ordering apparel means going
+// through /shop again.
+router.post('/projects/:id/reorder', requireCustomer, async (req, res) => {
+  try {
+    const sourceId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(sourceId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+
+    const source = await queryOne(
+      `SELECT id, client_id, description, project_type_id, production_emp_id, contact_email,
+              contact_name, contact_phone
+         FROM projects WHERE id = $1`,
+      [sourceId],
+    );
+    if (!source || source.client_id !== req.customer.id) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    const newDescription = `Re-order: ${source.description || `Job #${source.id}`}`.slice(0, 500);
+    const newProject = await queryOne(
+      `INSERT INTO projects (
+          description, client_id, project_type_id,
+          production_emp_id, status_id,
+          contact_name, contact_phone, contact_email,
+          created_date
+       ) VALUES (
+          $1, $2, $3,
+          $4, 1,
+          $5, $6, $7,
+          CURRENT_DATE
+       )
+       RETURNING id`,
+      [
+        newDescription,
+        source.client_id,
+        source.project_type_id,
+        source.production_emp_id,
+        source.contact_name,
+        source.contact_phone,
+        source.contact_email,
+      ],
+    );
+
+    // Copy line items (manual rows only — order_items belong to a paid order).
+    await query(
+      `INSERT INTO items (project_id, description, qty, price, ext_price, qb_item_name)
+       SELECT $1, description, qty, price, ext_price, qb_item_name
+         FROM items
+        WHERE project_id = $2`,
+      [newProject.id, sourceId],
+    );
+
+    res.status(201).json({ id: newProject.id, message: 'Re-order created as a new quote.' });
+  } catch (err) {
+    console.error('POST /customer/projects/:id/reorder:', err);
+    res.status(500).json({ message: 'Re-order failed', detail: err.message });
+  }
+});
+
 // GET /api/customer/projects/:id/invoice-pdf
 //
 // Streams the QBO Invoice PDF for the customer's project. Only works
