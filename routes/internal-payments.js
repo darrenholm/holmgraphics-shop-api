@@ -25,6 +25,7 @@
 const express = require('express');
 const cors = require('cors');
 const qbPayments = require('../lib/qb-payments');
+const qboSync = require('../lib/qbo-sync');
 const { query, queryOne } = require('../db/connection');
 
 const router = express.Router();
@@ -275,6 +276,106 @@ router.post('/create-project', requireInternalKey, async (req, res) => {
   } catch (err) {
     console.error('[/api/internal/create-project]', err);
     return res.status(500).json({ error: err.message || 'create-project failed' });
+  }
+});
+
+// ─── POST /create-sales-receipt (server-to-server only) ───────────────────────
+//
+// Mints a QBO Sales Receipt for an already-charged ad rental. Unlike the
+// orders pipeline (which has its own table + qbo_invoice_id column), this
+// endpoint is fire-and-forget for callers like the LED app: pass in the
+// charge metadata and we'll write the receipt. The returned id is for the
+// caller to persist if they want traceability.
+//
+// Idempotency lives in the caller: pass the same paymentRef twice and QBO
+// will (politely) create two receipts. We don't try to de-dupe here.
+
+router.post('/create-sales-receipt', requireInternalKey, async (req, res) => {
+  const {
+    clientId,
+    lineDescription,
+    amountCents,
+    currency,             // accepted but advisory — QBO uses the company's home currency
+    paymentRef,           // QB Payments charge id, stamped onto the receipt
+    chargeDate,           // ISO date or datetime; defaults to today
+  } = req.body || {};
+
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  if (!lineDescription || typeof lineDescription !== 'string') {
+    return res.status(400).json({ error: 'lineDescription is required' });
+  }
+  const cents = Number(amountCents);
+  if (!Number.isFinite(cents) || cents <= 0) {
+    return res.status(400).json({ error: 'amountCents must be a positive integer' });
+  }
+
+  try {
+    // 1. Load the clients row so ensureQboCustomer can either reuse the
+    //    cached qb_customer_id or auto-create the customer in QBO.
+    const client = await queryOne(
+      `SELECT id, company, fname, lname, email, qb_customer_id
+         FROM clients
+        WHERE id = $1`,
+      [parseInt(clientId, 10)],
+    );
+    if (!client) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+
+    const qbCustomerId = await qboSync.ensureQboCustomer(client);
+    const miscItemId   = await qboSync.findMiscItemId();
+
+    const amountDollars = cents / 100;
+    const txnDate = (() => {
+      try { return new Date(chargeDate || Date.now()).toISOString().slice(0, 10); }
+      catch { return new Date().toISOString().slice(0, 10); }
+    })();
+
+    // Single line item — keeps the receipt clean and matches the way
+    // rentals show up on the staff jobs board ("LED ad rental on <device>").
+    const Line = [{
+      Amount:      amountDollars,
+      DetailType:  'SalesItemLineDetail',
+      Description: String(lineDescription).slice(0, 4000),
+      SalesItemLineDetail: {
+        ItemRef:    { value: miscItemId },
+        UnitPrice:  amountDollars,
+        Qty:        1,
+        TaxCodeRef: { value: '7' }, // matches the order-receipt convention
+      },
+    }];
+
+    const payload = {
+      CustomerRef: { value: qbCustomerId },
+      TxnDate:     txnDate,
+      PrivateNote:
+        `LED ad rental` +
+        (paymentRef ? ` — QB Payments charge ${paymentRef}` : ''),
+      ...(paymentRef ? { PaymentRefNum: String(paymentRef).slice(0, 21) } : {}),
+      Line,
+      TxnTaxDetail: {
+        TxnTaxCodeRef: { value: '7' },
+        TotalTax:      0,
+      },
+      ...(client.email ? { BillEmail: { Address: client.email } } : {}),
+    };
+
+    const result = await qboSync.qbPost('/salesreceipt?minorversion=65', payload);
+    const qboId = result?.SalesReceipt?.Id;
+    if (!qboId) {
+      throw new Error('QBO did not return a SalesReceipt Id');
+    }
+    return res.status(201).json({ id: qboId });
+  } catch (err) {
+    console.error('[/api/internal/create-sales-receipt]', err);
+    // QBO 401/403 → 502 so the caller knows it's a token problem, not their input.
+    const isAuth = err.status === 401 || err.status === 403;
+    return res.status(isAuth ? 502 : 500).json({
+      error: err.message || 'create-sales-receipt failed',
+      ...(err.qbCode ? { qbCode: err.qbCode } : {}),
+    });
   }
 });
 
