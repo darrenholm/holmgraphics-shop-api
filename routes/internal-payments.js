@@ -26,6 +26,7 @@ const express = require('express');
 const cors = require('cors');
 const qbPayments = require('../lib/qb-payments');
 const qboSync = require('../lib/qbo-sync');
+const filesBridge = require('../lib/files-bridge-client');
 const { query, queryOne } = require('../db/connection');
 
 const router = express.Router();
@@ -450,6 +451,236 @@ router.post('/set-client-trust', requireInternalKey, async (req, res) => {
   } catch (err) {
     console.error('[/api/internal/set-client-trust]', err);
     return res.status(500).json({ error: err.message || 'set-client-trust failed' });
+  }
+});
+
+// ─── POST /search-clients (server-to-server only) ─────────────────────────────
+//
+// Lightweight client lookup for the LED admin's "Add ad contract" modal.
+// Accepts a single `q` string and returns up to `limit` matches across
+// email / company / first / last name. Read-only.
+
+router.post('/search-clients', requireInternalKey, async (req, res) => {
+  const { q, limit } = req.body || {};
+  const term = (q || '').toString().trim();
+  if (term.length < 2) {
+    return res.status(400).json({ error: 'q must be at least 2 characters' });
+  }
+  const lim = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const like = `%${term.toLowerCase()}%`;
+  try {
+    const rows = await query(
+      `SELECT id, email, company, fname, lname
+         FROM clients
+        WHERE LOWER(COALESCE(email, ''))   LIKE $1
+           OR LOWER(COALESCE(company, '')) LIKE $1
+           OR LOWER(COALESCE(fname, ''))   LIKE $1
+           OR LOWER(COALESCE(lname, ''))   LIKE $1
+        ORDER BY
+          CASE
+            WHEN LOWER(COALESCE(company, '')) = $2 THEN 0
+            WHEN LOWER(COALESCE(email,   '')) = $2 THEN 1
+            ELSE 2
+          END,
+          company NULLS LAST,
+          lname   NULLS LAST,
+          fname   NULLS LAST
+        LIMIT $3`,
+      [like, term.toLowerCase(), lim],
+    );
+    return res.json({
+      clients: rows.map((r) => ({
+        id:      r.id,
+        email:   r.email,
+        company: r.company,
+        name:    [r.fname, r.lname].filter(Boolean).join(' ') || r.company || r.email,
+      })),
+    });
+  } catch (err) {
+    console.error('[/api/internal/search-clients]', err);
+    return res.status(500).json({ error: err.message || 'search-clients failed' });
+  }
+});
+
+// ─── POST /mirror-ad-artwork (server-to-server only) ──────────────────────────
+//
+// Mirrors an LED ad creative from the LED app's storage (Railway volume) into
+// the client's L:\ files folder. Called best-effort by the LED app after a
+// rental's artwork is set. The LED app keeps its own copy (VNNOX pulls from
+// there) — this just makes the file visible to staff browsing the client
+// folder in Windows Explorer.
+//
+// Body: { sourceUrl, clientId, contractRef, filename, mimeType? }
+//   sourceUrl   — fetchable URL where the artwork currently lives
+//                 (e.g. https://led.holmgraphics.ca/files/uploads/abc.png)
+//   clientId    — shop-api.clients.id
+//   contractRef — short stable label (typically contract uuid prefix)
+//   filename    — desired on-disk filename (will be sanitized)
+//
+// Returns the L:\ path the file landed at. If files-bridge isn't configured
+// or is unreachable, returns 503 — the LED caller is expected to log and
+// move on (the rental still works without the mirror).
+
+router.post('/mirror-ad-artwork', requireInternalKey, async (req, res) => {
+  const { sourceUrl, clientId, contractRef, filename, mimeType } = req.body || {};
+
+  if (!sourceUrl || typeof sourceUrl !== 'string') {
+    return res.status(400).json({ error: 'sourceUrl is required' });
+  }
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  if (!contractRef || !/^[A-Za-z0-9_.\-]+$/.test(String(contractRef))) {
+    return res.status(400).json({ error: 'contractRef must match [A-Za-z0-9_.-]+' });
+  }
+  if (!filename || typeof filename !== 'string') {
+    return res.status(400).json({ error: 'filename is required' });
+  }
+  if (!process.env.FILES_BRIDGE_URL || !process.env.FILES_BRIDGE_API_KEY) {
+    return res.status(503).json({ error: 'files-bridge not configured' });
+  }
+
+  try {
+    // 1. Load the client so we can build the on-disk folder name.
+    const client = await queryOne(
+      `SELECT id, email, company, fname, lname FROM clients WHERE id = $1`,
+      [parseInt(clientId, 10)],
+    );
+    if (!client) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+    // Folder naming priority: company > "First Last" > email local part.
+    // Matches the convention used elsewhere in the shop.
+    const clientFolderName =
+      (client.company && client.company.trim()) ||
+      [client.fname, client.lname].filter(Boolean).join(' ').trim() ||
+      (client.email ? client.email.split('@')[0] : null);
+    if (!clientFolderName) {
+      return res.status(400).json({ error: `client ${clientId} has no name/company/email to derive a folder from` });
+    }
+
+    // 2. Pull the artwork bytes. Use a HEAD-then-GET to surface size early
+    //    and to inherit Content-Type if the caller didn't pass mimeType.
+    const fetchRes = await fetch(sourceUrl);
+    if (!fetchRes.ok) {
+      return res.status(502).json({ error: `source fetch failed: ${fetchRes.status}` });
+    }
+    const fileBuffer = Buffer.from(await fetchRes.arrayBuffer());
+    const inferredMime = fetchRes.headers.get('content-type') || mimeType || 'application/octet-stream';
+
+    // 3. Push to files-bridge.
+    const result = await filesBridge.uploadAdFile({
+      clientName:  clientFolderName,
+      contractRef: String(contractRef),
+      fileName:    filename,
+      fileBuffer,
+      mimeType:    (mimeType && mimeType.trim()) || inferredMime,
+    });
+    return res.json({
+      ok:           true,
+      clientFolder: result.clientFolder,
+      contractFolder: result.contractFolder,
+      path:         result.path,
+      size:         result.size,
+    });
+  } catch (err) {
+    console.error('[/api/internal/mirror-ad-artwork]', err);
+    return res.status(500).json({ error: err.message || 'mirror-ad-artwork failed' });
+  }
+});
+
+// ─── POST /create-rental-invoice (server-to-server only) ──────────────────────
+//
+// Mints a QBO Invoice for a contract renewal. Unlike create-sales-receipt
+// (which records a charge that already happened), this creates an unpaid
+// Invoice with a DueDate and tells QBO to email it to the customer.
+//
+// Idempotency lives in the caller: pass the same contractRef twice and you
+// get two invoices. The LED app's renewal cron should stamp
+// ad_contracts.renewal_invoice_id immediately after a successful call so
+// it doesn't double-bill.
+//
+// Body: { clientId, contractRef, lineDescription, amountCents, dueDate?,
+//         billingEmail? }
+
+router.post('/create-rental-invoice', requireInternalKey, async (req, res) => {
+  const { clientId, contractRef, lineDescription, amountCents, dueDate, billingEmail } = req.body || {};
+
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  if (!lineDescription || typeof lineDescription !== 'string') {
+    return res.status(400).json({ error: 'lineDescription is required' });
+  }
+  const cents = Number(amountCents);
+  if (!Number.isFinite(cents) || cents <= 0) {
+    return res.status(400).json({ error: 'amountCents must be a positive integer' });
+  }
+
+  try {
+    const client = await queryOne(
+      `SELECT id, company, fname, lname, email, qb_customer_id
+         FROM clients WHERE id = $1`,
+      [parseInt(clientId, 10)],
+    );
+    if (!client) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+
+    const billTo = (billingEmail && String(billingEmail).trim()) || client.email || null;
+    const qbCustomerId = await qboSync.ensureQboCustomer(client, billTo ? { email: billTo } : {});
+    const itemId       = await qboSync.findComMarketBoardItemId();
+
+    const amountDollars = cents / 100;
+    const txnDate = new Date().toISOString().slice(0, 10);
+    const due = (() => {
+      if (!dueDate) return null;
+      try { return new Date(dueDate).toISOString().slice(0, 10); }
+      catch { return null; }
+    })();
+
+    const Line = [{
+      Amount:      amountDollars,
+      DetailType:  'SalesItemLineDetail',
+      Description: String(lineDescription).slice(0, 4000),
+      SalesItemLineDetail: {
+        ItemRef:    { value: itemId },
+        UnitPrice:  amountDollars,
+        Qty:        1,
+        TaxCodeRef: { value: '7' },
+      },
+    }];
+
+    const payload = {
+      CustomerRef: { value: qbCustomerId },
+      TxnDate:     txnDate,
+      ...(due ? { DueDate: due } : {}),
+      PrivateNote: `LED ad rental renewal` + (contractRef ? ` — contract ${contractRef}` : ''),
+      Line,
+      TxnTaxDetail: {
+        TxnTaxCodeRef: { value: '7' },
+        TotalTax:      0,
+      },
+      // Telling QBO to email the invoice automatically — same pattern as
+      // createInvoiceFromOrder.
+      ...(billTo
+        ? { BillEmail: { Address: billTo }, EmailStatus: 'NeedToSend' }
+        : {}),
+    };
+
+    const result = await qboSync.qbPost('/invoice?minorversion=65', payload);
+    const qboId = result?.Invoice?.Id;
+    if (!qboId) {
+      throw new Error('QBO did not return an Invoice Id');
+    }
+    return res.status(201).json({ id: qboId, billEmail: billTo });
+  } catch (err) {
+    console.error('[/api/internal/create-rental-invoice]', err);
+    const isAuth = err.status === 401 || err.status === 403;
+    return res.status(isAuth ? 502 : 500).json({
+      error: err.message || 'create-rental-invoice failed',
+      ...(err.qbCode ? { qbCode: err.qbCode } : {}),
+    });
   }
 });
 
