@@ -727,6 +727,100 @@ router.get('/projects/:id/invoice-pdf', requireCustomer, async (req, res) => {
   }
 });
 
+// GET /api/customer/projects/:id/messages
+//
+// Returns the chat thread between the customer and Holm Graphics staff
+// for one of their projects, oldest first so the UI can append the
+// latest at the bottom. Also bumps read_at_customer so the unread badge
+// on the portal hub clears.
+router.get('/projects/:id/messages', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+    // Owner check up-front so we don't leak message presence for other clients.
+    const proj = await queryOne(
+      `SELECT client_id FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    if (!proj || proj.client_id !== req.customer.id) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+    const messages = await query(
+      `SELECT id, author_type, author_id, author_name, body, created_at
+         FROM project_messages
+        WHERE project_id = $1
+        ORDER BY created_at ASC, id ASC`,
+      [projectId],
+    );
+    // Bump the customer's read marker.
+    await query(
+      `INSERT INTO project_message_reads (project_id, read_at_customer)
+       VALUES ($1, NOW())
+       ON CONFLICT (project_id) DO UPDATE SET read_at_customer = NOW()`,
+      [projectId],
+    );
+    res.json({ messages });
+  } catch (err) {
+    console.error('GET /customer/projects/:id/messages:', err);
+    res.status(500).json({ message: 'Failed to load messages', detail: err.message });
+  }
+});
+
+// POST /api/customer/projects/:id/messages   { body }
+//
+// Customer posts a message to the project thread. We email the
+// assigned production employee + the generic SHOP_QUOTES_TO inbox so
+// staff get notified without having to poll the portal.
+router.post('/projects/:id/messages', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    const body = (req.body?.body || '').toString().trim();
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+    if (!body) return res.status(400).json({ message: 'Message body required' });
+    if (body.length > 4000) return res.status(400).json({ message: 'Message too long (4000 char max)' });
+
+    // Owner check + assigned-staff lookup in one shot.
+    const proj = await queryOne(
+      `SELECT p.client_id, p.description AS project_name,
+              e.email AS assigned_email,
+              CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_name
+         FROM projects p
+         LEFT JOIN employees e ON e.id = p.production_emp_id
+        WHERE p.id = $1`,
+      [projectId],
+    );
+    if (!proj || proj.client_id !== req.customer.id) {
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    const inserted = await queryOne(
+      `INSERT INTO project_messages (project_id, author_type, author_id, author_name, body)
+       VALUES ($1, 'customer', $2, $3, $4)
+       RETURNING id, author_type, author_id, author_name, body, created_at`,
+      [projectId, req.customer.id, req.customer.name || req.customer.email, body],
+    );
+
+    // Fire-and-forget staff notification.
+    mailer.sendProjectMessageNotification({
+      recipientEmail: proj.assigned_email || null,
+      audience:       'staff',
+      projectId,
+      projectName:    proj.project_name,
+      authorName:     inserted.author_name,
+      body:           inserted.body,
+    }).catch((e) => console.warn('project-message staff notify failed:', e.message));
+
+    res.status(201).json({ message: inserted });
+  } catch (err) {
+    console.error('POST /customer/projects/:id/messages:', err);
+    res.status(500).json({ message: 'Could not post message', detail: err.message });
+  }
+});
+
 // POST /api/customer/projects/:id/upload-link
 //
 // Customer-initiated equivalent of the staff-minted POST /api/jobs/:id/upload-links.

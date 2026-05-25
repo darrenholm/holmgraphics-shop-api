@@ -511,6 +511,83 @@ router.put('/:id', requireStaff, async (req, res) => {
   }
 });
 
+// ─── GET /api/projects/:id/messages ──────────────────────────────────────────
+//
+// Staff-facing read of the project chat thread (customer ↔ staff). Posting
+// is at POST /api/projects/:id/messages. Same table as the customer endpoint
+// in routes/customer-auth.js — the author_type column discriminates who
+// said what. Touching this endpoint bumps the staff "last read" stamp so
+// the jobs board's unread badge can clear.
+router.get('/:id/messages', requireStaff, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id);
+    const rows = await query(
+      `SELECT id, author_type, author_id, author_name, body, created_at
+         FROM project_messages
+        WHERE project_id = $1
+        ORDER BY created_at ASC, id ASC`,
+      [projectId],
+    );
+    await query(
+      `INSERT INTO project_message_reads (project_id, read_at_staff)
+       VALUES ($1, NOW())
+       ON CONFLICT (project_id) DO UPDATE SET read_at_staff = NOW()`,
+      [projectId],
+    );
+    res.json({ messages: rows });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to load messages', detail: e.message });
+  }
+});
+
+router.post('/:id/messages', requireStaff, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id);
+    const body = (req.body?.body || '').toString().trim();
+    if (!body) return res.status(400).json({ message: 'Message body required' });
+    if (body.length > 4000) return res.status(400).json({ message: 'Message too long (4000 char max)' });
+
+    // Lookup customer email + project name for the notification.
+    const proj = await queryOne(
+      `SELECT p.description AS project_name,
+              c.email AS client_email,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+         FROM projects p
+         LEFT JOIN clients c ON c.id = p.client_id
+        WHERE p.id = $1`,
+      [projectId],
+    );
+    if (!proj) return res.status(404).json({ message: 'Project not found' });
+
+    const authorName = [req.user?.first_name, req.user?.last_name]
+      .filter(Boolean)
+      .join(' ')
+      .trim() || req.user?.email || 'Holm Graphics';
+
+    const inserted = await queryOne(
+      `INSERT INTO project_messages (project_id, author_type, author_id, author_name, body)
+       VALUES ($1, 'staff', $2, $3, $4)
+       RETURNING id, author_type, author_id, author_name, body, created_at`,
+      [projectId, req.user?.id || null, authorName, body],
+    );
+
+    if (proj.client_email) {
+      mailer.sendProjectMessageNotification({
+        recipientEmail: proj.client_email,
+        audience:       'customer',
+        projectId,
+        projectName:    proj.project_name,
+        authorName:     authorName,
+        body:           inserted.body,
+      }).catch((e) => console.warn('project-message customer notify failed:', e.message));
+    }
+
+    res.status(201).json({ message: inserted });
+  } catch (e) {
+    res.status(500).json({ message: 'Could not post message', detail: e.message });
+  }
+});
+
 // ─── GET /api/projects/:id/notes ─────────────────────────────────────────────
 // LEFT JOIN employees so the staff name comes from notes.created_by when the
 // row has it. Historical rows (pre-attribution fix) have created_by NULL and
