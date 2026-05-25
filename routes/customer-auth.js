@@ -217,11 +217,17 @@ async function queueQboCustomerSync(clientId) {
 // LOGIN
 // ═════════════════════════════════════════════════════════════════════════════
 
-// POST /api/customer/login   { email, password }
+// POST /api/customer/login   { email, password, returnPath? }
+//
+// `returnPath` is optional; when provided AND the account is unactivated, we
+// embed it in the activation email so clicking the link lands the customer
+// on the page they were trying to reach (e.g. /advertise/my-ads) instead of
+// the generic /shop/account.
 router.post('/login', async (req, res) => {
   try {
-    const email    = normalizeEmail(req.body.email);
-    const password = req.body.password || '';
+    const email      = normalizeEmail(req.body.email);
+    const password   = req.body.password || '';
+    const returnPath = req.body.returnPath || '';
     if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
 
     const client = await findClientByEmail(email);
@@ -238,7 +244,12 @@ router.post('/login', async (req, res) => {
           WHERE id = $2`,
         [token, client.id]
       );
-      await mailer.sendActivationEmail({ email: client.email, token, name: client.fname || '' });
+      await mailer.sendActivationEmail({
+        email: client.email,
+        token,
+        name: client.fname || '',
+        returnPath,
+      });
       return res.status(403).json({
         message: 'Your account hasn\'t been activated yet. We\'ve emailed you an activation link.',
         code: 'activation_required',
@@ -261,12 +272,17 @@ router.post('/login', async (req, res) => {
 // EXISTING-CUSTOMER ACTIVATION
 // ═════════════════════════════════════════════════════════════════════════════
 
-// POST /api/customer/request-activation   { email }
+// POST /api/customer/request-activation   { email, returnPath? }
 // Used by existing customers (or anyone who wants to claim a record).
 // Always returns 200 to avoid revealing whether an email is on file.
+//
+// `returnPath` is optional; when provided it's embedded in the activation
+// email URL (validated same-origin in the mailer) so the customer lands
+// back on the page they came from after setting their password.
 router.post('/request-activation', async (req, res) => {
   try {
-    const email = normalizeEmail(req.body.email);
+    const email      = normalizeEmail(req.body.email);
+    const returnPath = req.body.returnPath || '';
     if (!isValidEmail(email)) return res.status(400).json({ message: 'Valid email required' });
 
     const client = await findClientByEmail(email);
@@ -277,7 +293,12 @@ router.post('/request-activation', async (req, res) => {
           WHERE id = $2`,
         [token, client.id]
       );
-      await mailer.sendActivationEmail({ email: client.email, token, name: client.fname || '' });
+      await mailer.sendActivationEmail({
+        email: client.email,
+        token,
+        name: client.fname || '',
+        returnPath,
+      });
     }
     res.json({ message: 'If we have a record for that email, we\'ve sent an activation link.' });
   } catch (err) {
