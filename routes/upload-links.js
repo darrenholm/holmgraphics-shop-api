@@ -280,9 +280,11 @@ router.post('/upload-links/:token/upload', upload.single('file'), async (req, re
     // resolution as routes/designs.js so client-uploaded files land
     // alongside customer-uploaded ones in the same job folder.
     const job = await queryOne(
-      `SELECT p.id, c.id AS client_id, c.fname, c.lname, c.company, c.files_folder
+      `SELECT p.id, c.id AS client_id, c.fname, c.lname, c.company, c.files_folder,
+              e.email AS assigned_email
          FROM projects p
-         LEFT JOIN clients c ON c.id = p.client_id
+         LEFT JOIN clients c   ON c.id = p.client_id
+         LEFT JOIN employees e ON e.id = p.production_emp_id
         WHERE p.id = $1
         LIMIT 1`,
       [link.job_id]
@@ -342,11 +344,16 @@ router.post('/upload-links/:token/upload', upload.single('file'), async (req, re
     // Best-effort staff notification. Single-file uploads each fire one
     // email -- in practice staff get a small batch as the client
     // works through their files. If we ever debounce, do it here.
+    //
+    // assignedEmail is the project's production_emp_id employee. We pass
+    // it through so the person actually managing the job gets the alert
+    // directly, on top of the generic SHOP_QUOTES_TO inbox.
     mailer.sendStaffUploadNotification({
       jobNumber:      link.job_id,
       clientName:     clientDisplayName(job),
       recipientEmail: link.recipient_email,
       uploadCount:    1,
+      assignedEmail:  job.assigned_email || null,
     }).catch((e) => console.warn('staff upload notify email failed:', e.message));
 
     res.json({

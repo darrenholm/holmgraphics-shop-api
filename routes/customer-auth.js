@@ -480,4 +480,133 @@ router.put('/me', requireCustomer, async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// CUSTOMER PORTAL — projects ("current jobs")
+// ═════════════════════════════════════════════════════════════════════════════
+
+const crypto = require('crypto');
+
+// What counts as a "current" project for the customer hub:
+//   * status_id BETWEEN 2 AND 10 inclusive — Ordered through "Billing"
+//     (the rough active-production lifecycle, exact upper bound easy to
+//     adjust here as the status table evolves).
+//   * OR status_id = 1 (Quote) created in the last 10 days — so a recent
+//     quote stays visible while the customer reviews it.
+// Anything past status 10 (Complete / Closed) drops out of the "current"
+// view; we can surface a "Past jobs" tab later when that's wanted.
+const CURRENT_STATUS_MIN     = 2;
+const CURRENT_STATUS_MAX     = 10;
+const QUOTE_STATUS_ID        = 1;
+const QUOTE_FRESHNESS_DAYS   = 10;
+
+// GET /api/customer/projects
+router.get('/projects', requireCustomer, async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT p.id,
+              p.description       AS project_name,
+              p.status_id,
+              s.name              AS status_name,
+              p.due_date,
+              p.created_date,
+              p.po_number,
+              p.contact_email,
+              -- production_emp_id is the "managing" employee for the
+              -- customer-facing notification thread (matches the
+              -- assigned-staff convention on the jobs board view).
+              p.production_emp_id AS assigned_id,
+              CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_to,
+              e.email                                   AS assigned_email,
+              pt.name             AS project_type
+         FROM projects p
+         LEFT JOIN status       s  ON p.status_id        = s.id
+         LEFT JOIN project_type pt ON p.project_type_id  = pt.id
+         LEFT JOIN employees    e  ON p.production_emp_id = e.id
+        WHERE p.client_id = $1
+          AND (
+            (p.status_id BETWEEN $2 AND $3)
+            OR (p.status_id = $4 AND p.created_date >= CURRENT_DATE - $5::int)
+          )
+        ORDER BY p.created_date DESC NULLS LAST, p.id DESC`,
+      [
+        req.customer.id,
+        CURRENT_STATUS_MIN, CURRENT_STATUS_MAX,
+        QUOTE_STATUS_ID, QUOTE_FRESHNESS_DAYS,
+      ]
+    );
+    res.json({ projects: rows });
+  } catch (err) {
+    console.error('GET /customer/projects:', err);
+    res.status(500).json({ message: 'Failed to load projects', detail: err.message });
+  }
+});
+
+// POST /api/customer/projects/:id/upload-link
+//
+// Customer-initiated equivalent of the staff-minted POST /api/jobs/:id/upload-links.
+// Verifies the project belongs to the calling customer, then creates a
+// 14-day / 20-upload link, emails an invite, and returns the URL so the
+// portal can redirect the user straight to it.
+//
+// Why we don't authenticate the public upload page itself: the existing
+// /upload/<token> flow already supports drag-and-drop with a single
+// public token, and minting one per request keeps the audit trail
+// (which client requested it, when, and for which project) without
+// rewriting the upload page.
+const UPLOAD_LINK_EXPIRY_DAYS = 14;
+const UPLOAD_LINK_MAX_USES    = 20;
+const PUBLIC_BASE_FOR_LINK    = (process.env.PUBLIC_SHOP_URL || 'https://holmgraphics.ca').replace(/\/$/, '');
+
+router.post('/projects/:id/upload-link', requireCustomer, async (req, res) => {
+  try {
+    const projectId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(projectId)) {
+      return res.status(400).json({ message: 'Project id must be an integer' });
+    }
+    const proj = await queryOne(
+      `SELECT id, client_id, description FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    if (!proj) return res.status(404).json({ message: 'Project not found' });
+    if (proj.client_id !== req.customer.id) {
+      // Same generic message as a 404 so a probing client can't enumerate
+      // project ids belonging to other customers.
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    const token     = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + UPLOAD_LINK_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+    await query(
+      `INSERT INTO client_upload_links
+         (job_id, token, recipient_email, expires_at, max_uploads, created_by_emp_id)
+       VALUES ($1, $2, $3, $4, $5, NULL)`,
+      [projectId, token, req.customer.email, expiresAt, UPLOAD_LINK_MAX_USES]
+    );
+
+    const url = `${PUBLIC_BASE_FOR_LINK}/upload/${token}`;
+
+    // Fire-and-forget invite email (matches the staff-minted flow).
+    mailer.sendArtworkUploadInvite({
+      email:         req.customer.email,
+      recipientName: req.customer.name || req.customer.email,
+      jobNumber:     projectId,
+      uploadUrl:     url,
+      expiresAt,
+      note:          null,
+    }).catch((e) => console.warn('upload-link invite failed:', e.message));
+
+    res.status(201).json({
+      ok: true,
+      url,
+      token,
+      expires_at: expiresAt,
+      max_uploads: UPLOAD_LINK_MAX_USES,
+    });
+  } catch (err) {
+    console.error('POST /customer/projects/:id/upload-link:', err);
+    res.status(500).json({ message: 'Could not create upload link', detail: err.message });
+  }
+});
+
 module.exports = router;
