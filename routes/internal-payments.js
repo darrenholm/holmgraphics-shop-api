@@ -382,4 +382,75 @@ router.post('/create-sales-receipt', requireInternalKey, async (req, res) => {
   }
 });
 
+// ─── POST /lookup-client (server-to-server only) ──────────────────────────────
+//
+// Used by the LED app's self-serve ad portal: when an advertiser tries to
+// swap their on-screen artwork, the LED app calls this to look up the
+// trust_self_serve_ads flag and decide whether the swap should publish
+// instantly or move the rental back to pending_review for admin approval.
+//
+// Read-only; takes no PII risk. Still gated by X-Internal-Key so the flag
+// can't be probed from the public internet.
+
+router.post('/lookup-client', requireInternalKey, async (req, res) => {
+  const { clientId } = req.body || {};
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  try {
+    const row = await queryOne(
+      `SELECT id, email, company, fname, lname, trust_self_serve_ads
+         FROM clients
+        WHERE id = $1`,
+      [parseInt(clientId, 10)],
+    );
+    if (!row) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+    return res.json({
+      id:                    row.id,
+      email:                 row.email,
+      company:               row.company,
+      name:                  [row.fname, row.lname].filter(Boolean).join(' ') ||
+                             row.company || row.email,
+      trust_self_serve_ads:  row.trust_self_serve_ads !== false, // default true if column missing
+    });
+  } catch (err) {
+    console.error('[/api/internal/lookup-client]', err);
+    return res.status(500).json({ error: err.message || 'lookup-client failed' });
+  }
+});
+
+// ─── POST /set-client-trust (server-to-server only) ───────────────────────────
+//
+// Lets the LED admin UI flip clients.trust_self_serve_ads from the rental
+// detail page without needing to hop into the shop-api admin. Audit log
+// lives in QBO / payment history; we don't keep a per-flag history here.
+
+router.post('/set-client-trust', requireInternalKey, async (req, res) => {
+  const { clientId, trust } = req.body || {};
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  if (typeof trust !== 'boolean') {
+    return res.status(400).json({ error: 'trust must be a boolean' });
+  }
+  try {
+    const row = await queryOne(
+      `UPDATE clients
+          SET trust_self_serve_ads = $1
+        WHERE id = $2
+       RETURNING id, trust_self_serve_ads`,
+      [trust, parseInt(clientId, 10)],
+    );
+    if (!row) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+    return res.json({ id: row.id, trust_self_serve_ads: row.trust_self_serve_ads });
+  } catch (err) {
+    console.error('[/api/internal/set-client-trust]', err);
+    return res.status(500).json({ error: err.message || 'set-client-trust failed' });
+  }
+});
+
 module.exports = router;
