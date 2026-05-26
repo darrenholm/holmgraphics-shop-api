@@ -24,9 +24,11 @@
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const qbPayments = require('../lib/qb-payments');
 const qboSync = require('../lib/qbo-sync');
 const filesBridge = require('../lib/files-bridge-client');
+const mailer = require('../lib/customer-mailer');
 const { query, queryOne } = require('../db/connection');
 
 const router = express.Router();
@@ -681,6 +683,57 @@ router.post('/create-rental-invoice', requireInternalKey, async (req, res) => {
       error: err.message || 'create-rental-invoice failed',
       ...(err.qbCode ? { qbCode: err.qbCode } : {}),
     });
+  }
+});
+
+// ─── POST /send-customer-activation (server-to-server only) ──────────────────
+//
+// Triggers the customer activation email for a client by id. Used by the
+// LED app on contract create so the school/ad-client gets a "set up your
+// login" email automatically — they click the link, set a password, and
+// land on /advertise/my-ads with their screen already visible.
+//
+// Idempotent in the soft sense: if the account is already active, we
+// don't re-send (returns alreadyActive=true). If the client has no email
+// on file, we report hasEmail=false so the caller can flag it.
+
+router.post('/send-customer-activation', requireInternalKey, async (req, res) => {
+  const { clientId, returnPath } = req.body || {};
+  if (!clientId || !Number.isFinite(Number(clientId))) {
+    return res.status(400).json({ error: 'clientId is required (integer)' });
+  }
+  try {
+    const client = await queryOne(
+      `SELECT id, email, fname, account_status FROM clients WHERE id = $1`,
+      [parseInt(clientId, 10)]
+    );
+    if (!client) {
+      return res.status(404).json({ error: `client ${clientId} not found` });
+    }
+    if (!client.email) {
+      return res.json({ sent: false, hasEmail: false, alreadyActive: false });
+    }
+    if (client.account_status === 'active') {
+      return res.json({ sent: false, hasEmail: true, alreadyActive: true });
+    }
+
+    // urlSafeToken in customer-auth.js uses crypto.randomBytes; matching it here.
+    const token = crypto.randomBytes(32).toString('hex');
+    await query(
+      `UPDATE clients SET activation_token = $1, activation_sent_at = NOW()
+        WHERE id = $2`,
+      [token, client.id]
+    );
+    await mailer.sendActivationEmail({
+      email: client.email,
+      token,
+      name: client.fname || '',
+      returnPath: returnPath || '/advertise/my-ads',
+    });
+    return res.json({ sent: true, hasEmail: true, alreadyActive: false });
+  } catch (err) {
+    console.error('[/api/internal/send-customer-activation]', err);
+    return res.status(500).json({ error: err.message || 'send-customer-activation failed' });
   }
 });
 
