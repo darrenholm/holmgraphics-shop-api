@@ -31,6 +31,7 @@ const ledModulesRoutes   = require('./routes/led-modules');
 const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
+const quoteSheetRoutes   = require('./routes/quote-sheet');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -69,6 +70,10 @@ app.use('/api/quote-request', quoteRoutes);
 app.use('/api/admin/dtf',    dtfAdminRoutes);
 app.use('/api/admin/orders', ordersAdminRoutes);
 app.use('/api/projects',   projectRoutes);
+// Internal quoting worksheet (new) — mounted at /api so its routes read
+// /api/projects/:id/quote-sheet. Order doesn't matter vs projectRoutes
+// because there's no path collision (no /quote-sheet route in projects.js).
+app.use('/api',            quoteSheetRoutes);
 // /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
 // (parsing "folder-mappings" as an integer id and crashing the query).
