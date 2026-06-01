@@ -923,17 +923,21 @@ router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
   const processedEntries = new Map(); // Track which entries we process
   let skippedNoMapping = 0;
   let skippedAlreadySynced = 0;
+  const unmappedEmployees     = new Set();   // names — for actionable error UI
+  const alreadySyncedEmployees = new Set();
 
   for (const r of rows) {
     // Skip entries already synced to payroll
     if (r.qbo_synced_at) {
       skippedAlreadySynced++;
+      if (r.employee_name) alreadySyncedEmployees.add(r.employee_name);
       continue;
     }
 
     // Skip employees not yet mapped to QBO
     if (!r.qbo_employee_id) {
       skippedNoMapping++;
+      if (r.employee_name) unmappedEmployees.add(r.employee_name);
       continue;
     }
 
@@ -1054,6 +1058,8 @@ router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
     total_hours: Math.round(totalHours * 100) / 100,
     skipped_no_mapping: skippedNoMapping,
     skipped_already_synced: skippedAlreadySynced,
+    unmapped_employees:      [...unmappedEmployees].sort(),
+    already_synced_employees: [...alreadySyncedEmployees].sort(),
     errors,
   });
 });
