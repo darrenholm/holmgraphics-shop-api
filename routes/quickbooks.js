@@ -859,6 +859,35 @@ router.post('/sync-time-period/:id', requireAdmin, async (req, res) => {
   });
 });
 
+// ─── POST /api/quickbooks/sync-payroll/:id/reset ────────────────────────────
+// Clears qbo_synced_at on every entry in a pay period so the next
+// sync-payroll run treats them as fresh. Use when the previous sync
+// reported success but the data didn't land in QB the way you expected
+// — letting you re-run cleanly and look at the verbose response.
+//
+// Does NOT touch QB; any TimeActivity records already created in QB
+// from the previous sync stay there. If you don't want duplicates,
+// delete them in QB → Time → Time Entries first.
+router.post('/sync-payroll/:id/reset', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid pay period id' });
+  }
+  try {
+    const result = await query(
+      `UPDATE time_entries
+          SET qbo_synced_at = NULL
+        WHERE pay_period_id = $1 AND qbo_synced_at IS NOT NULL
+        RETURNING id`,
+      [id]
+    );
+    res.json({ cleared: result.length });
+  } catch (e) {
+    console.error('reset sync flags failed:', e);
+    res.status(500).json({ message: 'reset failed', detail: e.message });
+  }
+});
+
 // ─── POST /api/quickbooks/sync-payroll/:id ──────────────────────────────────
 // Push a pay period's time entries to QBO Payroll as employee hours.
 //
