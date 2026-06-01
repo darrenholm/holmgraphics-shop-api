@@ -561,6 +561,35 @@ router.put('/admin/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── DELETE /api/time/admin/:id ──────────────────────────────────────────────
+// Hard-delete a single entry. Refuses if the entry has already been
+// synced to QuickBooks (qbo_synced_at IS NOT NULL) — deleting at that
+// point would create a payroll/accounting gap. Reverse in QB first if
+// you really need it gone.
+router.delete('/admin/:id', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  try {
+    const existing = await queryOne(
+      `SELECT id, qbo_synced_at, status FROM time_entries WHERE id = $1`,
+      [id]
+    );
+    if (!existing) return res.status(404).json({ message: 'Entry not found.' });
+    if (existing.qbo_synced_at) {
+      return res.status(409).json({
+        message: 'Entry already synced to QuickBooks; reverse it in QB before deleting.'
+      });
+    }
+    await query(`DELETE FROM time_entries WHERE id = $1`, [id]);
+    res.status(204).end();
+  } catch (e) {
+    console.error('DELETE /api/time/admin/:id failed:', e);
+    res.status(500).json({ message: 'Delete failed', detail: e.message });
+  }
+});
+
 // ─── POST /api/time/admin/:id/approve ────────────────────────────────────────
 router.post('/admin/:id/approve', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
