@@ -560,9 +560,14 @@ router.post('/:id/messages', requireStaff, async (req, res) => {
     if (!body) return res.status(400).json({ message: 'Message body required' });
     if (body.length > 4000) return res.status(400).json({ message: 'Message too long (4000 char max)' });
 
-    // Lookup customer email + project name for the notification.
+    // Lookup customer email + project name for the notification. Prefer the
+    // project-level contact_email (set when the job was created — that's the
+    // person actually involved in this job) and fall back to the client's
+    // accounting email only if no contact email was captured. The accounting
+    // address is usually a billing inbox that doesn't read job updates.
     const proj = await queryOne(
       `SELECT p.description AS project_name,
+              p.contact_email,
               c.email AS client_email,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
          FROM projects p
@@ -584,9 +589,12 @@ router.post('/:id/messages', requireStaff, async (req, res) => {
       [projectId, req.user?.id || null, authorName, body],
     );
 
-    if (proj.client_email) {
+    const customerEmail = (proj.contact_email && proj.contact_email.trim())
+      || (proj.client_email && proj.client_email.trim())
+      || null;
+    if (customerEmail) {
       mailer.sendProjectMessageNotification({
-        recipientEmail: proj.client_email,
+        recipientEmail: customerEmail,
         audience:       'customer',
         projectId,
         projectName:    proj.project_name,
@@ -1041,9 +1049,9 @@ async function maybePostToFacebook(photo) {
 // Facebook toggle (fb_post_enabled) + optional caption override (fb_caption).
 // All fields optional; whichever are present in the body get updated.
 //
-// If the resulting state is "in gallery + FB enabled + not yet posted", the
-// photo is posted to the Facebook Page inline (best-effort — a FB failure is
-// recorded but never fails this request or the website publish).
+// This does NOT post to Facebook — it only persists the flags/caption. The
+// actual post is triggered separately via POST .../fb-retry, so the caption
+// can be set first and travels with the post.
 router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
   const id      = parseInt(req.params.id, 10);
   const photoId = parseInt(req.params.photoId, 10);
@@ -1089,11 +1097,10 @@ router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
     );
     if (!updated) return res.status(404).json({ message: 'Photo not found' });
 
-    // Optional second destination: the Facebook Page. Only when the photo is
-    // in the gallery, FB is enabled, and it hasn't already been posted.
-    if (updated.show_in_gallery && updated.fb_post_enabled && !updated.fb_posted) {
-      await maybePostToFacebook(updated);
-    }
+    // NOTE: setting fb_post_enabled here does NOT post — it only records intent
+    // and (optionally) the caption. The actual post is triggered explicitly via
+    // POST .../fb-retry, so the admin can set a caption first and the post fires
+    // with it. Keeps a Facebook failure entirely off the website-publish path.
 
     res.json(updated);
   } catch (e) {
