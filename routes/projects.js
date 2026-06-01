@@ -7,6 +7,7 @@ const { query, queryOne } = db;
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const { runBackfill } = require('../db/backfill-photos');
 const mailer = require('../lib/customer-mailer');
+const facebook = require('../lib/facebook');
 const multer = require('multer');
 const path = require('path');
 const ftp = require('basic-ftp');
@@ -248,6 +249,12 @@ router.get('/photos/all', requireAdmin, async (req, res) => {
               ph.category,
               ph.show_in_gallery,
               ph.uploaded_at,
+              ph.fb_post_enabled,
+              ph.fb_posted,
+              ph.fb_post_id,
+              ph.fb_post_error,
+              ph.fb_caption,
+              ph.fb_posted_at,
               p.description AS project_description,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
          FROM project_photos ph
@@ -265,6 +272,12 @@ router.get('/photos/all', requireAdmin, async (req, res) => {
       category:            r.category,
       show_in_gallery:     r.show_in_gallery,
       uploaded:            r.uploaded_at,
+      fb_post_enabled:     r.fb_post_enabled,
+      fb_posted:           r.fb_posted,
+      fb_post_id:          r.fb_post_id,
+      fb_post_error:       r.fb_post_error,
+      fb_caption:          r.fb_caption,
+      fb_posted_at:        r.fb_posted_at,
       url:                 `${WHC_PUBLIC_BASE}/${r.project_id}/${encodeURIComponent(r.filename)}`,
     }));
     res.json(out);
@@ -982,9 +995,55 @@ router.post('/:id/photos', requireStaff, upload.array('photos', 20), async (req,
   }
 });
 
+// Best-effort Facebook post for a freshly-published gallery photo.
+//
+// A Facebook failure must NEVER fail or roll back the website gallery publish
+// (FB is the secondary destination). So this swallows errors, records them in
+// fb_post_error, and leaves fb_posted=false so the post can be retried. On
+// success it sets fb_posted/fb_post_id/fb_posted_at and clears the error.
+//
+// `photo` is the row already updated by the caller; this MUTATES it in place
+// with the resulting fb_* fields so the caller can return current status.
+async function maybePostToFacebook(photo) {
+  try {
+    // Caption: per-photo override if set, else the parent project's
+    // description (what the website gallery already shows).
+    let caption = photo.fb_caption;
+    if (!caption) {
+      const proj = await queryOne('SELECT description FROM projects WHERE id = $1', [photo.project_id]);
+      caption = proj?.description || '';
+    }
+    const imageUrl = `${WHC_PUBLIC_BASE}/${photo.project_id}/${encodeURIComponent(photo.filename)}`;
+    const { post_id } = await facebook.postPhotoToPage({ imageUrl, caption });
+    const row = await queryOne(
+      `UPDATE project_photos
+          SET fb_posted = TRUE, fb_post_id = $1, fb_posted_at = NOW(), fb_post_error = NULL
+        WHERE id = $2
+        RETURNING fb_posted, fb_post_id, fb_post_error, fb_posted_at`,
+      [post_id, photo.id]
+    );
+    Object.assign(photo, row);
+  } catch (e) {
+    console.warn(`[facebook] post failed for photo ${photo.id}:`, e.message);
+    const row = await queryOne(
+      `UPDATE project_photos
+          SET fb_post_error = $1
+        WHERE id = $2
+        RETURNING fb_posted, fb_post_id, fb_post_error, fb_posted_at`,
+      [e.message, photo.id]
+    );
+    Object.assign(photo, row);
+  }
+}
+
 // ─── PATCH /api/projects/:id/photos/:photoId ─────────────────────────────────
-// Admin curation: flip show_in_gallery and/or change category. Both fields
-// are optional; whichever are present in the body get updated.
+// Admin curation: flip show_in_gallery, change category, and/or set the
+// Facebook toggle (fb_post_enabled) + optional caption override (fb_caption).
+// All fields optional; whichever are present in the body get updated.
+//
+// If the resulting state is "in gallery + FB enabled + not yet posted", the
+// photo is posted to the Facebook Page inline (best-effort — a FB failure is
+// recorded but never fails this request or the website publish).
 router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
   const id      = parseInt(req.params.id, 10);
   const photoId = parseInt(req.params.photoId, 10);
@@ -1002,6 +1061,18 @@ router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
     params.push(normalizeCategory(req.body.category));
     sets.push(`category = $${params.length}`);
   }
+  if (typeof req.body.fb_post_enabled === 'boolean') {
+    params.push(req.body.fb_post_enabled);
+    sets.push(`fb_post_enabled = $${params.length}`);
+  }
+  if (req.body.fb_caption !== undefined) {
+    // Empty/blank caption → null so the post falls back to the project
+    // description rather than posting an empty caption.
+    const raw = req.body.fb_caption;
+    const cap = (raw === null || String(raw).trim() === '') ? null : String(raw).trim();
+    params.push(cap);
+    sets.push(`fb_caption = $${params.length}`);
+  }
   if (sets.length === 0) {
     return res.status(400).json({ message: 'Nothing to update' });
   }
@@ -1011,14 +1082,56 @@ router.patch('/:id/photos/:photoId', requireAdmin, async (req, res) => {
       `UPDATE project_photos
           SET ${sets.join(', ')}
         WHERE id = $${params.length - 1} AND project_id = $${params.length}
-        RETURNING id, filename, category, show_in_gallery, uploaded_at`,
+        RETURNING id, project_id, filename, category, show_in_gallery, uploaded_at,
+                  fb_post_enabled, fb_posted, fb_post_id, fb_post_error,
+                  fb_caption, fb_posted_at`,
       params
     );
     if (!updated) return res.status(404).json({ message: 'Photo not found' });
+
+    // Optional second destination: the Facebook Page. Only when the photo is
+    // in the gallery, FB is enabled, and it hasn't already been posted.
+    if (updated.show_in_gallery && updated.fb_post_enabled && !updated.fb_posted) {
+      await maybePostToFacebook(updated);
+    }
+
     res.json(updated);
   } catch (e) {
     console.error('PATCH /:id/photos/:photoId:', e);
     res.status(500).json({ message: 'Failed to update photo', detail: e.message });
+  }
+});
+
+// ─── POST /api/projects/:id/photos/:photoId/fb-retry ─────────────────────────
+// Admin: retry a Facebook post that previously failed (fb_post_error set,
+// fb_posted still false). Idempotent — if it's already posted, returns the
+// current state without re-posting (the fb_posted guard prevents duplicates).
+router.post('/:id/photos/:photoId/fb-retry', requireAdmin, async (req, res) => {
+  const id      = parseInt(req.params.id, 10);
+  const photoId = parseInt(req.params.photoId, 10);
+  if (!Number.isInteger(id) || !Number.isInteger(photoId)) {
+    return res.status(400).json({ message: 'Invalid id(s)' });
+  }
+  try {
+    const photo = await queryOne(
+      `SELECT id, project_id, filename, category, show_in_gallery, uploaded_at,
+              fb_post_enabled, fb_posted, fb_post_id, fb_post_error,
+              fb_caption, fb_posted_at
+         FROM project_photos
+        WHERE id = $1 AND project_id = $2`,
+      [photoId, id]
+    );
+    if (!photo) return res.status(404).json({ message: 'Photo not found' });
+    if (!photo.show_in_gallery || !photo.fb_post_enabled) {
+      return res.status(400).json({ message: 'Photo is not enabled for Facebook posting' });
+    }
+    if (!photo.fb_posted) {
+      await maybePostToFacebook(photo);
+    }
+    res.json(photo);
+  } catch (e) {
+    console.error('POST /:id/photos/:photoId/fb-retry:', e);
+    res.status(500).json({ message: 'Failed to retry Facebook post', detail: e.message });
   }
 });
 
