@@ -26,23 +26,124 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const { query, queryOne } = require('../db/connection');
 const { extractJobId, stripReplyTrail, parseFromHeader } = require('../lib/inbound-email-parser');
 const mailer = require('../lib/customer-mailer');
 
 const router = express.Router();
 
-function requireInboundSecret(req, res, next) {
-  const expected = process.env.INBOUND_EMAIL_SECRET;
-  if (!expected) {
-    console.warn('[inbound-email] INBOUND_EMAIL_SECRET not set — refusing request.');
+// Auth: accept EITHER a shared-secret header (for the Cloudflare
+// Email Worker path or curl testing) OR a Svix-style signature header
+// (for Resend Inbound). Whichever env is set determines which check
+// runs; both can be set side-by-side. If neither is set the route
+// refuses every request — better fail-closed than allow un-authed posts.
+function verifyInboundAuth(req, res, next) {
+  const sharedSecret = process.env.INBOUND_EMAIL_SECRET;       // X-Inbound-Secret header
+  const svixSecret   = process.env.INBOUND_EMAIL_SVIX_SECRET;  // Resend / Svix webhook signing secret
+
+  // Diagnostic log — helps catch "I set the env var but it's not loading"
+  // bugs that look identical to "no env var configured" at the response
+  // level. Lengths only, never logs the secret value itself.
+  console.log('[inbound-email] auth check', {
+    shared_secret_len: sharedSecret?.length || 0,
+    svix_secret_len:   svixSecret?.length   || 0,
+    has_svix_signature_header:   !!req.headers['svix-signature'],
+    has_x_inbound_secret_header: !!req.headers['x-inbound-secret'],
+  });
+
+  if (!sharedSecret && !svixSecret) {
+    console.warn('[inbound-email] no INBOUND_EMAIL_SECRET or INBOUND_EMAIL_SVIX_SECRET set.');
     return res.status(503).json({ message: 'inbound email not configured' });
   }
-  const provided = req.headers['x-inbound-secret'];
-  if (provided !== expected) {
-    return res.status(401).json({ message: 'invalid inbound secret' });
+
+  // 1. Shared-secret path: header presence + match.
+  if (sharedSecret && req.headers['x-inbound-secret']) {
+    if (req.headers['x-inbound-secret'] !== sharedSecret) {
+      return res.status(401).json({ message: 'invalid inbound secret' });
+    }
+    return next();
   }
-  next();
+
+  // 2. Svix signature path (Resend Inbound). Required headers:
+  //      svix-id, svix-timestamp, svix-signature
+  //    Signature format: "v1,<base64-of-HMAC-SHA256-bytes> v1,<another>..."
+  //    Signed payload:  `${svix_id}.${svix_timestamp}.${rawBody}`
+  //    Key:             base64 of (svix-secret stripped of `whsec_` prefix)
+  if (svixSecret && req.headers['svix-signature']) {
+    try {
+      const svixId   = req.headers['svix-id'];
+      const svixTs   = req.headers['svix-timestamp'];
+      const sigHdr   = req.headers['svix-signature'];
+      const rawBody  = req.rawBody; // populated by the raw-body middleware below
+      if (!svixId || !svixTs || !sigHdr || !rawBody) {
+        return res.status(400).json({ message: 'missing svix headers or raw body' });
+      }
+      // Reject stale signatures (>5 min) to prevent replay.
+      const tsNum = parseInt(svixTs, 10);
+      if (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300) {
+        return res.status(401).json({ message: 'svix timestamp out of window' });
+      }
+      const keyB64 = svixSecret.replace(/^whsec_/, '');
+      const key = Buffer.from(keyB64, 'base64');
+      const signedPayload = `${svixId}.${svixTs}.${rawBody}`;
+      const expected = crypto.createHmac('sha256', key).update(signedPayload).digest('base64');
+      // Header lists multiple "v1,<sig>" separated by spaces — accept if any match.
+      const provided = sigHdr.split(' ').map((p) => p.split(',')[1]).filter(Boolean);
+      const ok = provided.some((p) => {
+        try { return crypto.timingSafeEqual(Buffer.from(p), Buffer.from(expected)); }
+        catch { return false; }
+      });
+      if (!ok) return res.status(401).json({ message: 'svix signature mismatch' });
+      return next();
+    } catch (e) {
+      console.warn('[inbound-email] svix verify error:', e.message);
+      return res.status(401).json({ message: 'svix verify failed' });
+    }
+  }
+
+  return res.status(401).json({ message: 'no recognized auth header' });
+}
+
+// Resend Inbound + many other webhook sources wrap the email in a
+// { type, data: {...} } envelope; the Cloudflare Worker we ship sends
+// a flat shape. Normalize to one internal representation so the
+// handler below stays simple.
+function normalizeInboundBody(body) {
+  if (!body || typeof body !== 'object') return {};
+  // Resend / Svix-style: { type: 'email.received', data: {...} }
+  if (body.data && typeof body.data === 'object' && body.type) {
+    const d = body.data;
+    // Resend's 'to' is an array; we only care about the first match.
+    const to = Array.isArray(d.to) ? d.to[0] : (d.to || '');
+    // Headers may come as an object map or an array of {name, value}.
+    let messageId = d.message_id || null;
+    if (!messageId && d.headers) {
+      if (Array.isArray(d.headers)) {
+        const h = d.headers.find((x) => /^message[-_]?id$/i.test(x?.name || ''));
+        if (h) messageId = h.value;
+      } else if (typeof d.headers === 'object') {
+        messageId = d.headers['message-id'] || d.headers['Message-ID'] || null;
+      }
+    }
+    return {
+      to,
+      from:       d.from?.email || d.from || '',
+      subject:    d.subject || '',
+      text:       d.text || '',
+      html:       d.html || '',
+      message_id: messageId,
+    };
+  }
+  // Flat / Cloudflare Worker shape.
+  return {
+    to:         body.to || '',
+    from:       body.from || '',
+    subject:    body.subject || '',
+    text:       body.text || '',
+    html:       body.html || '',
+    message_id: body.message_id || null,
+  };
 }
 
 // Body shape (from the Cloudflare Worker):
@@ -54,9 +155,17 @@ function requireInboundSecret(req, res, next) {
 //     html:        string  (optional, ignored for now)
 //     message_id:  string  (Message-ID header, used for dedup)
 //   }
-router.post('/projects/messages/inbound', express.json({ limit: '5mb' }), requireInboundSecret, async (req, res, next) => {
+// Capture the raw request body before JSON parsing — needed to verify
+// the Svix signature, which is computed over the exact bytes Resend
+// sent.
+const captureRaw = express.json({
+  limit: '5mb',
+  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+});
+
+router.post('/projects/messages/inbound', captureRaw, verifyInboundAuth, async (req, res, next) => {
   try {
-    const b = req.body || {};
+    const b = normalizeInboundBody(req.body);
     const to = String(b.to || '').trim();
     const fromRaw = String(b.from || '').trim();
     const subject = String(b.subject || '').trim();

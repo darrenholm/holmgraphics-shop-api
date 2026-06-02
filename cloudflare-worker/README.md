@@ -6,128 +6,149 @@ the **Messages** tab on each project automatically.
 The pieces:
 
 ```
-  Customer hits reply → Cloudflare Email Routing (reply.holmgraphics.ca)
-   → Email Worker → POST /api/projects/messages/inbound (this API)
+  Customer hits reply → MX for reply.holmgraphics.ca picks it up
+   → webhook source (Resend Inbound OR Cloudflare Email Worker)
+   → POST /api/projects/messages/inbound (this API)
    → insert row in project_messages
    → notify the OTHER party so the thread feels live
 ```
 
-## Step 1 — Generate a shared secret
+There are two supported webhook sources:
 
-Pick a long random string. On macOS/Linux:
+- **Resend Inbound** (recommended for the Holm Graphics setup since
+  Cloudflare's Email Routing would conflict with the M365 MX records
+  on the apex `holmgraphics.ca`). Resend handles MX + parsing +
+  signature-signing.
+- **Cloudflare Email Worker** (alternative — only works if your apex
+  email isn't already routing through another MX provider). Code
+  for it lives next to this README in `inbound-email-worker.js`.
 
-```bash
-openssl rand -hex 32
-```
+The API webhook handler in `routes/inbound-email.js` accepts both
+shapes; pick whichever fits your DNS situation.
 
-You'll paste this string in two places: as `INBOUND_EMAIL_SECRET` on
-Railway, and as `INBOUND_SECRET` on the Cloudflare Worker.
+---
 
-## Step 2 — Railway env vars
+## Path A — Resend Inbound (recommended)
 
-In Railway → `holmgraphics-shop-api` → Variables, add:
+### Step 1 — Pick the inbound subdomain & confirm Resend Inbound is enabled
+
+We use `reply.holmgraphics.ca` so the apex zone's M365 MX records
+stay untouched.
+
+In Resend: **Domains → Add domain → `reply.holmgraphics.ca`**. On the
+domain's detail page, look for an **Inbound** or **Receiving**
+section. If it's there, you're set. If not, contact Resend support to
+have inbound enabled on your account — Pro plan typically includes
+it.
+
+### Step 2 — Add the MX + SPF DNS records in Cloudflare
+
+Resend will give you MX records to add (something like
+`feedback-smtp.us-east-1.amazonses.com` with priority 10, plus a SPF
+TXT). Add them in Cloudflare DNS:
+
+1. Cloudflare dashboard → DNS → Records → **Add record**.
+2. Type: **MX**, Name: `reply`, Mail server: (the host Resend gave
+   you), Priority: (per Resend), Proxy: DNS only (orange-cloud OFF).
+3. Add any additional MX or SPF/TXT records Resend lists. Keep them
+   scoped to the `reply` subdomain — never edit the apex MX.
+4. Wait a minute, then in Resend's domain page click **Verify** /
+   re-check status.
+
+### Step 3 — Configure the webhook endpoint in Resend
+
+In Resend: **Webhooks → Add Endpoint**:
+
+- URL: `https://<your-railway-api>.up.railway.app/api/projects/messages/inbound`
+- Events: `email.received` (and any other inbound events Resend
+  shows).
+
+After saving, Resend gives you a **Signing Secret** that starts with
+`whsec_`. Copy it.
+
+### Step 4 — Railway env vars
+
+In Railway → `holmgraphics-shop-api` → Variables:
 
 | Variable | Value |
 |---|---|
-| `INBOUND_EMAIL_SECRET` | (the random string from step 1) |
 | `INBOUND_EMAIL_DOMAIN` | `reply.holmgraphics.ca` |
+| `INBOUND_EMAIL_SVIX_SECRET` | `whsec_…` (the Resend signing secret from step 3) |
 
-Save — Railway will redeploy automatically. The outbound message
-template will now use `Reply-To: <staff>+jobNNN@reply.holmgraphics.ca`.
+Save — Railway redeploys. The outbound `Reply-To` will now use the
+inbound subdomain, and the webhook will verify Resend's signature on
+every inbound POST.
 
-## Step 3 — DNS for the subdomain
+### Step 5 — Test
 
-In Cloudflare DNS for `holmgraphics.ca`:
+1. From `/jobs/<id>` → Messages tab, post a test message to a job
+   whose `contact_email` you control.
+2. Hit reply in the customer's mailbox, send.
+3. Within ~30 seconds the reply should land in that same Messages
+   tab as a customer message.
+4. Forward an unrelated customer email to
+   `job<id>@reply.holmgraphics.ca` and confirm it appears too,
+   authored as you.
 
-1. Verify the apex `holmgraphics.ca` MX records still point at WHC
-   (so the regular `darren@holmgraphics.ca`, `frontdesk@…` mailboxes
-   are unaffected). Don't touch them.
-2. Cloudflare will add MX records for the `reply` subdomain
-   automatically when you enable Email Routing in step 4 — you don't
-   add anything manually here.
+If something's off, check **Resend → Webhooks → your endpoint →
+Logs** — it shows every POST attempt and the API's response code.
 
-## Step 4 — Cloudflare Email Routing
+---
 
-1. Cloudflare dashboard → **Email** → **Email Routing**.
-2. Pick the `holmgraphics.ca` zone.
-3. **Enable Email Routing** if not already on. Cloudflare will prompt
-   to add MX records on the apex — **only do this if your existing
-   apex email already routes through Cloudflare**. If apex email is
-   still on WHC (likely), **skip the apex** and only configure the
-   subdomain in the next step.
-4. Once enabled, go to **Settings → Custom Address** (or **Routes**)
-   and add:
-   - Custom address: `*@reply.holmgraphics.ca` (catch-all on the
-     subdomain)
-   - Destination: **Send to Worker** → pick the worker from step 5.
-5. Cloudflare will add MX records for `reply.holmgraphics.ca`
-   automatically.
+## Path B — Cloudflare Email Worker (only if your apex MX is unused)
 
-(If Email Routing complains about needing apex MX changes, configure
-a subdomain-only zone instead — `reply.holmgraphics.ca` as a child
-zone with its own MX. Cloudflare support has a doc on this; ask in
-chat if it gets stuck.)
+**Don't use this path if you have apex MX records you can't touch
+(e.g. M365 / Outlook).** Cloudflare Email Routing onboarding wants
+to own the whole zone's MX. Skip to Path A.
 
-## Step 5 — Deploy the Cloudflare Email Worker
+If apex email IS available to take over, the Worker code in
+`inbound-email-worker.js` posts to the same webhook. Setup:
 
-1. Cloudflare dashboard → **Workers & Pages** → **Create application**
-   → **Create Worker**. Name it `inbound-email-worker`.
-2. Replace the default code with the contents of
-   `inbound-email-worker.js` (in this folder).
-3. The Worker uses `postal-mime` for MIME parsing — add it to
-   **Settings → Bindings → npm packages** (or in `wrangler.toml` if
-   you deploy via CLI):
-   ```bash
-   npm install postal-mime
-   ```
-4. **Settings → Variables and Secrets** — add:
-   - `API_WEBHOOK_URL` = `https://<your-railway-api>.up.railway.app/api/projects/messages/inbound`
-     (use your production URL)
-   - `INBOUND_SECRET` = (the random string from step 1)
-5. **Save and Deploy**.
-6. Go back to Email Routing and confirm the route from step 4 points
-   at this worker.
+1. Generate a long random secret (e.g.
+   `-join (1..64 | % { '0123456789abcdef'[(Get-Random -Max 16)] })`
+   in PowerShell), and set it as both:
+   - Railway env `INBOUND_EMAIL_SECRET`
+   - Cloudflare Worker env `INBOUND_SECRET` (plus `API_WEBHOOK_URL`
+     for the API endpoint URL).
+2. In Cloudflare → Email → Email Routing → enable for the zone (this
+   replaces your apex MX with Cloudflare's). Add a Custom Address
+   route `*@reply.holmgraphics.ca` → **Send to Worker**.
+3. Deploy `inbound-email-worker.js` (it depends on the `postal-mime`
+   npm package for MIME parsing). Point the route at this worker.
 
-## Step 6 — Test
+---
 
-1. Send a message from `/jobs/<id>` Messages tab to a job whose
-   contact email you control.
-2. The email lands in the customer mailbox. Hit **Reply** in your
-   email client — body should auto-include "Re: New message on your
-   job #N".
-3. Send.
-4. Within ~30 seconds the reply should appear in the same job's
-   Messages tab as a customer message.
-5. Cloudflare Worker logs (Workers → your worker → Logs) show the
-   POST result. Railway logs show the webhook hit.
+## What the webhook does
 
-## Forwarding an external email into a job
+For every inbound:
 
-To file an email you got directly from a customer (outside the
-system) into the Messages tab, forward it to:
+1. Extracts the job id from the To address (`...+job1234@…` or
+   `job1234@…`).
+2. Looks up the project + assigned staff + customer contact.
+3. Classifies the sender as **staff** (matches `employees.email`) or
+   **customer**.
+4. Strips the quoted-reply trail using a heuristic that covers Gmail,
+   Outlook, Apple Mail, and Resend's own templates.
+5. Inserts a row in `project_messages` with the appropriate
+   `author_type`. Dedupes via `Message-ID`.
+6. Sends a notification email to the OTHER party so they see the
+   message in real time — customer reply → notify assigned staff,
+   staff forward → notify customer.
 
-```
-job<id>@reply.holmgraphics.ca
-```
-
-e.g., `job1234@reply.holmgraphics.ca`. The same worker + webhook
-handles it; it'll show in the Messages tab authored by your name
-(since it's coming from your staff email), with the forwarded body.
+---
 
 ## Troubleshooting
 
-- **Webhook returns 401**: the Worker's `INBOUND_SECRET` doesn't match
-  Railway's `INBOUND_EMAIL_SECRET`. Re-paste, redeploy worker.
-- **Webhook returns 400 "no recognizable job tag"**: the To address
-  doesn't have `jobNNN` in the local part. Confirm the customer
-  replied to the original message and didn't change the To field.
-- **Webhook returns 404 "job not found"**: the job id was extracted
-  but no such project exists. Did the job get deleted? Was the id
-  mangled?
-- **Email reaches the customer but reply doesn't come back**: check
-  Cloudflare Workers logs for parse errors, and Email Routing log
-  for delivery status. The receiving address must match
-  `*@reply.holmgraphics.ca`.
-- **Quoted-reply trail still appears in stored messages**: our
-  `stripReplyTrail` heuristic missed the marker. Forward me an
-  example and I'll widen the regex.
+- **401 svix signature mismatch**: the signing secret on Railway
+  doesn't match what Resend has for that endpoint. Regenerate in
+  Resend, paste fresh into `INBOUND_EMAIL_SVIX_SECRET`, redeploy.
+- **400 "no recognizable job tag"**: the address didn't have
+  `jobNNN` in the local part. Customer changed the To field on
+  their reply, or the forward target was mistyped.
+- **404 "job not found"**: id extracted but project was deleted.
+- **No notification reaches the customer/staff side**: open Resend
+  logs (the *outbound* side) and confirm the notification email was
+  accepted. Check Railway logs around the same timestamp.
+- **Reply trail still appears in the stored body**: the heuristic
+  missed the marker your client uses. Forward me an example email
+  and I'll widen the regex.
