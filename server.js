@@ -32,6 +32,7 @@ const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
+const inboundEmailRoutes = require('./routes/inbound-email');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -74,6 +75,9 @@ app.use('/api/projects',   projectRoutes);
 // /api/projects/:id/quote-sheet. Order doesn't matter vs projectRoutes
 // because there's no path collision (no /quote-sheet route in projects.js).
 app.use('/api',            quoteSheetRoutes);
+// Inbound email webhook (POST /api/projects/messages/inbound). Auth is
+// via the X-Inbound-Secret header; see routes/inbound-email.js.
+app.use('/api',            inboundEmailRoutes);
 // /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
 // (parsing "folder-mappings" as an integer id and crashing the query).
