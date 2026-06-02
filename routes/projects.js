@@ -560,18 +560,24 @@ router.post('/:id/messages', requireStaff, async (req, res) => {
     if (!body) return res.status(400).json({ message: 'Message body required' });
     if (body.length > 4000) return res.status(400).json({ message: 'Message too long (4000 char max)' });
 
-    // Lookup customer email + project name for the notification. Prefer the
-    // project-level contact_email (set when the job was created — that's the
-    // person actually involved in this job) and fall back to the client's
-    // accounting email only if no contact email was captured. The accounting
-    // address is usually a billing inbox that doesn't read job updates.
+    // Lookup customer email + project name + assigned-staff email for the
+    // notification. Prefer the project-level contact_email (set when the
+    // job was created — that's the person actually involved in this job)
+    // and fall back to the client's accounting email only if no contact
+    // email was captured. The accounting address is usually a billing
+    // inbox that doesn't read job updates. Also grab the assigned staff
+    // member's email so customer replies can route directly to them
+    // rather than a generic ops inbox.
     const proj = await queryOne(
       `SELECT p.description AS project_name,
               p.contact_email,
               c.email AS client_email,
-              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              e.email AS assigned_email,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name
          FROM projects p
-         LEFT JOIN clients c ON c.id = p.client_id
+         LEFT JOIN clients   c ON c.id = p.client_id
+         LEFT JOIN employees e ON e.id = p.production_emp_id
         WHERE p.id = $1`,
       [projectId],
     );
@@ -600,6 +606,10 @@ router.post('/:id/messages', requireStaff, async (req, res) => {
         projectName:    proj.project_name,
         authorName:     authorName,
         body:           inserted.body,
+        // Customer replies route to the assigned staff member first; fall
+        // back to the global SHOP_QUOTES_TO inbox when the job is
+        // unassigned (set inside the mailer).
+        replyToEmail:   (proj.assigned_email && proj.assigned_email.trim()) || null,
       }).catch((e) => console.warn('project-message customer notify failed:', e.message));
     }
 
