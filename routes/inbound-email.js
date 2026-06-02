@@ -145,6 +145,7 @@ function normalizeInboundBody(body) {
       text:       d.text || '',
       html:       d.html || '',
       message_id: messageId,
+      email_id:   d.email_id || null,
     };
   }
   // Flat / Cloudflare Worker shape.
@@ -155,7 +156,31 @@ function normalizeInboundBody(body) {
     text:       body.text || '',
     html:       body.html || '',
     message_id: body.message_id || null,
+    email_id:   body.email_id || null,
   };
+}
+
+// Resend's email.received webhook only carries metadata — the actual
+// text/html body has to be fetched separately via their REST API
+// using the email_id. Returns { text, html } or null on failure.
+async function fetchResendEmailBody(emailId) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || !emailId) return null;
+  try {
+    const res = await fetch(`https://api.resend.com/emails/${encodeURIComponent(emailId)}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      console.warn(`[inbound-email] Resend GET /emails/${emailId} -> ${res.status}: ${detail.slice(0, 200)}`);
+      return null;
+    }
+    const json = await res.json();
+    return { text: json.text || '', html: json.html || '' };
+  } catch (e) {
+    console.warn('[inbound-email] Resend API fetch threw:', e.message);
+    return null;
+  }
 }
 
 // Body shape (from the Cloudflare Worker):
@@ -175,10 +200,38 @@ router.post('/projects/messages/inbound', verifyInboundAuth, async (req, res, ne
     const to = String(b.to || '').trim();
     const fromRaw = String(b.from || '').trim();
     const subject = String(b.subject || '').trim();
-    const textBody = String(b.text || '').trim();
+    let textBody = String(b.text || '').trim();
+    const htmlBody = String(b.html || '').trim();
     const messageId = b.message_id ? String(b.message_id).trim() : null;
 
+    // Resend's email.received webhook payload doesn't include the body.
+    // Fall back to their REST API to fetch text/html using email_id.
+    if (!textBody && b.email_id) {
+      const fetched = await fetchResendEmailBody(b.email_id);
+      if (fetched) {
+        textBody = (fetched.text || '').trim();
+        if (!textBody && fetched.html) {
+          // Crude html→text if Resend only gave us html. Strip tags
+          // and collapse whitespace — good enough for messages tab
+          // display until we want true rich rendering.
+          textBody = fetched.html
+            .replace(/<style[\s\S]*?<\/style>/gi, '')
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/p>/gi, '\n\n')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+        }
+      }
+    }
+
     if (!to || !fromRaw || !textBody) {
+      console.warn('[inbound-email] missing required fields after normalize + fetch', {
+        has_to: !!to, has_from: !!fromRaw, has_text: !!textBody, email_id: b.email_id,
+      });
       return res.status(400).json({ message: 'to, from, and text are required' });
     }
 
