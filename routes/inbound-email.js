@@ -167,15 +167,9 @@ function normalizeInboundBody(body) {
 //     html:        string  (optional, ignored for now)
 //     message_id:  string  (Message-ID header, used for dedup)
 //   }
-// Capture the raw request body before JSON parsing — needed to verify
-// the Svix signature, which is computed over the exact bytes Resend
-// sent.
-const captureRaw = express.json({
-  limit: '5mb',
-  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
-});
-
-router.post('/projects/messages/inbound', captureRaw, verifyInboundAuth, async (req, res, next) => {
+// req.rawBody is populated globally in server.js's express.json verify
+// hook (so it's available here for Svix signature verification).
+router.post('/projects/messages/inbound', verifyInboundAuth, async (req, res, next) => {
   try {
     const b = normalizeInboundBody(req.body);
     const to = String(b.to || '').trim();

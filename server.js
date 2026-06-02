@@ -54,7 +54,14 @@ app.use(cors({
 }));
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
-app.use(express.json());
+// The `verify` hook stashes the raw request body on req.rawBody for
+// routes that need to verify HMAC signatures over the exact bytes the
+// sender signed (currently just /api/projects/messages/inbound for
+// Resend Inbound webhooks). Negligible overhead — one buffer→string
+// copy per request, never logged.
+app.use(express.json({
+  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+}));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth',       authRoutes);
