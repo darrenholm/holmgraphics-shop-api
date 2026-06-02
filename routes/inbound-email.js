@@ -44,12 +44,20 @@ function verifyInboundAuth(req, res, next) {
 
   // Diagnostic log — helps catch "I set the env var but it's not loading"
   // bugs that look identical to "no env var configured" at the response
-  // level. Lengths only, never logs the secret value itself.
+  // level. Lengths only, never logs the secret value itself. Includes
+  // every Svix-style header presence flag so we can see exactly what
+  // naming the source is using (svix-* vs webhook-*).
   console.log('[inbound-email] auth check', {
     shared_secret_len: sharedSecret?.length || 0,
     svix_secret_len:   svixSecret?.length   || 0,
-    has_svix_signature_header:   !!req.headers['svix-signature'],
-    has_x_inbound_secret_header: !!req.headers['x-inbound-secret'],
+    raw_body_len:      req.rawBody?.length  || 0,
+    headers_svix_id:        !!req.headers['svix-id'],
+    headers_svix_timestamp: !!req.headers['svix-timestamp'],
+    headers_svix_signature: !!req.headers['svix-signature'],
+    headers_webhook_id:        !!req.headers['webhook-id'],
+    headers_webhook_timestamp: !!req.headers['webhook-timestamp'],
+    headers_webhook_signature: !!req.headers['webhook-signature'],
+    headers_x_inbound_secret:  !!req.headers['x-inbound-secret'],
   });
 
   if (!sharedSecret && !svixSecret) {
@@ -65,17 +73,21 @@ function verifyInboundAuth(req, res, next) {
     return next();
   }
 
-  // 2. Svix signature path (Resend Inbound). Required headers:
-  //      svix-id, svix-timestamp, svix-signature
+  // 2. Svix signature path (Resend Inbound). Required headers, with
+  //    optional alternate naming (Resend supports both svix-* and
+  //    webhook-* — different webhooks use different prefixes):
+  //      svix-id        OR webhook-id
+  //      svix-timestamp OR webhook-timestamp
+  //      svix-signature OR webhook-signature
   //    Signature format: "v1,<base64-of-HMAC-SHA256-bytes> v1,<another>..."
-  //    Signed payload:  `${svix_id}.${svix_timestamp}.${rawBody}`
+  //    Signed payload:  `${id}.${timestamp}.${rawBody}`
   //    Key:             base64 of (svix-secret stripped of `whsec_` prefix)
-  if (svixSecret && req.headers['svix-signature']) {
+  const sigHdr = req.headers['svix-signature'] || req.headers['webhook-signature'];
+  if (svixSecret && sigHdr) {
     try {
-      const svixId   = req.headers['svix-id'];
-      const svixTs   = req.headers['svix-timestamp'];
-      const sigHdr   = req.headers['svix-signature'];
-      const rawBody  = req.rawBody; // populated by the raw-body middleware below
+      const svixId  = req.headers['svix-id']        || req.headers['webhook-id'];
+      const svixTs  = req.headers['svix-timestamp'] || req.headers['webhook-timestamp'];
+      const rawBody = req.rawBody; // populated by the raw-body middleware below
       if (!svixId || !svixTs || !sigHdr || !rawBody) {
         return res.status(400).json({ message: 'missing svix headers or raw body' });
       }
