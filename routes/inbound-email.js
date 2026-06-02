@@ -161,18 +161,21 @@ function normalizeInboundBody(body) {
 }
 
 // Resend's email.received webhook only carries metadata — the actual
-// text/html body has to be fetched separately via their REST API
-// using the email_id. Returns { text, html } or null on failure.
+// text/html body has to be fetched separately via their REST API.
+// The endpoint for INBOUND emails is /emails/receiving/{id}, NOT the
+// /emails/{id} endpoint that serves outbound sends (that one returns
+// 404 for inbound ids). Returns { text, html } or null on failure.
 async function fetchResendEmailBody(emailId) {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey || !emailId) return null;
   try {
-    const res = await fetch(`https://api.resend.com/emails/${encodeURIComponent(emailId)}`, {
+    const url = `https://api.resend.com/emails/receiving/${encodeURIComponent(emailId)}`;
+    const res = await fetch(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      console.warn(`[inbound-email] Resend GET /emails/${emailId} -> ${res.status}: ${detail.slice(0, 200)}`);
+      console.warn(`[inbound-email] Resend ${url} -> ${res.status}: ${detail.slice(0, 200)}`);
       return null;
     }
     const json = await res.json();
