@@ -28,7 +28,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { query, queryOne } = require('../db/connection');
-const { extractJobId, stripReplyTrail, parseFromHeader } = require('../lib/inbound-email-parser');
+const { extractJobId, stripReplyTrail, parseFromHeader, isForwardedEmail } = require('../lib/inbound-email-parser');
 const mailer = require('../lib/customer-mailer');
 
 const router = express.Router();
@@ -286,12 +286,20 @@ router.post('/projects/messages/inbound', verifyInboundAuth, async (req, res, ne
       ? `${employee.first_name || ''} ${employee.last_name || ''}`.trim() || 'Staff'
       : (fromName || fromEmail || 'Customer');
 
-    // Strip quoted trail. If stripping leaves nothing (edge case where
-    // the customer wrote only inline replies, or our heuristics over-
-    // matched), fall back to the raw body — better to keep something
-    // ugly than to drop the message.
-    let body = stripReplyTrail(textBody);
-    if (!body) body = textBody;
+    // For REPLIES, strip the quoted-reply trail so we don't store an
+    // entire conversation history every message. For FORWARDS (staff
+    // filing a customer email into the system), keep the full body —
+    // the whole point of a forward is to capture what the other party
+    // wrote, which lives below the "From: …" header Outlook injects.
+    // If stripping leaves nothing (heuristic over-match), fall back
+    // to the raw body so we never drop a message entirely.
+    let body;
+    if (isForwardedEmail(subject, textBody)) {
+      body = textBody;
+    } else {
+      body = stripReplyTrail(textBody);
+      if (!body) body = textBody;
+    }
 
     // Insert as a message on the project.
     const inserted = await queryOne(
