@@ -33,6 +33,7 @@ const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
+const projectProofsRoutes = require('./routes/project-proofs');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -85,6 +86,11 @@ app.use('/api',            quoteSheetRoutes);
 // Inbound email webhook (POST /api/projects/messages/inbound). Auth is
 // via the X-Inbound-Secret header; see routes/inbound-email.js.
 app.use('/api',            inboundEmailRoutes);
+// Project proofs — staff upload + customer tokenized approval flow.
+// Mounted at /api so its routes read /api/projects/:id/proofs and
+// /api/proofs/by-token/:token. Token endpoints have no auth (token IS
+// the auth) so order doesn't matter vs other routers.
+app.use('/api',            projectProofsRoutes);
 // /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
 // (parsing "folder-mappings" as an integer id and crashing the query).
