@@ -94,6 +94,10 @@ async function handleProofUpload(req, res) {
 
   const approveStatusId = req.body.approve_status_id ? parseInt(req.body.approve_status_id, 10) : null;
   const note = (req.body.note || '').toString().trim() || null;
+  // Optional per-proof recipient override — useful when staff want to send
+  // a proof to a different contact (e.g. designer's personal email) without
+  // changing the job's contact_email permanently. Validated below.
+  const recipientOverride = (req.body.recipient_email || '').toString().trim() || null;
 
   // Look up project + customer details for the email.
   const proj = await queryOne(
@@ -111,9 +115,19 @@ async function handleProofUpload(req, res) {
   );
   if (!proj) return res.status(404).json({ message: 'project not found' });
 
-  const customerEmail = (proj.contact_email && proj.contact_email.trim())
-    || (proj.client_email && proj.client_email.trim())
-    || null;
+  // Recipient priority: explicit override > project contact > client default.
+  // Validate the override so we don't try to send mail to "bob" or "".
+  let customerEmail = null;
+  if (recipientOverride) {
+    if (!/^\S+@\S+\.\S+$/.test(recipientOverride)) {
+      return res.status(400).json({ message: 'Invalid recipient_email.' });
+    }
+    customerEmail = recipientOverride;
+  } else {
+    customerEmail = (proj.contact_email && proj.contact_email.trim())
+      || (proj.client_email && proj.client_email.trim())
+      || null;
+  }
   if (!customerEmail) {
     return res.status(400).json({ message: 'No customer email on file — set contact_email on the job first.' });
   }
