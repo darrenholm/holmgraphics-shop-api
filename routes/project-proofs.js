@@ -381,6 +381,21 @@ router.get('/project-proofs/by-token/:token', async (req, res, next) => {
       proof.status = 'viewed';
     }
 
+    // If this proof was superseded, find the latest one so we can tell
+    // the customer when it was sent. They can still act on the proof in
+    // hand — useful when the newer one's email bounced.
+    let latest = null;
+    if (proof.status === 'superseded') {
+      latest = await queryOne(
+        `SELECT version, uploaded_at, status
+           FROM project_proofs
+          WHERE project_id = $1 AND id <> $2
+          ORDER BY version DESC
+          LIMIT 1`,
+        [proof.project_id, proof.id]
+      );
+    }
+
     res.json({
       proof: {
         id:             proof.id,
@@ -398,6 +413,11 @@ router.get('/project-proofs/by-token/:token', async (req, res, next) => {
         annotations:    proof.annotations || [],
         image_url:      proofPublicUrl(proof.project_id, proof.file_path),
         file_mime:      proof.file_mime,
+        latest_version: latest ? {
+          version:      latest.version,
+          uploaded_at:  latest.uploaded_at,
+          status:       latest.status,
+        } : null,
       },
     });
   } catch (err) { next(err); }
@@ -419,9 +439,10 @@ async function respondCommon(req, res, kind) {
   if (proof.responded_at) {
     return res.status(409).json({ message: `This proof was already ${proof.status === 'approved' ? 'approved' : 'replied to'} on ${new Date(proof.responded_at).toLocaleDateString('en-CA')}.` });
   }
-  if (proof.status === 'superseded') {
-    return res.status(409).json({ message: 'This proof has been replaced by a newer version. Check your inbox for the latest link.' });
-  }
+  // Note: superseded proofs are still actionable. If the newer version's
+  // email bounced or never arrived, the customer is otherwise stranded.
+  // The customer page shows a "we sent a newer version, but you can
+  // respond here" banner; we accept the response either way.
 
   const newStatus = kind === 'approve' ? 'approved' : 'changes_requested';
   const ip = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() || req.ip || null;
