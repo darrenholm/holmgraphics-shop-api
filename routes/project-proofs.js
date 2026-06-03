@@ -214,18 +214,30 @@ async function handleProofUpload(req, res) {
   const approvalUrl = `${PUBLIC_SHOP_URL}/proofs/${token}`;
   const imageUrl = proofPublicUrl(projectId, safeFileName);
 
-  // Send the email. Best-effort — proof row exists either way.
-  mailer.sendProjectProofRequest({
-    recipientEmail: customerEmail,
-    projectId, projectName: proj.project_name,
-    version, approvalUrl, imageUrl,
-    senderName: authorName, note,
-  }).catch((e) => console.warn('[project-proofs] customer email failed:', e.message));
+  // Send the email synchronously so we can report the result. The proof
+  // row exists either way — we just want the staff member to know whether
+  // the customer actually got the email.
+  let emailResult;
+  try {
+    emailResult = await mailer.sendProjectProofRequest({
+      recipientEmail: customerEmail,
+      projectId, projectName: proj.project_name,
+      version, approvalUrl, imageUrl,
+      senderName: authorName, note,
+    });
+  } catch (e) {
+    console.warn('[project-proofs] customer email threw:', e.stack || e);
+    emailResult = { ok: false, error: e.message || String(e) };
+  }
 
   res.status(201).json({
     id: row.id, project_id: row.project_id, version: row.version,
     status: row.status, token: row.token, uploaded_at: row.uploaded_at,
     image_url: imageUrl, approval_url: approvalUrl,
+    // Frontend can show "email sent" vs "email failed: ..." so staff isn't
+    // left wondering whether the customer received anything.
+    email: emailResult,
+    sent_to: customerEmail,
   });
 }
 
