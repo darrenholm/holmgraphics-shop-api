@@ -60,7 +60,12 @@ app.use(cors({
 // sender signed (currently just /api/projects/messages/inbound for
 // Resend Inbound webhooks). Negligible overhead — one buffer→string
 // copy per request, never logged.
+// Raise from body-parser's 100 KB default — proof annotations can hold
+// hundreds of vector shapes, and big quote sheets are also JSON-heavy.
+// Multipart uploads (proofs, photos) don't hit this parser because their
+// content type is multipart/form-data; they go through multer's own limit.
 app.use(express.json({
+  limit: '5mb',
   verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
 }));
 
