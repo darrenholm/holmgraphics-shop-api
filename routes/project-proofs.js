@@ -359,8 +359,13 @@ async function loadProofByToken(token) {
   );
 }
 
-// GET /api/proofs/by-token/:token — view proof + mark first-viewed
-router.get('/proofs/by-token/:token', async (req, res, next) => {
+// Customer endpoints live under /api/project-proofs/ (not /api/proofs/),
+// because routes/proofs.js — the older DTF-order proof router — already
+// owns /api/proofs/by-token/:token and would 404 first since it has no
+// matching token in its own table.
+//
+// GET /api/project-proofs/by-token/:token — view proof + mark first-viewed
+router.get('/project-proofs/by-token/:token', async (req, res, next) => {
   try {
     const proof = await loadProofByToken(req.params.token);
     if (!proof) return res.status(404).json({ message: 'Proof not found or link expired' });
@@ -462,11 +467,11 @@ async function respondCommon(req, res, kind) {
   });
 }
 
-router.post('/proofs/by-token/:token/approve', express.json(), (req, res, next) => {
+router.post('/project-proofs/by-token/:token/approve', express.json(), (req, res, next) => {
   respondCommon(req, res, 'approve').catch(next);
 });
 
-router.post('/proofs/by-token/:token/request-changes', express.json(), (req, res, next) => {
+router.post('/project-proofs/by-token/:token/request-changes', express.json(), (req, res, next) => {
   respondCommon(req, res, 'changes').catch(next);
 });
 
