@@ -223,7 +223,16 @@ async function handleProofUpload(req, res) {
       recipientEmail: customerEmail,
       projectId, projectName: proj.project_name,
       version, approvalUrl, imageUrl,
-      senderName: authorName, note,
+      // senderName is what appears in the email body byline. Prefer the
+      // assigned staff member (the production person on the job) so the
+      // customer sees the actual contact, falling back to whoever clicked
+      // the Send Proof button if nobody is assigned.
+      senderName: proj.assigned_name || authorName,
+      note,
+      // Per-call From / Reply-To. customer-mailer drops the From override
+      // if the email isn't on the verified shop domain.
+      assignedEmail: proj.assigned_email || null,
+      assignedName:  proj.assigned_name  || null,
     });
   } catch (e) {
     console.warn('[project-proofs] customer email threw:', e.stack || e);
