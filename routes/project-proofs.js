@@ -83,7 +83,16 @@ router.post('/projects/:id/proofs', requireStaff, (req, res, next) => {
       if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'File too large (max 50 MB)' });
       return res.status(400).json({ message: err.message });
     }
-    handleProofUpload(req, res).catch(next);
+    // Catch the error locally so the staff UI sees the real reason (missing
+    // table, FTP creds, etc.) instead of the global 500's generic message.
+    // The same detail still goes to Railway logs via console.error.
+    handleProofUpload(req, res).catch((e) => {
+      console.error('[project-proofs] upload failed:', e.stack || e);
+      res.status(500).json({
+        message: 'Proof upload failed.',
+        detail: e.message || String(e),
+      });
+    });
   });
 });
 
