@@ -34,6 +34,7 @@ const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
 const projectProofsRoutes = require('./routes/project-proofs');
+const { scheduleProofArchiveSweep } = require('./lib/proof-archive-sweep');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -163,6 +164,11 @@ app.use((err, req, res, next) => {
     console.error('FATAL: migrations failed —', e.message);
     process.exit(1);
   }
+
+  // Background: nightly proof archive sweep (deletes >90-day-old
+  // superseded proof files from WHC). Self-scheduling, never blocks
+  // request handling. See lib/proof-archive-sweep.js.
+  scheduleProofArchiveSweep();
 
   app.listen(PORT, () => {
     let dbHost = '(DATABASE_URL not set)';

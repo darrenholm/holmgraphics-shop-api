@@ -25,6 +25,8 @@ const { Readable } = require('stream');
 const { query, queryOne } = require('../db/connection');
 const { requireStaff } = require('../middleware/auth');
 const mailer = require('../lib/customer-mailer');
+const { renderProofPdf } = require('../lib/proof-pdf-renderer');
+const { rasterizePdfPageOne } = require('../lib/proof-pdf-rasterize');
 
 const router = express.Router();
 
@@ -148,14 +150,38 @@ async function handleProofUpload(req, res) {
   );
   const version = Number(last.v) + 1;
 
-  // Generate token + filename.
-  const token = genToken();
-  const ext = path.extname(req.file.originalname || '').toLowerCase() || (
-    req.file.mimetype === 'application/pdf' ? '.pdf' :
-    req.file.mimetype === 'image/png'       ? '.png' :
-    req.file.mimetype === 'image/webp'      ? '.webp' :
+  // Generate token + filename. If a PDF was uploaded we try to rasterize
+  // page 1 to PNG so the customer's email preview and the in-browser
+  // annotation canvas have a real image to display — neither works on
+  // a PDF MIME type. If rasterization isn't available on this host
+  // (cairo/pango missing, etc.), we fall through and store the PDF
+  // as-is; the email link still opens the canvas page (which will show
+  // a broken image but lets the customer download the PDF link).
+  let fileBuffer = req.file.buffer;
+  let fileMime   = req.file.mimetype;
+  let extFromMime = (
+    fileMime === 'application/pdf' ? '.pdf' :
+    fileMime === 'image/png'       ? '.png' :
+    fileMime === 'image/webp'      ? '.webp' :
     '.jpg'
   );
+  if (fileMime === 'application/pdf') {
+    const raster = await rasterizePdfPageOne(req.file.buffer);
+    if (raster && raster.buffer) {
+      fileBuffer = raster.buffer;
+      fileMime   = raster.mime;
+      extFromMime = '.png';
+    } else {
+      console.warn(`[project-proofs] PDF rasterize unavailable — storing v${version} as PDF (preview/canvas won't render).`);
+    }
+  }
+  const token = genToken();
+  const origExt = path.extname(req.file.originalname || '').toLowerCase();
+  // If we rasterized a PDF, use .png regardless of the original
+  // filename's extension. Otherwise honour the original extension.
+  const ext = (fileMime === 'image/png' && req.file.mimetype === 'application/pdf')
+    ? '.png'
+    : (origExt || extFromMime);
   // Filename includes token so the file URL is unguessable even though
   // WHC serves the directory publicly.
   const safeFileName = `v${version}-${token.slice(0, 16)}${ext}`;
@@ -166,7 +192,7 @@ async function handleProofUpload(req, res) {
   try {
     ftpClient = await connectFtp();
     await ftpClient.ensureDir(remoteDir);
-    await ftpClient.uploadFrom(Readable.from(req.file.buffer), safeFileName);
+    await ftpClient.uploadFrom(Readable.from(fileBuffer), safeFileName);
   } catch (e) {
     console.error('[project-proofs] WHC upload failed:', e);
     if (ftpClient) ftpClient.close();
@@ -192,8 +218,8 @@ async function handleProofUpload(req, res) {
      VALUES ($1, $2, $3, $4, $5, $6, 'sent', $7, $8, $9)
      RETURNING id, project_id, version, status, token, uploaded_at`,
     [
-      projectId, version, safeFileName, req.file.mimetype,
-      req.file.buffer.length, token,
+      projectId, version, safeFileName, fileMime,
+      fileBuffer.length, token,
       Number.isInteger(approveStatusId) ? approveStatusId : null,
       req.user?.id || null, customerEmail,
     ]
@@ -473,6 +499,48 @@ async function respondCommon(req, res, kind) {
     [proof.project_id, name, summary]
   );
 
+  // Audit log entry — surfaces the customer's decision in the job's
+  // Audit Log tab alongside status changes, who-edited-what, etc. We
+  // can't fill employee_id (the actor is the customer, not staff) but
+  // the customer's typed name is preserved in the project_messages row
+  // above, so the two together tell the full story. field_changed
+  // includes the proof version so multiple rounds are distinguishable.
+  await query(
+    `INSERT INTO audit_log
+       (project_id, employee_id, field_changed, old_value, new_value, changed_at)
+     VALUES ($1, NULL, $2, $3, $4, NOW())`,
+    [
+      proof.project_id,
+      `proof_v${proof.version}_status`,
+      proof.status,
+      newStatus,
+    ]
+  );
+
+  // For a changes-requested response WITH annotations, render the proof
+  // image + the customer's markup into a one-page PDF and attach it to
+  // the staff notification. Best-effort — a render failure shouldn't
+  // block the notification email.
+  let pdfBuffer = null;
+  if (kind === 'changes' && annotations.length > 0) {
+    try {
+      pdfBuffer = await renderProofPdf({
+        imageUrl: proofPublicUrl(proof.project_id, proof.file_path),
+        // file_size_bytes is stored but not natural dimensions — let
+        // the renderer fall back to its aspect-fit heuristic. (We can
+        // upgrade by stashing imgW/imgH on upload later if needed.)
+        annotations,
+        projectId: proof.project_id,
+        projectName: proof.project_name,
+        version: proof.version,
+        customerName: name,
+        customerText: text,
+      });
+    } catch (e) {
+      console.warn('[project-proofs] annotated PDF render failed:', e.message || e);
+    }
+  }
+
   // Notify assigned staff (or fall back to SHOP_QUOTES_TO via mailer).
   mailer.sendProjectProofResponseToStaff({
     recipientEmail: proof.assigned_email || null,
@@ -480,6 +548,7 @@ async function respondCommon(req, res, kind) {
     version: proof.version, kind, customerName: name, text,
     annotationsCount: annotations.length,
     jobUrl: `${PUBLIC_SHOP_URL}/jobs/${proof.project_id}`,
+    pdfBuffer,
   }).catch((e) => console.warn('[project-proofs] staff notify failed:', e.message));
 
   res.json({
