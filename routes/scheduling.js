@@ -257,54 +257,102 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
     // job_task_assignees is kept in sync with job_tasks.assigned_emp_id
     // by a trigger from migration 042, so this query reads ONE source
     // for assignees and doesn't have to UNION the lead column too.
-    const rows = await query(
-      `WITH lanes AS (
-         SELECT t.id, t.resource_id AS lane_id
-           FROM job_tasks t
-          WHERE t.resource_id IS NOT NULL
-            AND t.planned_start IS NOT NULL
-            AND t.planned_end   IS NOT NULL
-            AND t.planned_start <= $2
-            AND t.planned_end   >= $1
-            AND t.status NOT IN ('completed', 'skipped')
-         UNION
-         SELECT t.id, r_emp.id AS lane_id
-           FROM job_tasks t
-           JOIN job_task_assignees a ON a.task_id = t.id
-           JOIN resources r_emp ON r_emp.employee_id = a.employee_id
-          WHERE t.planned_start IS NOT NULL
-            AND t.planned_end   IS NOT NULL
-            AND t.planned_start <= $2
-            AND t.planned_end   >= $1
-            AND t.status NOT IN ('completed', 'skipped')
-       )
-       SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
+    // Step 1 — fetch the in-window tasks (one row per task, not per lane).
+    // Same predicates as the debug endpoint that returned correctly,
+    // so we know this part works.
+    const taskRows = await query(
+      `SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
               t.planned_start::text AS planned_start,
               t.planned_end::text   AS planned_end,
               t.actual_start::text  AS actual_start,
               t.actual_end::text    AS actual_end,
               t.duration_hours, t.status,
               t.assigned_emp_id, t.resource_id,
-              l.lane_id            AS effective_resource_id,
-              r.color              AS effective_color,
-              r.name               AS effective_resource_name,
               p.description AS project_name,
-              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
-              -- Every assignee's name as a comma-list, for the bar tooltip.
-              (SELECT string_agg(TRIM(CONCAT_WS(' ', e2.first_name, e2.last_name)), ', ' ORDER BY a2.role DESC, a2.created_at)
-                 FROM job_task_assignees a2
-                 JOIN employees e2 ON e2.id = a2.employee_id
-                WHERE a2.task_id = t.id) AS assigned_names
-         FROM lanes l
-         JOIN job_tasks t ON t.id = l.id
-         JOIN resources r ON r.id = l.lane_id
-         JOIN projects  p ON p.id = t.project_id
-         LEFT JOIN clients   c ON c.id = p.client_id
-        ORDER BY t.planned_start, t.id, l.lane_id`,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+         FROM job_tasks t
+         JOIN projects p ON p.id = t.project_id
+         LEFT JOIN clients c ON c.id = p.client_id
+        WHERE t.planned_start IS NOT NULL
+          AND t.planned_end   IS NOT NULL
+          AND t.planned_start <= $2
+          AND t.planned_end   >= $1
+          AND t.status NOT IN ('completed', 'skipped')
+        ORDER BY t.planned_start, t.id`,
       [from, to]
     );
-    console.log(`[scheduling] calendar-tasks ${from}..${to} → ${rows.length} lane-rows`);
-    res.json({ from, to, tasks: rows });
+
+    if (taskRows.length === 0) {
+      console.log(`[scheduling] calendar-tasks ${from}..${to} → 0 tasks`);
+      return res.json({ from, to, tasks: [] });
+    }
+
+    // Step 2 — for each task, build the set of lanes it occupies.
+    // Done in JS instead of SQL UNION so a regression in either branch
+    // doesn't tank the whole calendar render.
+    const taskIds = taskRows.map((t) => t.id);
+    const [assigneeLanes, resourceLookup] = await Promise.all([
+      query(
+        `SELECT a.task_id, r.id AS resource_id, r.name, r.color
+           FROM job_task_assignees a
+           JOIN resources r ON r.employee_id = a.employee_id
+          WHERE a.task_id = ANY($1::int[])`,
+        [taskIds]
+      ),
+      query(
+        `SELECT id, name, color FROM resources WHERE id = ANY($1::int[])`,
+        [taskRows.map((t) => t.resource_id).filter(Boolean)]
+      ),
+    ]);
+
+    // Build name lookup keyed by task_id → "Lead, Assist1, Assist2"
+    const assigneeNamesByTask = await query(
+      `SELECT a.task_id,
+              string_agg(TRIM(CONCAT_WS(' ', e.first_name, e.last_name)),
+                         ', '
+                         ORDER BY (a.role = 'lead') DESC, a.created_at) AS names
+         FROM job_task_assignees a
+         JOIN employees e ON e.id = a.employee_id
+        WHERE a.task_id = ANY($1::int[])
+        GROUP BY a.task_id`,
+      [taskIds]
+    );
+    const namesMap = new Map(assigneeNamesByTask.map((r) => [r.task_id, r.names]));
+    const resourceMap = new Map(resourceLookup.map((r) => [r.id, r]));
+
+    // Expand each task into one row per lane it occupies (direct
+    // resource + each assignee's person-resource). Dedup so a manual
+    // resource_id pointed at the assignee's resource doesn't double.
+    const out = [];
+    for (const t of taskRows) {
+      const seen = new Set();
+      const lanes = [];
+      if (t.resource_id) {
+        lanes.push({ id: t.resource_id, src: 'direct' });
+        seen.add(t.resource_id);
+      }
+      for (const a of assigneeLanes) {
+        if (a.task_id !== t.id) continue;
+        if (seen.has(a.resource_id)) continue;
+        lanes.push({ id: a.resource_id, name: a.name, color: a.color, src: 'assignee' });
+        seen.add(a.resource_id);
+      }
+      const assignedNames = namesMap.get(t.id) || '';
+      for (const lane of lanes) {
+        const resInfo = resourceMap.get(lane.id) || { name: lane.name, color: lane.color };
+        out.push({
+          ...t,
+          effective_resource_id: lane.id,
+          effective_resource_name: resInfo.name,
+          effective_color: resInfo.color,
+          assigned_names: assignedNames,
+          lane_source: lane.src,
+        });
+      }
+    }
+
+    console.log(`[scheduling] calendar-tasks ${from}..${to} → ${taskRows.length} tasks, ${out.length} lane-rows`);
+    res.json({ from, to, tasks: out });
   } catch (e) { next(e); }
 });
 
