@@ -283,7 +283,6 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
     );
 
     if (taskRows.length === 0) {
-      console.log(`[scheduling] calendar-tasks ${from}..${to} → 0 tasks`);
       return res.json({ from, to, tasks: [] });
     }
 
@@ -356,20 +355,7 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
       }
     }
 
-    console.log(`[scheduling] calendar-tasks ${from}..${to} → ${taskRows.length} tasks, ${out.length} lane-rows`);
-    // Inline counters so the frontend can show the breakdown without
-    // a separate DevTools dive — drops out once we're confident the
-    // grid is reliable.
-    res.json({
-      from, to, tasks: out,
-      _debug: {
-        taskRows: taskRows.length,
-        assigneeLanes: assigneeLanes.length,
-        assigneeNames: assigneeNamesByTask.length,
-        resourceLookup: resourceLookup.length,
-        laneRows: out.length,
-      },
-    });
+    res.json({ from, to, tasks: out });
   } catch (e) { next(e); }
 });
 
