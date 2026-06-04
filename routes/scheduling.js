@@ -49,7 +49,8 @@ router.get('/scheduling/resources', requireStaff, async (req, res, next) => {
   try {
     const includeInactive = req.query.include_inactive === 'true';
     const rows = await query(
-      `SELECT id, name, resource_type, daily_capacity_hours, color, active, notes
+      `SELECT id, name, resource_type, daily_capacity_hours, color, active, notes,
+              employee_id, vehicle_id
          FROM resources
         ${includeInactive ? '' : 'WHERE active'}
         ORDER BY resource_type, name`
