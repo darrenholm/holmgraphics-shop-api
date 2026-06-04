@@ -161,32 +161,57 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
     const fromDate = new Date(from + 'T12:00:00.000Z');
     const to = asDate(req.query.to) || new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
 
+    // A single task can occupy TWO swimlanes simultaneously — the
+    // machine/facility it runs on (resource_id) AND the person doing
+    // it (assigned_emp_id's person-resource). E.g. an install in the
+    // Install Bay assigned to Corson should appear on BOTH rows so
+    // it's visible whether you're scanning by machine OR by person.
+    //
+    // The UNION ALL below emits one row per (task, effective_resource).
+    // The CTE collapses duplicates when resource_id happens to equal
+    // the assignee's person-resource (rare — only if you manually
+    // pointed resource_id at the same person).
     const rows = await query(
-      `SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
+      `WITH lanes AS (
+         SELECT t.id, t.resource_id AS lane_id
+           FROM job_tasks t
+          WHERE t.resource_id IS NOT NULL
+            AND t.planned_start IS NOT NULL
+            AND t.planned_end   IS NOT NULL
+            AND t.planned_start <= $2
+            AND t.planned_end   >= $1
+            AND t.status NOT IN ('completed', 'skipped')
+         UNION
+         SELECT t.id, r_emp.id AS lane_id
+           FROM job_tasks t
+           JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
+          WHERE t.assigned_emp_id IS NOT NULL
+            AND t.planned_start IS NOT NULL
+            AND t.planned_end   IS NOT NULL
+            AND t.planned_start <= $2
+            AND t.planned_end   >= $1
+            AND t.status NOT IN ('completed', 'skipped')
+       )
+       SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
               t.planned_start::text AS planned_start,
               t.planned_end::text   AS planned_end,
               t.actual_start::text  AS actual_start,
               t.actual_end::text    AS actual_end,
               t.duration_hours, t.status,
               t.assigned_emp_id, t.resource_id,
-              COALESCE(t.resource_id, r_via_emp.id) AS effective_resource_id,
-              COALESCE(r_direct.color, r_via_emp.color) AS effective_color,
-              COALESCE(r_direct.name,  r_via_emp.name)  AS effective_resource_name,
+              l.lane_id            AS effective_resource_id,
+              r.color              AS effective_color,
+              r.name               AS effective_resource_name,
               p.description AS project_name,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
               TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name
-         FROM job_tasks t
-         JOIN projects p ON p.id = t.project_id
+         FROM lanes l
+         JOIN job_tasks t ON t.id = l.id
+         JOIN resources r ON r.id = l.lane_id
+         JOIN projects  p ON p.id = t.project_id
          LEFT JOIN clients   c ON c.id = p.client_id
          LEFT JOIN employees e ON e.id = t.assigned_emp_id
-         LEFT JOIN resources r_direct ON r_direct.id = t.resource_id
-         LEFT JOIN resources r_via_emp ON r_via_emp.employee_id = t.assigned_emp_id
-        WHERE t.planned_start IS NOT NULL
-          AND t.planned_end   IS NOT NULL
-          AND t.planned_start <= $2
-          AND t.planned_end   >= $1
-          AND t.status NOT IN ('completed', 'skipped')
-        ORDER BY t.planned_start, t.id`,
+        ORDER BY t.planned_start, t.id, l.lane_id`,
       [from, to]
     );
     res.json({ from, to, tasks: rows });
@@ -702,21 +727,36 @@ router.get('/scheduling/resource-load', requireStaff, async (req, res, next) => 
          SELECT generate_series($1::date, $2::date, '1 day'::interval)::date AS day
        ),
        task_load AS (
-         -- Each task contributes to the day's allocation under its
-         -- effective resource: explicit t.resource_id if set, else the
-         -- assignee's person-resource. Tasks with neither don't count
-         -- toward any resource's daily load.
-         SELECT COALESCE(t.resource_id, r_emp.id) AS resource_id,
+         -- A task with BOTH a resource AND an assignee contributes to
+         -- both lanes — the resource is busy because the work is
+         -- happening on it, and the assignee is busy because they're
+         -- doing the work. Two separate union branches express that.
+         -- A task with only one of the two contributes to the single
+         -- relevant lane. Tasks with neither don't count.
+         SELECT t.resource_id AS resource_id,
                 d.day,
-                -- Distribute task's hours across its date span (ceil-day count)
                 COALESCE(t.duration_hours, 8.0) /
                   GREATEST(1, t.planned_end - t.planned_start + 1) AS hours
            FROM job_tasks t
-           LEFT JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
            JOIN date_series d ON d.day BETWEEN t.planned_start AND t.planned_end
-          WHERE (t.resource_id IS NOT NULL OR r_emp.id IS NOT NULL)
+          WHERE t.resource_id IS NOT NULL
             AND t.task_kind = 'labor'
             AND t.status NOT IN ('completed', 'skipped')
+         UNION ALL
+         SELECT r_emp.id AS resource_id,
+                d.day,
+                COALESCE(t.duration_hours, 8.0) /
+                  GREATEST(1, t.planned_end - t.planned_start + 1) AS hours
+           FROM job_tasks t
+           JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
+           JOIN date_series d ON d.day BETWEEN t.planned_start AND t.planned_end
+          WHERE t.assigned_emp_id IS NOT NULL
+            AND t.task_kind = 'labor'
+            AND t.status NOT IN ('completed', 'skipped')
+            -- Skip if the assignee's person-resource IS the task's
+            -- resource_id (would double-count) — rare but possible if
+            -- you point resource_id at a person directly.
+            AND (t.resource_id IS NULL OR t.resource_id <> r_emp.id)
        ),
        install_load AS (
          SELECT i.crew_resource_id AS resource_id,
