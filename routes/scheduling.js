@@ -143,6 +143,84 @@ router.get('/scheduling/installs', requireStaff, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// GET /api/scheduling/debug
+// Returns the raw state of every scheduling-relevant table for a 6-week
+// window. Use to diagnose "task is in the DB but not on the calendar"
+// problems — compare counts between job_tasks, job_task_assignees, and
+// what calendar-tasks actually emits.
+router.get('/scheduling/debug', requireStaff, async (req, res, next) => {
+  try {
+    const from = asDate(req.query.from) || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(from + 'T12:00:00.000Z');
+    const to = asDate(req.query.to) || new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
+
+    const [tasks, assignees, resources, schedule, lanesBranch1, lanesBranch2] = await Promise.all([
+      query(
+        `SELECT id, project_id, name, status,
+                planned_start::text, planned_end::text,
+                assigned_emp_id, resource_id, task_kind
+           FROM job_tasks
+          WHERE planned_start <= $2 AND planned_end >= $1
+          ORDER BY planned_start, id`,
+        [from, to]
+      ),
+      query(`SELECT task_id, employee_id, role FROM job_task_assignees ORDER BY task_id, role DESC`),
+      query(`SELECT id, name, resource_type, active, employee_id, vehicle_id FROM resources ORDER BY resource_type, name`),
+      query(
+        `SELECT id, project_id, install_date::text, crew_resource_id, status
+           FROM project_install_schedule
+          WHERE install_date BETWEEN $1 AND $2
+          ORDER BY install_date`,
+        [from, to]
+      ),
+      query(
+        `SELECT t.id AS task_id, t.resource_id AS lane_id, 'direct' AS source
+           FROM job_tasks t
+          WHERE t.resource_id IS NOT NULL
+            AND t.planned_start IS NOT NULL
+            AND t.planned_end   IS NOT NULL
+            AND t.planned_start <= $2
+            AND t.planned_end   >= $1
+            AND t.status NOT IN ('completed', 'skipped')`,
+        [from, to]
+      ),
+      query(
+        `SELECT t.id AS task_id, r.id AS lane_id, 'via-assignee' AS source,
+                a.employee_id, a.role
+           FROM job_tasks t
+           JOIN job_task_assignees a ON a.task_id = t.id
+           JOIN resources r ON r.employee_id = a.employee_id
+          WHERE t.planned_start IS NOT NULL
+            AND t.planned_end   IS NOT NULL
+            AND t.planned_start <= $2
+            AND t.planned_end   >= $1
+            AND t.status NOT IN ('completed', 'skipped')`,
+        [from, to]
+      ),
+    ]);
+
+    res.json({
+      window: { from, to },
+      counts: {
+        tasks_in_window: tasks.length,
+        assignees: assignees.length,
+        resources: resources.length,
+        installs_in_window: schedule.length,
+        lanes_via_resource: lanesBranch1.length,
+        lanes_via_assignee: lanesBranch2.length,
+      },
+      tasks,
+      assignees,
+      schedule,
+      lanesBranch1,
+      lanesBranch2,
+      // List resources missing the employee_id link — these block the
+      // assignee-lane branch from producing any rows for that staff.
+      resources_without_employee_link: resources.filter((r) => r.resource_type === 'person' && !r.employee_id),
+    });
+  } catch (e) { next(e); }
+});
+
 // GET /api/scheduling/calendar-tasks?from=&to=
 //
 // Returns every job_task overlapping the date range, with the
