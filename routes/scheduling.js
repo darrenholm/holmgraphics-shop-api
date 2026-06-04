@@ -171,6 +171,14 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
     // The CTE collapses duplicates when resource_id happens to equal
     // the assignee's person-resource (rare — only if you manually
     // pointed resource_id at the same person).
+    // Two lane sources combined via UNION:
+    //   • Tasks with an explicit resource_id (machine / facility lane)
+    //   • Every assignee in job_task_assignees (one lane per person —
+    //     covers both the primary lead and any extra helpers)
+    //
+    // job_task_assignees is kept in sync with job_tasks.assigned_emp_id
+    // by a trigger from migration 042, so this query reads ONE source
+    // for assignees and doesn't have to UNION the lead column too.
     const rows = await query(
       `WITH lanes AS (
          SELECT t.id, t.resource_id AS lane_id
@@ -184,9 +192,9 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
          UNION
          SELECT t.id, r_emp.id AS lane_id
            FROM job_tasks t
-           JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
-          WHERE t.assigned_emp_id IS NOT NULL
-            AND t.planned_start IS NOT NULL
+           JOIN job_task_assignees a ON a.task_id = t.id
+           JOIN resources r_emp ON r_emp.employee_id = a.employee_id
+          WHERE t.planned_start IS NOT NULL
             AND t.planned_end   IS NOT NULL
             AND t.planned_start <= $2
             AND t.planned_end   >= $1
@@ -204,16 +212,20 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
               r.name               AS effective_resource_name,
               p.description AS project_name,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
-              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name
+              -- Every assignee's name as a comma-list, for the bar tooltip.
+              (SELECT string_agg(TRIM(CONCAT_WS(' ', e2.first_name, e2.last_name)), ', ' ORDER BY a2.role DESC, a2.created_at)
+                 FROM job_task_assignees a2
+                 JOIN employees e2 ON e2.id = a2.employee_id
+                WHERE a2.task_id = t.id) AS assigned_names
          FROM lanes l
          JOIN job_tasks t ON t.id = l.id
          JOIN resources r ON r.id = l.lane_id
          JOIN projects  p ON p.id = t.project_id
          LEFT JOIN clients   c ON c.id = p.client_id
-         LEFT JOIN employees e ON e.id = t.assigned_emp_id
         ORDER BY t.planned_start, t.id, l.lane_id`,
       [from, to]
     );
+    console.log(`[scheduling] calendar-tasks ${from}..${to} → ${rows.length} lane-rows`);
     res.json({ from, to, tasks: rows });
   } catch (e) { next(e); }
 });
@@ -334,7 +346,19 @@ router.get('/scheduling/job-tasks/:projectId', requireStaff, async (req, res, ne
               t.created_at, t.updated_at,
               TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name,
               r.name  AS resource_name,
-              r.color AS resource_color
+              r.color AS resource_color,
+              -- All assignees as JSON. Trigger keeps the primary lead in
+              -- sync with t.assigned_emp_id; extras come from manual adds.
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                         'employee_id', a.employee_id,
+                         'name',        TRIM(CONCAT_WS(' ', e2.first_name, e2.last_name)),
+                         'role',        a.role
+                       ) ORDER BY a.role DESC, a.created_at)
+                  FROM job_task_assignees a
+                  JOIN employees e2 ON e2.id = a.employee_id
+                 WHERE a.task_id = t.id
+              ), '[]'::json) AS assignees
          FROM job_tasks t
          LEFT JOIN employees e ON e.id = t.assigned_emp_id
          LEFT JOIN resources r ON r.id = t.resource_id
@@ -426,6 +450,70 @@ router.delete('/scheduling/job-tasks/:id', requireStaff, async (req, res, next) 
     const id = asInt(req.params.id);
     if (!id) return res.status(400).json({ message: 'invalid id' });
     await query(`DELETE FROM job_tasks WHERE id = $1`, [id]);
+    res.status(204).end();
+  } catch (e) { next(e); }
+});
+
+// POST /api/scheduling/job-tasks/:id/assignees — add an extra helper.
+// Body: { employee_id, role? }. role defaults to 'assist'; pass 'lead'
+// to make this person the primary (which mirrors back to
+// job_tasks.assigned_emp_id via the sync trigger from 042).
+router.post('/scheduling/job-tasks/:id/assignees', requireStaff, async (req, res, next) => {
+  try {
+    const taskId = asInt(req.params.id);
+    const empId  = asInt(req.body?.employee_id);
+    if (!taskId || !empId) return res.status(400).json({ message: 'employee_id required' });
+    const role = req.body?.role === 'lead' ? 'lead' : 'assist';
+
+    // If promoting to lead, demote the existing lead first (the trigger
+    // also handles this when the primary column changes, but we want a
+    // clean state regardless of how the caller got here).
+    if (role === 'lead') {
+      await query(
+        `UPDATE job_tasks SET assigned_emp_id = $1 WHERE id = $2`,
+        [empId, taskId]
+      );
+    } else {
+      await query(
+        `INSERT INTO job_task_assignees (task_id, employee_id, role)
+         VALUES ($1, $2, 'assist')
+         ON CONFLICT (task_id, employee_id) DO NOTHING`,
+        [taskId, empId]
+      );
+    }
+    const row = await queryOne(
+      `SELECT a.task_id, a.employee_id, a.role,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS name
+         FROM job_task_assignees a
+         JOIN employees e ON e.id = a.employee_id
+        WHERE a.task_id = $1 AND a.employee_id = $2`,
+      [taskId, empId]
+    );
+    res.status(201).json(row);
+  } catch (e) { next(e); }
+});
+
+// DELETE /api/scheduling/job-tasks/:id/assignees/:empId — remove a helper.
+// Refuses to drop the lead — that change has to go through
+// PATCH /scheduling/job-tasks/:id with a new assigned_emp_id, or by
+// clearing it (set to null).
+router.delete('/scheduling/job-tasks/:id/assignees/:empId', requireStaff, async (req, res, next) => {
+  try {
+    const taskId = asInt(req.params.id);
+    const empId  = asInt(req.params.empId);
+    if (!taskId || !empId) return res.status(400).json({ message: 'invalid id' });
+    const existing = await queryOne(
+      `SELECT role FROM job_task_assignees WHERE task_id = $1 AND employee_id = $2`,
+      [taskId, empId]
+    );
+    if (!existing) return res.status(404).json({ message: 'assignee not found' });
+    if (existing.role === 'lead') {
+      return res.status(409).json({ message: 'Cannot remove the lead via this endpoint — set a new lead on the task first.' });
+    }
+    await query(
+      `DELETE FROM job_task_assignees WHERE task_id = $1 AND employee_id = $2`,
+      [taskId, empId]
+    );
     res.status(204).end();
   } catch (e) { next(e); }
 });
@@ -727,12 +815,10 @@ router.get('/scheduling/resource-load', requireStaff, async (req, res, next) => 
          SELECT generate_series($1::date, $2::date, '1 day'::interval)::date AS day
        ),
        task_load AS (
-         -- A task with BOTH a resource AND an assignee contributes to
-         -- both lanes — the resource is busy because the work is
-         -- happening on it, and the assignee is busy because they're
-         -- doing the work. Two separate union branches express that.
-         -- A task with only one of the two contributes to the single
-         -- relevant lane. Tasks with neither don't count.
+         -- A task occupies its resource (machine/facility) AND each
+         -- of its assignees simultaneously. Each lane gets the full
+         -- per-day hour figure — we don't split because the resource
+         -- IS busy for those hours AND each assignee IS busy.
          SELECT t.resource_id AS resource_id,
                 d.day,
                 COALESCE(t.duration_hours, 8.0) /
@@ -748,14 +834,14 @@ router.get('/scheduling/resource-load', requireStaff, async (req, res, next) => 
                 COALESCE(t.duration_hours, 8.0) /
                   GREATEST(1, t.planned_end - t.planned_start + 1) AS hours
            FROM job_tasks t
-           JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
+           JOIN job_task_assignees a ON a.task_id = t.id
+           JOIN resources r_emp ON r_emp.employee_id = a.employee_id
            JOIN date_series d ON d.day BETWEEN t.planned_start AND t.planned_end
-          WHERE t.assigned_emp_id IS NOT NULL
-            AND t.task_kind = 'labor'
+          WHERE t.task_kind = 'labor'
             AND t.status NOT IN ('completed', 'skipped')
-            -- Skip if the assignee's person-resource IS the task's
-            -- resource_id (would double-count) — rare but possible if
-            -- you point resource_id at a person directly.
+            -- Skip if a person-resource IS already the task's
+            -- resource_id (would double-count) — rare but possible
+            -- if you point resource_id at a person directly.
             AND (t.resource_id IS NULL OR t.resource_id <> r_emp.id)
        ),
        install_load AS (
