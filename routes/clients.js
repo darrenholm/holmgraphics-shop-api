@@ -688,6 +688,13 @@ router.put('/:id', requireStaff, async (req, res) => {
   // Hand-coerce the net-terms fields: extractFields' string-based cleanValue
   // would mishandle the boolean/integer types here.
   const body = { ...req.body };
+  // The clients table stores names as fname/lname but the GET response
+  // aliases them as first_name/last_name for consistency with employees.
+  // Accept the aliased spelling on writes too — otherwise the frontend
+  // (which reads first_name/last_name) silently sends fields that get
+  // dropped by extractFields, and the name "doesn't save".
+  if ('first_name' in body && !('fname' in body)) body.fname = body.first_name;
+  if ('last_name'  in body && !('lname' in body)) body.lname = body.last_name;
   if ('payment_terms_days' in body) {
     const raw = body.payment_terms_days;
     if (raw === null || raw === '' || raw === undefined) {
