@@ -137,6 +137,54 @@ router.get('/scheduling/installs', requireStaff, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// GET /api/scheduling/calendar-tasks?from=&to=
+//
+// Returns every job_task overlapping the date range, with the
+// "effective resource" already resolved:
+//   • If t.resource_id is set, use that.
+//   • Else if t.assigned_emp_id is set, use that employee's
+//     person-resource (one per employee since migration 039).
+//   • Else effective_resource_id is NULL → renders in the "unassigned"
+//     bucket on the calendar.
+// This lets the calendar swimlanes render task bars under the same
+// resource row as installs, without forcing the caller to do a
+// second join.
+router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) => {
+  try {
+    const from = asDate(req.query.from) || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(from + 'T12:00:00.000Z');
+    const to = asDate(req.query.to) || new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
+
+    const rows = await query(
+      `SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
+              t.planned_start, t.planned_end,
+              t.actual_start, t.actual_end,
+              t.duration_hours, t.status,
+              t.assigned_emp_id, t.resource_id,
+              COALESCE(t.resource_id, r_via_emp.id) AS effective_resource_id,
+              COALESCE(r_direct.color, r_via_emp.color) AS effective_color,
+              COALESCE(r_direct.name,  r_via_emp.name)  AS effective_resource_name,
+              p.description AS project_name,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name
+         FROM job_tasks t
+         JOIN projects p ON p.id = t.project_id
+         LEFT JOIN clients   c ON c.id = p.client_id
+         LEFT JOIN employees e ON e.id = t.assigned_emp_id
+         LEFT JOIN resources r_direct ON r_direct.id = t.resource_id
+         LEFT JOIN resources r_via_emp ON r_via_emp.employee_id = t.assigned_emp_id
+        WHERE t.planned_start IS NOT NULL
+          AND t.planned_end   IS NOT NULL
+          AND t.planned_start <= $2
+          AND t.planned_end   >= $1
+          AND t.status NOT IN ('completed', 'skipped')
+        ORDER BY t.planned_start, t.id`,
+      [from, to]
+    );
+    res.json({ from, to, tasks: rows });
+  } catch (e) { next(e); }
+});
+
 // GET /api/scheduling/installs/by-project/:projectId — every install for one job.
 router.get('/scheduling/installs/by-project/:projectId', requireStaff, async (req, res, next) => {
   try {
@@ -637,14 +685,19 @@ router.get('/scheduling/resource-load', requireStaff, async (req, res, next) => 
          SELECT generate_series($1::date, $2::date, '1 day'::interval)::date AS day
        ),
        task_load AS (
-         SELECT t.resource_id,
+         -- Each task contributes to the day's allocation under its
+         -- effective resource: explicit t.resource_id if set, else the
+         -- assignee's person-resource. Tasks with neither don't count
+         -- toward any resource's daily load.
+         SELECT COALESCE(t.resource_id, r_emp.id) AS resource_id,
                 d.day,
                 -- Distribute task's hours across its date span (ceil-day count)
                 COALESCE(t.duration_hours, 8.0) /
                   GREATEST(1, t.planned_end - t.planned_start + 1) AS hours
            FROM job_tasks t
+           LEFT JOIN resources r_emp ON r_emp.employee_id = t.assigned_emp_id
            JOIN date_series d ON d.day BETWEEN t.planned_start AND t.planned_end
-          WHERE t.resource_id IS NOT NULL
+          WHERE (t.resource_id IS NOT NULL OR r_emp.id IS NOT NULL)
             AND t.task_kind = 'labor'
             AND t.status NOT IN ('completed', 'skipped')
        ),
@@ -690,15 +743,24 @@ router.get('/scheduling/by-resource/:resourceId', requireStaff, async (req, res,
     const fromDate = new Date(from + 'T12:00:00.000Z');
     const to = asDate(req.query.to) || new Date(fromDate.getTime() + 14 * 86400000).toISOString().slice(0, 10);
 
+    // Tasks reach this resource two ways: direct resource_id link OR
+    // via assigned_emp_id when this resource IS the person's row. The
+    // person-resource link comes from resources.employee_id (set on
+    // INSERT by the sync trigger in migration 039).
     const tasks = await query(
       `SELECT t.id, t.project_id, t.name, t.task_kind,
               t.planned_start, t.planned_end, t.status, t.duration_hours,
               p.description AS project_name,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
          FROM job_tasks t
          JOIN projects p ON p.id = t.project_id
          LEFT JOIN clients c ON c.id = p.client_id
-        WHERE t.resource_id = $1
+         LEFT JOIN employees e ON e.id = t.assigned_emp_id
+        WHERE (
+                t.resource_id = $1
+             OR t.assigned_emp_id = (SELECT employee_id FROM resources WHERE id = $1)
+              )
           AND t.planned_start <= $3 AND t.planned_end >= $2
         ORDER BY t.planned_start`,
       [rid, from, to]
