@@ -305,18 +305,23 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
       ),
     ]);
 
-    // Build name lookup keyed by task_id → "Lead, Assist1, Assist2"
-    const assigneeNamesByTask = await query(
-      `SELECT a.task_id,
-              string_agg(TRIM(CONCAT_WS(' ', e.first_name, e.last_name)),
-                         ', '
-                         ORDER BY (a.role = 'lead') DESC, a.created_at) AS names
-         FROM job_task_assignees a
-         JOIN employees e ON e.id = a.employee_id
-        WHERE a.task_id = ANY($1::int[])
-        GROUP BY a.task_id`,
-      [taskIds]
-    );
+    // Build name lookup keyed by task_id → "Lead, Assist1, Assist2".
+    // Wrap in try/catch so a regression here can't tank the whole
+    // calendar response — the names column is purely cosmetic (tooltip).
+    let assigneeNamesByTask = [];
+    try {
+      assigneeNamesByTask = await query(
+        `SELECT a.task_id,
+                string_agg(TRIM(CONCAT_WS(' ', e.first_name, e.last_name)), ', ') AS names
+           FROM job_task_assignees a
+           JOIN employees e ON e.id = a.employee_id
+          WHERE a.task_id = ANY($1::int[])
+          GROUP BY a.task_id`,
+        [taskIds]
+      );
+    } catch (e) {
+      console.warn('[scheduling] assignee-names query failed:', e.message);
+    }
     const namesMap = new Map(assigneeNamesByTask.map((r) => [r.task_id, r.names]));
     const resourceMap = new Map(resourceLookup.map((r) => [r.id, r]));
 
@@ -352,7 +357,19 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
     }
 
     console.log(`[scheduling] calendar-tasks ${from}..${to} → ${taskRows.length} tasks, ${out.length} lane-rows`);
-    res.json({ from, to, tasks: out });
+    // Inline counters so the frontend can show the breakdown without
+    // a separate DevTools dive — drops out once we're confident the
+    // grid is reliable.
+    res.json({
+      from, to, tasks: out,
+      _debug: {
+        taskRows: taskRows.length,
+        assigneeLanes: assigneeLanes.length,
+        assigneeNames: assigneeNamesByTask.length,
+        resourceLookup: resourceLookup.length,
+        laneRows: out.length,
+      },
+    });
   } catch (e) { next(e); }
 });
 
