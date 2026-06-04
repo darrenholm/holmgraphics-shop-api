@@ -1058,4 +1058,153 @@ router.get('/scheduling/by-resource/:resourceId', requireStaff, async (req, res,
   } catch (e) { next(e); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════
+// Staff absences + holidays (migration 043)
+// ═════════════════════════════════════════════════════════════════════════
+
+// GET /api/scheduling/absences?from=&to= — every absence overlapping window.
+router.get('/scheduling/absences', requireStaff, async (req, res, next) => {
+  try {
+    const from = asDate(req.query.from) || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(from + 'T12:00:00.000Z');
+    const to = asDate(req.query.to) || new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
+
+    const rows = await query(
+      `SELECT a.id, a.employee_id,
+              a.start_date::text AS start_date,
+              a.end_date::text   AS end_date,
+              a.start_time::text AS start_time,
+              a.end_time::text   AS end_time,
+              a.kind, a.notes,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS employee_name,
+              -- Person-resource id so the calendar can map an absence
+              -- directly to its swimlane without a second join client-side.
+              r.id AS resource_id
+         FROM staff_absences a
+         JOIN employees e ON e.id = a.employee_id
+         LEFT JOIN resources r ON r.employee_id = a.employee_id
+        WHERE a.start_date <= $2 AND a.end_date >= $1
+        ORDER BY a.start_date, a.employee_id`,
+      [from, to]
+    );
+    res.json({ from, to, absences: rows });
+  } catch (e) { next(e); }
+});
+
+router.post('/scheduling/absences', requireStaff, async (req, res, next) => {
+  try {
+    const empId = asInt(req.body.employee_id);
+    const start = asDate(req.body.start_date);
+    const end   = asDate(req.body.end_date) || start;
+    if (!empId || !start) {
+      return res.status(400).json({ message: 'employee_id and start_date required' });
+    }
+    const startTime = req.body.start_time || null;
+    const endTime   = req.body.end_time   || null;
+    if ((startTime && !endTime) || (!startTime && endTime)) {
+      return res.status(400).json({ message: 'start_time and end_time must both be set or both null' });
+    }
+    if (startTime && start !== end) {
+      return res.status(400).json({ message: 'Partial-day absences must be on a single date.' });
+    }
+    const row = await queryOne(
+      `INSERT INTO staff_absences
+         (employee_id, start_date, end_date, start_time, end_time, kind, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'personal'), $7, $8)
+       RETURNING *`,
+      [
+        empId, start, end, startTime, endTime,
+        req.body.kind, req.body.notes || null,
+        req.user?.id || null,
+      ]
+    );
+    res.status(201).json(row);
+  } catch (e) { next(e); }
+});
+
+router.patch('/scheduling/absences/:id', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    const allow = {
+      employee_id: (v) => asInt(v),
+      start_date:  (v) => asDate(v),
+      end_date:    (v) => asDate(v),
+      start_time:  (v) => v || null,
+      end_time:    (v) => v || null,
+      kind:        (v) => v,
+      notes:       (v) => v ?? null,
+    };
+    const fields = [], vals = [];
+    for (const [k, coerce] of Object.entries(allow)) {
+      if (k in (req.body || {})) {
+        fields.push(`${k} = $${fields.length + 1}`);
+        vals.push(coerce(req.body[k]));
+      }
+    }
+    if (!fields.length) return res.status(400).json({ message: 'no fields' });
+    vals.push(id);
+    const row = await queryOne(
+      `UPDATE staff_absences SET ${fields.join(', ')}
+        WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+    if (!row) return res.status(404).json({ message: 'not found' });
+    res.json(row);
+  } catch (e) { next(e); }
+});
+
+router.delete('/scheduling/absences/:id', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    await query(`DELETE FROM staff_absences WHERE id = $1`, [id]);
+    res.status(204).end();
+  } catch (e) { next(e); }
+});
+
+// ─── Holidays ─────────────────────────────────────────────────────────
+router.get('/scheduling/holidays', requireStaff, async (req, res, next) => {
+  try {
+    const from = asDate(req.query.from) || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(from + 'T12:00:00.000Z');
+    const to = asDate(req.query.to) || new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
+    const rows = await query(
+      `SELECT id, date::text AS date, name, observed
+         FROM holidays
+        WHERE observed
+          AND date BETWEEN $1 AND $2
+        ORDER BY date`,
+      [from, to]
+    );
+    res.json({ from, to, holidays: rows });
+  } catch (e) { next(e); }
+});
+
+router.post('/scheduling/holidays', requireStaff, async (req, res, next) => {
+  try {
+    const date = asDate(req.body.date);
+    if (!date || !req.body.name) {
+      return res.status(400).json({ message: 'date + name required' });
+    }
+    const row = await queryOne(
+      `INSERT INTO holidays (date, name, observed)
+       VALUES ($1, $2, COALESCE($3, TRUE))
+       ON CONFLICT (date) DO UPDATE SET name = EXCLUDED.name, observed = EXCLUDED.observed
+       RETURNING *`,
+      [date, req.body.name, req.body.observed]
+    );
+    res.status(201).json(row);
+  } catch (e) { next(e); }
+});
+
+router.delete('/scheduling/holidays/:id', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    await query(`DELETE FROM holidays WHERE id = $1`, [id]);
+    res.status(204).end();
+  } catch (e) { next(e); }
+});
+
 module.exports = router;
