@@ -115,13 +115,19 @@ router.get('/scheduling/installs', requireStaff, async (req, res, next) => {
     const defaultTo = new Date(fromDate.getTime() + 42 * 86400000).toISOString().slice(0, 10);
     const to = asDate(req.query.to) || defaultTo;
 
+    // ::text on every DATE column so the JSON response is plain
+    // YYYY-MM-DD — the pg driver otherwise returns Date objects that
+    // serialise to "2026-06-04T00:00:00.000Z", which <input type="date">
+    // can't render and which break the calendar's date-key bucketing.
     const rows = await query(
-      `SELECT i.id, i.project_id, i.install_date, i.start_time,
+      `SELECT i.id, i.project_id,
+              i.install_date::text AS install_date,
+              i.start_time::text   AS start_time,
               i.duration_hours, i.crew_resource_id, i.notes,
               i.weather_blocked, i.status, i.updated_at,
               p.description AS project_name,
               p.status_id   AS project_status_id,
-              p.due_date,
+              p.due_date::text AS due_date,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
               r.name        AS crew_name,
               r.color       AS crew_color
@@ -157,8 +163,10 @@ router.get('/scheduling/calendar-tasks', requireStaff, async (req, res, next) =>
 
     const rows = await query(
       `SELECT t.id, t.project_id, t.step_order, t.name, t.task_kind,
-              t.planned_start, t.planned_end,
-              t.actual_start, t.actual_end,
+              t.planned_start::text AS planned_start,
+              t.planned_end::text   AS planned_end,
+              t.actual_start::text  AS actual_start,
+              t.actual_end::text    AS actual_end,
               t.duration_hours, t.status,
               t.assigned_emp_id, t.resource_id,
               COALESCE(t.resource_id, r_via_emp.id) AS effective_resource_id,
@@ -191,7 +199,13 @@ router.get('/scheduling/installs/by-project/:projectId', requireStaff, async (re
     const pid = asInt(req.params.projectId);
     if (!pid) return res.status(400).json({ message: 'invalid project id' });
     const rows = await query(
-      `SELECT i.*, r.name AS crew_name, r.color AS crew_color
+      `SELECT i.id, i.project_id,
+              i.install_date::text AS install_date,
+              i.start_time::text   AS start_time,
+              i.duration_hours, i.crew_resource_id, i.notes,
+              i.weather_blocked, i.status,
+              i.scheduled_by, i.created_at, i.updated_at,
+              r.name AS crew_name, r.color AS crew_color
          FROM project_install_schedule i
          LEFT JOIN resources r ON r.id = i.crew_resource_id
         WHERE i.project_id = $1
@@ -286,7 +300,10 @@ router.get('/scheduling/job-tasks/:projectId', requireStaff, async (req, res, ne
     if (!pid) return res.status(400).json({ message: 'invalid project id' });
     const rows = await query(
       `SELECT t.id, t.project_id, t.template_id, t.step_order, t.name, t.task_kind,
-              t.planned_start, t.planned_end, t.actual_start, t.actual_end,
+              t.planned_start::text AS planned_start,
+              t.planned_end::text   AS planned_end,
+              t.actual_start::text  AS actual_start,
+              t.actual_end::text    AS actual_end,
               t.duration_hours, t.assigned_emp_id, t.resource_id,
               t.depends_on_task_id, t.status, t.notes,
               t.created_at, t.updated_at,
@@ -716,7 +733,7 @@ router.get('/scheduling/resource-load', requireStaff, async (req, res, next) => 
          SELECT * FROM install_load
        )
        SELECT c.resource_id,
-              c.day,
+              c.day::text AS day,
               SUM(c.hours)::numeric(6,2)  AS hours_allocated,
               r.daily_capacity_hours,
               r.name,
@@ -749,7 +766,9 @@ router.get('/scheduling/by-resource/:resourceId', requireStaff, async (req, res,
     // INSERT by the sync trigger in migration 039).
     const tasks = await query(
       `SELECT t.id, t.project_id, t.name, t.task_kind,
-              t.planned_start, t.planned_end, t.status, t.duration_hours,
+              t.planned_start::text AS planned_start,
+              t.planned_end::text   AS planned_end,
+              t.status, t.duration_hours,
               p.description AS project_name,
               TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
@@ -766,7 +785,9 @@ router.get('/scheduling/by-resource/:resourceId', requireStaff, async (req, res,
       [rid, from, to]
     );
     const installs = await query(
-      `SELECT i.id, i.project_id, i.install_date, i.start_time,
+      `SELECT i.id, i.project_id,
+              i.install_date::text AS install_date,
+              i.start_time::text   AS start_time,
               i.duration_hours, i.status, i.notes,
               p.description AS project_name,
               COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
