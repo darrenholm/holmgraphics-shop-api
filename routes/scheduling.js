@@ -1060,6 +1060,279 @@ router.get('/scheduling/by-resource/:resourceId', requireStaff, async (req, res,
 });
 
 // ═════════════════════════════════════════════════════════════════════════
+// Job phases — event-driven rolling schedule (migration 045)
+// ═════════════════════════════════════════════════════════════════════════
+
+// GET /api/scheduling/phase-templates — for the "set up phases" picker
+router.get('/scheduling/phase-templates', requireStaff, async (req, res, next) => {
+  try {
+    const templates = await query(
+      `SELECT t.id, t.name, t.notes,
+              json_agg(json_build_object(
+                'phase_order',       s.phase_order,
+                'name',              s.name,
+                'default_days',      s.default_days,
+                'responsible_party', s.responsible_party,
+                'notes',             s.notes
+              ) ORDER BY s.phase_order) AS steps
+         FROM phase_templates t
+         LEFT JOIN phase_template_steps s ON s.template_id = t.id
+        WHERE t.active
+        GROUP BY t.id, t.name, t.notes
+        ORDER BY t.name`
+    );
+    res.json({ templates });
+  } catch (e) { next(e); }
+});
+
+// GET /api/scheduling/phases/:projectId — checklist for one job
+router.get('/scheduling/phases/:projectId', requireStaff, async (req, res, next) => {
+  try {
+    const pid = asInt(req.params.projectId);
+    if (!pid) return res.status(400).json({ message: 'invalid project id' });
+    const rows = await query(
+      `SELECT id, project_id, phase_order, name, responsible_party,
+              status, expected_days,
+              started_at, completed_at, notes,
+              -- expected_end derived in SQL so the UI doesn't have to
+              -- duplicate the rounding rule. Null when phase hasn't
+              -- started or has no allotment.
+              CASE WHEN started_at IS NOT NULL AND expected_days IS NOT NULL
+                   THEN (started_at::date + CEIL(expected_days)::int)
+                   ELSE NULL END AS expected_end_date,
+              -- "Days waiting" — only meaningful on an active phase
+              -- where the ball is in someone else's court.
+              CASE WHEN status = 'active' AND started_at IS NOT NULL
+                   THEN EXTRACT(DAY FROM NOW() - started_at)::int
+                   ELSE NULL END AS days_active
+         FROM job_phases
+        WHERE project_id = $1
+        ORDER BY phase_order`,
+      [pid]
+    );
+    res.json({ phases: rows });
+  } catch (e) { next(e); }
+});
+
+// POST /api/scheduling/phases/apply-template
+// Body: { project_id, template_id, start_first: bool }
+// Wipes any existing job_phases for the project (with confirm semantic)
+// and inserts the template's steps. Optionally activates the first
+// phase right away so the clock starts ticking.
+router.post('/scheduling/phases/apply-template', requireStaff, async (req, res, next) => {
+  try {
+    const pid = asInt(req.body.project_id);
+    const tid = asInt(req.body.template_id);
+    if (!pid || !tid) return res.status(400).json({ message: 'project_id + template_id required' });
+    const startFirst = req.body.start_first !== false; // default true
+
+    // Refuse to overwrite an in-flight checklist unless force is set.
+    const inFlight = await queryOne(
+      `SELECT COUNT(*) AS c FROM job_phases
+        WHERE project_id = $1 AND status IN ('active', 'completed')`,
+      [pid]
+    );
+    if (Number(inFlight.c) > 0 && req.body.force !== true) {
+      return res.status(409).json({
+        message: 'This job already has phases in progress. Pass force:true to replace them.',
+      });
+    }
+    await query(`DELETE FROM job_phases WHERE project_id = $1`, [pid]);
+
+    const steps = await query(
+      `SELECT * FROM phase_template_steps WHERE template_id = $1 ORDER BY phase_order`,
+      [tid]
+    );
+    if (steps.length === 0) return res.status(400).json({ message: 'template has no phases' });
+
+    // Insert all phases. The first one gets activated only if start_first
+    // is true (the trigger handles "next phase becomes active when prior
+    // is completed" — for the initial activation we set status directly).
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      const isFirst = i === 0;
+      await query(
+        `INSERT INTO job_phases
+           (project_id, phase_order, name, responsible_party,
+            status, expected_days, started_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          pid, s.phase_order, s.name, s.responsible_party,
+          isFirst && startFirst ? 'active' : 'pending',
+          s.default_days,
+          isFirst && startFirst ? new Date().toISOString() : null,
+        ]
+      );
+    }
+    const phases = await query(
+      `SELECT * FROM job_phases WHERE project_id = $1 ORDER BY phase_order`,
+      [pid]
+    );
+    res.status(201).json({ phases });
+  } catch (e) { next(e); }
+});
+
+// POST /api/scheduling/phases/:id/complete
+// Body: { next_expected_days?: number }
+// Marks the phase complete. The trigger auto-activates the next
+// pending phase. If next_expected_days is sent, that becomes the
+// next phase's allotment (override the template default).
+router.post('/scheduling/phases/:id/complete', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    const nextDays = asNumeric(req.body?.next_expected_days);
+
+    const phase = await queryOne(`SELECT * FROM job_phases WHERE id = $1`, [id]);
+    if (!phase) return res.status(404).json({ message: 'phase not found' });
+    if (phase.status === 'completed') {
+      return res.status(409).json({ message: 'Phase is already completed.' });
+    }
+
+    // Pre-stage the next phase's expected_days if provided. The trigger
+    // doesn't touch it on activation, so setting it before completing
+    // means the activate path picks it up cleanly.
+    if (nextDays != null) {
+      await query(
+        `UPDATE job_phases
+            SET expected_days = $1
+          WHERE project_id = $2
+            AND phase_order > $3
+            AND status = 'pending'
+            AND phase_order = (
+              SELECT MIN(phase_order) FROM job_phases
+               WHERE project_id = $2 AND status = 'pending' AND phase_order > $3
+            )`,
+        [nextDays, phase.project_id, phase.phase_order]
+      );
+    }
+
+    await query(
+      `UPDATE job_phases SET status = 'completed' WHERE id = $1`,
+      [id]
+    );
+
+    // Audit so the Audit Log tab catches phase handoffs.
+    await query(
+      `INSERT INTO audit_log
+         (project_id, employee_id, field_changed, old_value, new_value)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        phase.project_id, req.user?.id || null,
+        `phase_${phase.phase_order}_${phase.name.toLowerCase().replace(/\s+/g, '_')}`,
+        phase.status, 'completed',
+      ]
+    );
+
+    const phases = await query(
+      `SELECT * FROM job_phases WHERE project_id = $1 ORDER BY phase_order`,
+      [phase.project_id]
+    );
+    res.json({ phases });
+  } catch (e) { next(e); }
+});
+
+// PATCH /api/scheduling/phases/:id — edit name, days, responsible_party,
+// notes, OR force-skip a phase by setting status='skipped'. Skipped
+// phases still trigger the auto-advance.
+router.patch('/scheduling/phases/:id', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    const allow = {
+      name:              (v) => v,
+      responsible_party: (v) => v,
+      expected_days:     (v) => asNumeric(v),
+      status:            (v) => v,
+      notes:             (v) => v ?? null,
+    };
+    const fields = [], vals = [];
+    for (const [k, coerce] of Object.entries(allow)) {
+      if (k in (req.body || {})) {
+        fields.push(`${k} = $${fields.length + 1}`);
+        vals.push(coerce(req.body[k]));
+      }
+    }
+    if (!fields.length) return res.status(400).json({ message: 'no fields' });
+    vals.push(id);
+    const row = await queryOne(
+      `UPDATE job_phases SET ${fields.join(', ')}
+        WHERE id = $${vals.length} RETURNING *`,
+      vals
+    );
+    if (!row) return res.status(404).json({ message: 'not found' });
+    res.json(row);
+  } catch (e) { next(e); }
+});
+
+// POST /api/scheduling/phases — add an ad-hoc phase to a project that
+// the templates don't cover. Inserts at end (max order + 10).
+router.post('/scheduling/phases', requireStaff, async (req, res, next) => {
+  try {
+    const pid = asInt(req.body.project_id);
+    if (!pid || !req.body.name) {
+      return res.status(400).json({ message: 'project_id + name required' });
+    }
+    const last = await queryOne(
+      `SELECT COALESCE(MAX(phase_order), 0) AS m FROM job_phases WHERE project_id = $1`,
+      [pid]
+    );
+    const row = await queryOne(
+      `INSERT INTO job_phases
+         (project_id, phase_order, name, responsible_party, expected_days, notes)
+       VALUES ($1, $2, $3, COALESCE($4, 'shop'), $5, $6)
+       RETURNING *`,
+      [
+        pid, Number(last.m) + 10, req.body.name,
+        req.body.responsible_party, asNumeric(req.body.expected_days),
+        req.body.notes || null,
+      ]
+    );
+    res.status(201).json(row);
+  } catch (e) { next(e); }
+});
+
+router.delete('/scheduling/phases/:id', requireStaff, async (req, res, next) => {
+  try {
+    const id = asInt(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
+    await query(`DELETE FROM job_phases WHERE id = $1`, [id]);
+    res.status(204).end();
+  } catch (e) { next(e); }
+});
+
+// GET /api/scheduling/phases-active — every job's currently-active phase
+// in one query. Drives a "Ball in court" dashboard widget.
+router.get('/scheduling/phases-active', requireStaff, async (req, res, next) => {
+  try {
+    const rows = await query(
+      `SELECT ph.id, ph.project_id, ph.phase_order, ph.name,
+              ph.responsible_party, ph.expected_days,
+              ph.started_at,
+              EXTRACT(DAY FROM NOW() - ph.started_at)::int AS days_active,
+              CASE WHEN ph.expected_days IS NOT NULL
+                   THEN (ph.started_at::date + CEIL(ph.expected_days)::int)
+                   ELSE NULL END AS expected_end_date,
+              CASE WHEN ph.expected_days IS NOT NULL
+                   THEN GREATEST(0,
+                          (CURRENT_DATE - (ph.started_at::date + CEIL(ph.expected_days)::int)))
+                   ELSE NULL END AS days_overdue,
+              p.description AS project_name,
+              p.due_date::text AS project_due_date,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_to
+         FROM job_phases ph
+         JOIN projects p   ON p.id  = ph.project_id
+         LEFT JOIN clients   c ON c.id = p.client_id
+         LEFT JOIN employees e ON e.id = p.production_emp_id
+        WHERE ph.status = 'active'
+        ORDER BY ph.started_at`
+    );
+    res.json({ phases: rows });
+  } catch (e) { next(e); }
+});
+
+// ═════════════════════════════════════════════════════════════════════════
 // Staff absences + holidays (migration 043)
 // ═════════════════════════════════════════════════════════════════════════
 
