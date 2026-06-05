@@ -36,6 +36,7 @@ const inboundEmailRoutes = require('./routes/inbound-email');
 const projectProofsRoutes = require('./routes/project-proofs');
 const { scheduleProofArchiveSweep } = require('./lib/proof-archive-sweep');
 const schedulingRoutes    = require('./routes/scheduling');
+const inventoryRoutes     = require('./routes/inventory');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -101,6 +102,9 @@ app.use('/api',            projectProofsRoutes);
 // Scheduling system — install calendar (Phase 1), per-job tasks (Phase 2),
 // templates (Phase 3), resource conflict view (Phase 4). All staff-only.
 app.use('/api',            schedulingRoutes);
+// Inventory + PO system. Phase 1 = media rolls (vinyl). Mounted at /api
+// so its routes live under /api/inventory/...
+app.use('/api',            inventoryRoutes);
 // /api/clients MUST be mounted BEFORE the generic /api (lookupRoutes) mount,
 // otherwise lookup's catch-all `GET /clients/:id` eats `/api/clients/folder-mappings`
 // (parsing "folder-mappings" as an integer id and crashing the query).
