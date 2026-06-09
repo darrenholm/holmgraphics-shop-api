@@ -161,12 +161,18 @@ router.post('/jobs/:id/upload-links', requireStaff, async (req, res) => {
     const note = noteRaw.slice(0, 1000) || null;
 
     // Verify the job exists and grab the recipient's display name (for
-    // the email greeting).
+    // the email greeting) PLUS the assigned production staff member's
+    // email + name, so the invite email goes "from" them rather than
+    // the generic SHOP_FROM (which defaulted to whichever staffer the
+    // env var was set up under — Brady in our deploy).
     const job = await queryOne(
       `SELECT p.id, p.description AS project_name,
-              c.id AS client_id, c.fname, c.lname, c.company
+              c.id AS client_id, c.fname, c.lname, c.company,
+              e.email AS assigned_email,
+              TRIM(CONCAT_WS(' ', e.first_name, e.last_name)) AS assigned_name
          FROM projects p
-         LEFT JOIN clients c ON c.id = p.client_id
+         LEFT JOIN clients   c ON c.id = p.client_id
+         LEFT JOIN employees e ON e.id = p.production_emp_id
         WHERE p.id = $1`,
       [jobId]
     );
@@ -195,6 +201,12 @@ router.post('/jobs/:id/upload-links', requireStaff, async (req, res) => {
       uploadUrl:    url,
       expiresAt:    link.expires_at,
       note,
+      // Make the email come "from" the assigned staffer (Travis, Brady,
+      // whoever is on the job) so the customer's reply lands in the
+      // right inbox. The mailer drops the override if the address isn't
+      // on the verified shop domain, so we never get a Resend rejection.
+      assignedEmail: job.assigned_email || null,
+      assignedName:  job.assigned_name  || null,
     }).catch((e) => console.warn('upload-link email failed:', e.message));
 
     res.status(201).json({
