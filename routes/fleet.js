@@ -809,7 +809,15 @@ router.put('/vehicles/:id/finance', requireStaff, async (req, res, next) => {
          mileage_allowance_km  = EXCLUDED.mileage_allowance_km,
          excess_mileage_charge = EXCLUDED.excess_mileage_charge,
          notes                 = EXCLUDED.notes
-       RETURNING *`,
+       RETURNING id, vehicle_id, acquisition_type,
+                 acquisition_date::text AS acquisition_date,
+                 lender, account_number,
+                 purchase_price, down_payment, monthly_payment,
+                 term_months, interest_rate,
+                 start_date::text AS start_date,
+                 end_date::text   AS end_date,
+                 residual_value, mileage_allowance_km, excess_mileage_charge,
+                 notes, created_at, updated_at`,
       [
         vid, acqType,
         dat(b.acquisition_date), str(b.lender), str(b.account_number),
