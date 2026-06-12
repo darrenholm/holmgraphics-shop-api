@@ -31,6 +31,8 @@ const ledModulesRoutes   = require('./routes/led-modules');
 const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
+const fleetFordconnectRoutes = require('./routes/fleet-fordconnect');
+const cookieParser       = require('cookie-parser');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
 const projectProofsRoutes = require('./routes/project-proofs');
@@ -71,6 +73,9 @@ app.use(express.json({
   limit: '5mb',
   verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
 }));
+// FordConnect OAuth callback uses a signed state cookie for CSRF protection.
+// Parser runs site-wide so future cookie-based flows just work.
+app.use(cookieParser());
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/auth',       authRoutes);
@@ -125,6 +130,9 @@ app.use('/api/builder',      builderOrdersRoutes);
 // Smartcar telematics mounted BEFORE the generic fleet router so its
 // specific paths (e.g. /vehicles/:id/location) win over /vehicles/:id.
 app.use('/api/fleet',        fleetSmartcarRoutes);
+// FordConnect lives at /api/fleet/fordconnect/... — specific paths so
+// they don't collide with the generic /fleet/vehicles handlers below.
+app.use('/api',              fleetFordconnectRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
