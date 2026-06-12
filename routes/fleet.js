@@ -728,4 +728,112 @@ router.get('/access-log', requireStaff, async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ═════════════════════════════════════════════════════════════════════════
+// Vehicle finance — purchase / loan / lease details (migration 047)
+// ═════════════════════════════════════════════════════════════════════════
+
+// GET /api/fleet/vehicles/:id/finance — finance details for one vehicle.
+// Returns a placeholder { acquisition_type: 'owned' } shell when no row
+// exists yet so the UI can render the empty form without a 404 dance.
+router.get('/vehicles/:id/finance', requireStaff, async (req, res, next) => {
+  try {
+    const vid = parseInt(req.params.id, 10);
+    if (!Number.isInteger(vid)) return res.status(400).json({ message: 'invalid vehicle id' });
+    const row = await queryOne(
+      `SELECT id, vehicle_id, acquisition_type,
+              acquisition_date::text AS acquisition_date,
+              lender, account_number,
+              purchase_price, down_payment, monthly_payment,
+              term_months, interest_rate,
+              start_date::text AS start_date,
+              end_date::text   AS end_date,
+              residual_value, mileage_allowance_km, excess_mileage_charge,
+              notes,
+              created_at, updated_at
+         FROM vehicle_finance
+        WHERE vehicle_id = $1`,
+      [vid]
+    );
+    if (!row) {
+      return res.json({ vehicle_id: vid, acquisition_type: 'owned', _new: true });
+    }
+    res.json(row);
+  } catch (err) { next(err); }
+});
+
+// PUT /api/fleet/vehicles/:id/finance — upsert. Hit it whether the row
+// exists or not; we ON CONFLICT on vehicle_id.
+router.put('/vehicles/:id/finance', requireStaff, async (req, res, next) => {
+  try {
+    const vid = parseInt(req.params.id, 10);
+    if (!Number.isInteger(vid)) return res.status(400).json({ message: 'invalid vehicle id' });
+
+    const b = req.body || {};
+    const acqType = ['owned', 'financed', 'leased'].includes(b.acquisition_type)
+      ? b.acquisition_type : 'owned';
+    // A lease must carry an end date — the DB CHECK enforces it too, but
+    // catching it here gives a friendlier error than the constraint message.
+    if (acqType === 'leased' && !b.end_date) {
+      return res.status(400).json({ message: 'Lease end date is required for a leased vehicle.' });
+    }
+
+    // Helpers — coerce empty strings to NULL so blank inputs don't crash
+    // numeric columns.
+    const num = (v) => (v === '' || v == null) ? null : Number(v);
+    const int = (v) => (v === '' || v == null) ? null : parseInt(v, 10);
+    const str = (v) => (v === '' || v == null) ? null : String(v);
+    const dat = (v) => (v === '' || v == null) ? null : String(v).slice(0, 10);
+
+    const row = await queryOne(
+      `INSERT INTO vehicle_finance
+         (vehicle_id, acquisition_type, acquisition_date, lender, account_number,
+          purchase_price, down_payment, monthly_payment,
+          term_months, interest_rate,
+          start_date, end_date,
+          residual_value, mileage_allowance_km, excess_mileage_charge,
+          notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+       ON CONFLICT (vehicle_id) DO UPDATE SET
+         acquisition_type      = EXCLUDED.acquisition_type,
+         acquisition_date      = EXCLUDED.acquisition_date,
+         lender                = EXCLUDED.lender,
+         account_number        = EXCLUDED.account_number,
+         purchase_price        = EXCLUDED.purchase_price,
+         down_payment          = EXCLUDED.down_payment,
+         monthly_payment       = EXCLUDED.monthly_payment,
+         term_months           = EXCLUDED.term_months,
+         interest_rate         = EXCLUDED.interest_rate,
+         start_date            = EXCLUDED.start_date,
+         end_date              = EXCLUDED.end_date,
+         residual_value        = EXCLUDED.residual_value,
+         mileage_allowance_km  = EXCLUDED.mileage_allowance_km,
+         excess_mileage_charge = EXCLUDED.excess_mileage_charge,
+         notes                 = EXCLUDED.notes
+       RETURNING *`,
+      [
+        vid, acqType,
+        dat(b.acquisition_date), str(b.lender), str(b.account_number),
+        num(b.purchase_price), num(b.down_payment), num(b.monthly_payment),
+        int(b.term_months), num(b.interest_rate),
+        dat(b.start_date), dat(b.end_date),
+        num(b.residual_value), int(b.mileage_allowance_km), num(b.excess_mileage_charge),
+        str(b.notes),
+      ]
+    );
+    res.json(row);
+  } catch (err) { next(err); }
+});
+
+// DELETE /api/fleet/vehicles/:id/finance — clear the row (e.g. lease
+// paid out, vehicle is now owned outright with no remaining obligations
+// to track).
+router.delete('/vehicles/:id/finance', requireStaff, async (req, res, next) => {
+  try {
+    const vid = parseInt(req.params.id, 10);
+    if (!Number.isInteger(vid)) return res.status(400).json({ message: 'invalid vehicle id' });
+    await query(`DELETE FROM vehicle_finance WHERE vehicle_id = $1`, [vid]);
+    res.status(204).end();
+  } catch (err) { next(err); }
+});
+
 module.exports = router;
