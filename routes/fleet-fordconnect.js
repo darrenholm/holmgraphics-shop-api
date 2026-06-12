@@ -48,7 +48,11 @@ router.get('/fleet/fordconnect/status', requireStaff, async (req, res, next) => 
 });
 
 // ─── OAuth initiation — redirect to Ford ───────────────────────────────
-router.get('/fleet/fordconnect/authorize', requireStaff, (req, res, next) => {
+// NOT staff-gated. Browser navigations can't carry a Bearer header, and
+// the OAuth flow itself (state cookie + Ford's own login) is the
+// security boundary. The destructive endpoints (sync, unlink, vehicles)
+// keep staff auth.
+router.get('/fleet/fordconnect/authorize', (req, res, next) => {
   try {
     if (!ford.isConfigured()) {
       return res.status(503).json({ message: 'FordConnect not configured on the server.' });
@@ -89,10 +93,12 @@ router.get('/fleet/fordconnect/callback', async (req, res, next) => {
          (employee_id, access_token, refresh_token, expires_at, scope, last_status, last_synced_at)
        VALUES ($1, $2, $3, $4, $5, 'Connected — sync pending', NULL)
        RETURNING id`,
-      [req.user?.id || null, tok.access_token, tok.refresh_token, expiresAt, tok.scope || null]
+      [null, tok.access_token, tok.refresh_token, expiresAt, tok.scope || null]
     );
-    // Redirect the staffer back into the fleet UI.
-    res.redirect('/fleet-admin?fordconnect=linked');
+    // Redirect back to the SHOP UI (the API doesn't host /fleet-admin).
+    // PUBLIC_SHOP_URL is the same env var routes/project-proofs.js uses.
+    const shopBase = (process.env.PUBLIC_SHOP_URL || 'https://shop.holmgraphics.ca').replace(/\/$/, '');
+    res.redirect(`${shopBase}/fleet-admin?fordconnect=linked`);
   } catch (e) { next(e); }
 });
 
