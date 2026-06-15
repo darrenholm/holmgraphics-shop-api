@@ -947,14 +947,23 @@ router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
   // Compute lunch deductions across all period entries
   const deductions = _computeLunchDeductions(rows);
 
-  // Group entries by employee and sum hours
-  const employeeHours = new Map();
-  const processedEntries = new Map(); // Track which entries we process
   let skippedNoMapping = 0;
   let skippedAlreadySynced = 0;
-  const unmappedEmployees     = new Set();   // names — for actionable error UI
+  const unmappedEmployees      = new Set();   // names — for actionable error UI
   const alreadySyncedEmployees = new Set();
 
+  // Sync results
+  let syncedEntries = 0;
+  let totalHours = 0;
+  const errors = [];
+  const syncedEmployeeIds = new Set();        // distinct employees with >=1 pushed entry
+
+  // Push ONE TimeActivity PER DAY (per entry), dated on the actual work day.
+  // QBO Payroll only feeds realistic single-day hours into Run Payroll — a
+  // lumped multi-day total stuffed onto one date is accepted as an accounting
+  // record (so the create succeeds and we'd flag it "synced") but is silently
+  // ignored by payroll. That lumping is why hours stopped reaching paychecks;
+  // mirroring the per-day shape of /sync-time-period restores the working flow.
   for (const r of rows) {
     // Skip entries already synced to payroll
     if (r.qbo_synced_at) {
@@ -970,12 +979,12 @@ router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
       continue;
     }
 
-    // Calculate paid minutes (after lunch deduction)
+    // Paid minutes after lunch deduction, for THIS day's entry
     const clockMinutes = Math.round(
       (new Date(r.clock_out) - new Date(r.clock_in)) / 60000
     );
     const lunchMinutes = deductions.get(r.id) || 0;
-    const paidMinutes = Math.max(0, clockMinutes - lunchMinutes);
+    const paidMinutes  = Math.max(0, clockMinutes - lunchMinutes);
 
     if (paidMinutes <= 0) {
       // Skip zero-hour entries
@@ -983,82 +992,47 @@ router.post('/sync-payroll/:id', requireAdmin, async (req, res) => {
       continue;
     }
 
-    // Convert minutes to decimal hours
-    const hours = paidMinutes / 60;
+    const txnDate = _localDateKey(r.clock_in);
+    const payload = {
+      TxnDate: txnDate,                          // the actual work day, not the period start
+      NameOf:  'Employee',
+      EmployeeRef: { value: r.qbo_employee_id },
+      Hours:   Math.floor(paidMinutes / 60),
+      Minutes: paidMinutes % 60,
+      Description: `Payroll sync ${txnDate} (period ${payPeriod.start_date}–${payPeriod.end_date})`,
+      BillableStatus: 'NotBillable',             // Payroll hours are not billable
+    };
 
-    // Group by employee
-    if (!employeeHours.has(r.employee_id)) {
-      employeeHours.set(r.employee_id, {
-        employee_id: r.employee_id,
-        employee_name: r.employee_name,
-        qbo_employee_id: r.qbo_employee_id,
-        hours: 0,
-        entries: [],
-      });
-    }
-
-    const emp = employeeHours.get(r.employee_id);
-    emp.hours += hours;
-    emp.entries.push(r.id);
-    processedEntries.set(r.id, true);
-  }
-
-  // Track sync results
-  let syncedEmployees = 0;
-  let syncedEntries = 0;
-  let totalHours = 0;
-  const errors = [];
-
-  // Sync each employee's hours to QBO Payroll
-  for (const [, empData] of employeeHours) {
     try {
-      // Call QBO Payroll API to update employee hours
-      // The payload structure for QBO Payroll's batch hours endpoint:
-      // POST /payroll/employees/{employeeId}/timeactivity
-      // or similar (exact endpoint depends on QBO Payroll API version)
-      //
-      // For now, we'll use a generalized approach with the TimeActivity
-      // endpoint, which is compatible with QBO's payroll tracking.
-      // In production, this may need to be updated based on the specific
-      // payroll system being used.
-
-      const txnDate = _localDateKey(payPeriod.start_date);
-      const payload = {
-        TxnDate: txnDate,
-        NameOf: 'Employee',
-        EmployeeRef: { value: empData.qbo_employee_id },
-        Hours: Math.floor(empData.hours),
-        Minutes: Math.round((empData.hours % 1) * 60),
-        Description: `Payroll sync for period ${payPeriod.start_date} to ${payPeriod.end_date}`,
-        BillableStatus: 'NotBillable', // Payroll hours are not billable
-      };
-
-      // POST to QBO — the TimeActivity endpoint can be used for payroll tracking
       const result = await qbPost('/timeactivity?minorversion=65', payload);
       const newId = result?.TimeActivity?.Id;
       if (!newId) {
         throw new Error('QBO did not return a TimeActivity Id');
       }
 
-      // Mark all entries for this employee as synced to payroll
+      // Record the QBO id (so the record is traceable/deletable) and flag synced.
       await query(
         `UPDATE time_entries
-            SET qbo_synced_at = NOW()
-          WHERE id = ANY($1::int[])`,
-        [empData.entries]
+            SET qbo_time_activity_id = $1,
+                qbo_synced_at = NOW()
+          WHERE id = $2`,
+        [newId, r.id]
       );
 
-      syncedEmployees++;
-      syncedEntries += empData.entries.length;
-      totalHours += empData.hours;
+      syncedEntries++;
+      totalHours += paidMinutes / 60;
+      syncedEmployeeIds.add(r.employee_id);
     } catch (err) {
       errors.push({
-        employee_name: empData.employee_name,
-        employee_id: empData.employee_id,
+        employee_name: r.employee_name,
+        employee_id:   r.employee_id,
+        entry_id:      r.id,
         message: err.qbDetail || err.message || String(err),
       });
     }
   }
+
+  const syncedEmployees = syncedEmployeeIds.size;
 
   // Record the sync attempt in qbo_payroll_syncs table
   if (syncedEmployees > 0 || errors.length === 0) {
