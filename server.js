@@ -32,11 +32,13 @@ const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const fleetFordconnectRoutes = require('./routes/fleet-fordconnect');
+const fleetFordproRoutes = require('./routes/fleet-fordpro');
 const cookieParser       = require('cookie-parser');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
 const projectProofsRoutes = require('./routes/project-proofs');
 const { scheduleProofArchiveSweep } = require('./lib/proof-archive-sweep');
+const { scheduleFordproPoll } = require('./lib/fordpro-telematics');
 const schedulingRoutes    = require('./routes/scheduling');
 const inventoryRoutes     = require('./routes/inventory');
 
@@ -133,6 +135,8 @@ app.use('/api/fleet',        fleetSmartcarRoutes);
 // FordConnect lives at /api/fleet/fordconnect/... — specific paths so
 // they don't collide with the generic /fleet/vehicles handlers below.
 app.use('/api',              fleetFordconnectRoutes);
+// Ford Pro Telematics (M2M) at /api/fleet/fordpro/... — same reasoning.
+app.use('/api',              fleetFordproRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
@@ -185,6 +189,11 @@ app.use((err, req, res, next) => {
   // superseded proof files from WHC). Self-scheduling, never blocks
   // request handling. See lib/proof-archive-sweep.js.
   scheduleProofArchiveSweep();
+
+  // Background: Ford Pro Telematics poll (location/odometer/fuel every
+  // FORD_TELEMATICS_POLL_MINUTES). Self-scheduling; no-ops until the
+  // service-account creds are set. See lib/fordpro-telematics.js.
+  scheduleFordproPoll();
 
   app.listen(PORT, () => {
     let dbHost = '(DATABASE_URL not set)';
