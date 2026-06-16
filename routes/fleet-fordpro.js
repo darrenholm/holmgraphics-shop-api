@@ -1,9 +1,8 @@
 // routes/fleet-fordpro.js
-// Ford Pro Telematics endpoints (migration 049). Machine-to-machine, so there's
-// no OAuth redirect flow here — that's the consumer FordConnect integration at
-// routes/fleet-fordconnect.js. Telemetry refreshes on a server-side poller
-// (lib/fordpro-telematics.js); these routes expose status, a manual refresh,
-// and the cached snapshot.
+// Ford Pro Telematics endpoints (migration 049). Machine-to-machine — a single
+// service account (client credentials), so there's no per-user OAuth redirect
+// flow. Telemetry refreshes on a server-side poller (lib/fordpro-telematics.js);
+// these routes expose status, a manual refresh, and the cached snapshot.
 //
 //   GET  /api/fleet/fordpro/status     → configured + poll state + counts
 //   POST /api/fleet/fordpro/sync       → poll Ford now (manual refresh)

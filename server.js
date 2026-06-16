@@ -31,7 +31,6 @@ const ledModulesRoutes   = require('./routes/led-modules');
 const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
-const fleetFordconnectRoutes = require('./routes/fleet-fordconnect');
 const fleetFordproRoutes = require('./routes/fleet-fordpro');
 const cookieParser       = require('cookie-parser');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
@@ -132,10 +131,8 @@ app.use('/api/builder',      builderOrdersRoutes);
 // Smartcar telematics mounted BEFORE the generic fleet router so its
 // specific paths (e.g. /vehicles/:id/location) win over /vehicles/:id.
 app.use('/api/fleet',        fleetSmartcarRoutes);
-// FordConnect lives at /api/fleet/fordconnect/... — specific paths so
+// Ford Pro Telematics (M2M) at /api/fleet/fordpro/... — specific paths so
 // they don't collide with the generic /fleet/vehicles handlers below.
-app.use('/api',              fleetFordconnectRoutes);
-// Ford Pro Telematics (M2M) at /api/fleet/fordpro/... — same reasoning.
 app.use('/api',              fleetFordproRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
