@@ -72,4 +72,16 @@ router.get('/fleet/fordpro/vehicles', requireStaff, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── Diagnostic: raw /v3/vehicles response (temporary) ─────────────────
+// Returns exactly what Ford sends so we can confirm shape vs empty list.
+// Remove once telemetry is confirmed flowing.
+router.get('/fleet/fordpro/debug', requireStaff, async (req, res, next) => {
+  try {
+    const vehicles = await fordpro.rawGet('/v3/vehicles');
+    res.json({ vehicles });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
 module.exports = router;
