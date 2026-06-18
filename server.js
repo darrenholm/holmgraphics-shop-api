@@ -32,6 +32,7 @@ const builderOrdersRoutes = require('./routes/builder-orders');
 const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const fleetFordproRoutes = require('./routes/fleet-fordpro');
+const fleetTelematicsRoutes = require('./routes/fleet-telematics');
 const cookieParser       = require('cookie-parser');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
@@ -134,6 +135,8 @@ app.use('/api/fleet',        fleetSmartcarRoutes);
 // Ford Pro Telematics (M2M) at /api/fleet/fordpro/... — specific paths so
 // they don't collide with the generic /fleet/vehicles handlers below.
 app.use('/api',              fleetFordproRoutes);
+// Provider-agnostic telematics read layer at /api/fleet/telematics/...
+app.use('/api',              fleetTelematicsRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
