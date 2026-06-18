@@ -77,8 +77,9 @@ router.get('/fleet/fordpro/vehicles', requireStaff, async (req, res, next) => {
 // Remove once telemetry is confirmed flowing.
 router.get('/fleet/fordpro/debug', requireStaff, async (req, res, next) => {
   try {
-    const vehicles = await fordpro.rawGet('/v3/vehicles');
-    res.json({ vehicles });
+    const path = typeof req.query.path === 'string' && req.query.path ? req.query.path : '/v3/vehicles';
+    const result = await fordpro.rawGet(path);
+    res.json({ path, result });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
