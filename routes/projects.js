@@ -1214,4 +1214,58 @@ router.post('/admin/backfill-photos', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── POST /api/projects/:id/email-quote ──────────────────────────────────────
+// Emails a generated quote PDF straight to the customer via Resend, replacing
+// the old .eml / desktop-mail-client handoff (which kept failing to file a copy
+// in the staffer's Sent folder). The frontend generates the PDF and posts it
+// base64-encoded. The sender is BCC'd so they keep their own copy.
+//   Body: { to?, subject?, body?, pdf_base64, filename? }
+router.post('/:id/email-quote', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'invalid id' });
+
+  const { to, subject, body, pdf_base64, filename } = req.body || {};
+  if (!pdf_base64) return res.status(400).json({ message: 'pdf_base64 required' });
+
+  // Recipient: trust the frontend's `to`, else fall back to the project's
+  // contact/client email (same precedence used elsewhere in the app).
+  let recipient = (to || '').trim();
+  if (!recipient) {
+    try {
+      const proj = await queryOne(
+        `SELECT p.contact_email, c.email AS client_email
+           FROM projects p
+           LEFT JOIN clients c ON c.id = p.client_id
+          WHERE p.id = $1`,
+        [id]
+      );
+      recipient = (proj?.contact_email || proj?.client_email || '').trim();
+    } catch { /* fall through to the no-recipient error */ }
+  }
+  if (!recipient) {
+    return res.status(400).json({ message: 'No recipient email — set a contact or client email on the job first.' });
+  }
+
+  try {
+    const result = await mailer.sendJobQuote({
+      to:          recipient,
+      bccSelf:     req.user?.email || undefined,   // sender keeps a copy
+      fromName:    req.user?.name  || undefined,
+      fromEmail:   req.user?.email || undefined,
+      replyTo:     req.user?.email || undefined,
+      subject:     subject || `Quote #${id} — Holm Graphics`,
+      bodyText:    body || '',
+      pdfBase64:   pdf_base64,
+      pdfFilename: filename || `Quote-${id}.pdf`,
+    });
+    if (!result.ok) {
+      return res.status(502).json({ message: result.error || 'Email send failed' });
+    }
+    res.json({ ok: true, sent_to: recipient, message_id: result.message_id || null });
+  } catch (e) {
+    console.error('POST /projects/:id/email-quote failed:', e);
+    res.status(500).json({ message: 'Email failed', detail: e.message });
+  }
+});
+
 module.exports = router;
