@@ -287,6 +287,44 @@ router.get('/photos/all', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── GET /api/projects/summary ───────────────────────────────────────────────
+// Job-board stat strip for the owner/admin: a snapshot of the active production
+// pipeline (statuses 2..10, "Ordered" → "Billing" — the contiguous range
+// between the Quote stage and Complete). Returns:
+//   active_count   — jobs currently in the shop (Ordered..Billing)
+//   quoted_value   — sum of every active job's line-item value
+//   unpriced_count — active jobs with $0 of value (no pricing entered yet)
+//
+// Per-job value = manual line items (items.ext_price) + any linked online
+// order (orders.grand_total); a job is "unpriced" only when BOTH are zero.
+//
+// MUST be defined before `/:id` or Express matches "summary" as an :id.
+const ACTIVE_STATUS_MIN = 2;   // Ordered
+const ACTIVE_STATUS_MAX = 10;  // Billing
+router.get('/summary', requireAdmin, async (req, res) => {
+  try {
+    const jobValue =
+      `((SELECT COALESCE(SUM(ext_price), 0) FROM items  WHERE project_id = p.id)
+      + (SELECT COALESCE(SUM(grand_total), 0) FROM orders WHERE job_id     = p.id))`;
+    const row = await queryOne(
+      `SELECT COUNT(*)::int                                            AS active_count,
+              COALESCE(SUM(${jobValue}), 0)::numeric                   AS quoted_value,
+              SUM(CASE WHEN ${jobValue} = 0 THEN 1 ELSE 0 END)::int    AS unpriced_count
+         FROM projects p
+        WHERE p.status_id BETWEEN $1 AND $2`,
+      [ACTIVE_STATUS_MIN, ACTIVE_STATUS_MAX]
+    );
+    res.json({
+      active_count:   row?.active_count   ?? 0,
+      quoted_value:   Number(row?.quoted_value) || 0,
+      unpriced_count: row?.unpriced_count ?? 0,
+    });
+  } catch (e) {
+    console.error('GET /projects/summary:', e);
+    res.status(500).json({ message: 'Failed to load summary', detail: e.message });
+  }
+});
+
 // ─── GET /api/projects/:id ───────────────────────────────────────────────────
 router.get('/:id', requireAuth, async (req, res) => {
   try {
