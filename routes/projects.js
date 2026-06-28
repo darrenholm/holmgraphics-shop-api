@@ -152,14 +152,17 @@ router.get('/', requireAuth, async (req, res) => {
               -- Per-job quoted value: manual line items + any linked online
               -- order, same definition as the /summary stat strip. Lets the
               -- dashboard flag high-value jobs (> $2,500) on the card.
-              ((SELECT COALESCE(SUM(ext_price),   0) FROM items  WHERE project_id = p.id)
-             + (SELECT COALESCE(SUM(grand_total), 0) FROM orders WHERE job_id     = p.id)
-              )::numeric AS quoted_value
+              -- Each total is aggregated ONCE via the grouped joins below
+              -- rather than a correlated subquery per row — the per-row form
+              -- made this list crawl across the full projects table.
+              (COALESCE(iv.total, 0) + COALESCE(ov.total, 0))::numeric AS quoted_value
          FROM projects p
          LEFT JOIN clients      c  ON p.client_id        = c.id
          LEFT JOIN status       s  ON p.status_id        = s.id
          LEFT JOIN project_type pt ON p.project_type_id  = pt.id
          LEFT JOIN employees    e  ON p.production_emp_id = e.id
+         LEFT JOIN (SELECT project_id, SUM(ext_price)   AS total FROM items  GROUP BY project_id) iv ON iv.project_id = p.id
+         LEFT JOIN (SELECT job_id,     SUM(grand_total) AS total FROM orders GROUP BY job_id)     ov ON ov.job_id     = p.id
         WHERE ${where.join(' AND ')}
         ORDER BY p.created_date DESC NULLS LAST, p.id DESC`,
       params
