@@ -148,7 +148,13 @@ router.get('/', requireAuth, async (req, res) => {
               c.files_folder AS client_folder_override,
               s.name AS status_name,
               pt.name AS project_type,
-              CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_to
+              CONCAT_WS(' ', e.first_name, e.last_name) AS assigned_to,
+              -- Per-job quoted value: manual line items + any linked online
+              -- order, same definition as the /summary stat strip. Lets the
+              -- dashboard flag high-value jobs (> $2,500) on the card.
+              ((SELECT COALESCE(SUM(ext_price),   0) FROM items  WHERE project_id = p.id)
+             + (SELECT COALESCE(SUM(grand_total), 0) FROM orders WHERE job_id     = p.id)
+              )::numeric AS quoted_value
          FROM projects p
          LEFT JOIN clients      c  ON p.client_id        = c.id
          LEFT JOIN status       s  ON p.status_id        = s.id
