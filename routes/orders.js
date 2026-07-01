@@ -38,6 +38,7 @@ const shiptime = require('../lib/shiptime');
 const qbPayments = require('../lib/qb-payments');
 const mailer = require('../lib/customer-mailer');
 const { maybePromoteJob } = require('../lib/promote-job');
+const { sendJobAssignedSms } = require('../lib/employee-notifier');
 const {
   validateUnitPriceOverrides,
   applyUnitPriceOverrides,
@@ -547,6 +548,9 @@ router.post('/', requireCustomer, async (req, res) => {
     // Internal staff alert (Darren/Brady) — independent of the customer
     // email. Recipients come from env SHOP_NEW_ORDER_TO. Idempotent.
     mailer.sendStaffNewOrderAlert({ orderId: order.id, db }).catch(() => {});
+    // Text the production employee the job auto-assigned to (Brady). Idempotent
+    // per (job, employee) via sms_log. Fire-and-forget — never blocks/fails.
+    sendJobAssignedSms({ projectId: createdJobId, db, orderId: order.id }).catch(() => {});
 
     res.status(201).json({
       ok: true,
@@ -953,6 +957,9 @@ router.post('/office', requireStaff, async (req, res) => {
     // Staff alert (Darren/Brady) — fires for ALL new orders, including
     // walk-in/invoice-pending so the office knows production is queuing up.
     mailer.sendStaffNewOrderAlert({ orderId: order.id, db }).catch(() => {});
+    // Text the production employee the job auto-assigned to. Idempotent per
+    // (job, employee) via sms_log. Fire-and-forget — never blocks/fails.
+    sendJobAssignedSms({ projectId: createdJobId, db, orderId: order.id }).catch(() => {});
 
     res.status(201).json({
       ok: true,

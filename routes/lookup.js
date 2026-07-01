@@ -111,7 +111,8 @@ router.post('/clients', requireStaff, async (req, res) => {
 router.get('/employees', requireStaff, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, first_name, last_name, email, role, qbo_employee_id
+      `SELECT id, first_name, last_name, email, role, qbo_employee_id,
+              phone_number, phone_extension
          FROM employees
         WHERE active IS TRUE OR active IS NULL
         ORDER BY last_name, first_name`
@@ -152,6 +153,46 @@ router.put('/employees/:id/qbo-mapping', requireAdmin, async (req, res) => {
     res.json(result[0]);
   } catch (e) {
     console.error('PUT /employees/:id/qbo-mapping:', e);
+    res.status(500).json({ message: 'Update failed', detail: e.message });
+  }
+});
+
+// ─── PUT /api/employees/:id/contact ──────────────────────────────────────────
+// Set an employee's mobile number (where job-assignment texts go) and their
+// SkySwitch PBX extension. Either field may be sent; an empty string clears it.
+//
+// Body: { phone_number?: string|null, phone_extension?: string|null }
+//
+// Admin-only. Returns the updated row. phone_number is stored as entered —
+// lib/sms.js normalizes to E.164 at send time.
+router.put('/employees/:id/contact', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  const clean = (v) => {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s === '' ? null : s;
+  };
+  const phone = clean(req.body?.phone_number);
+  const ext   = clean(req.body?.phone_extension);
+  try {
+    const result = await query(
+      `UPDATE employees
+          SET phone_number    = $1,
+              phone_extension = $2
+        WHERE id = $3
+       RETURNING id, first_name, last_name, email, role, qbo_employee_id,
+                 phone_number, phone_extension`,
+      [phone, ext, id]
+    );
+    if (result.length === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+    res.json(result[0]);
+  } catch (e) {
+    console.error('PUT /employees/:id/contact:', e);
     res.status(500).json({ message: 'Update failed', detail: e.message });
   }
 });

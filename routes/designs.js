@@ -27,6 +27,7 @@ const { query, queryOne, pool } = require('../db/connection');
 const { requireCustomer } = require('../middleware/customer-auth');
 const filesBridge = require('../lib/files-bridge-client');
 const { maybePromoteJob } = require('../lib/promote-job');
+const { sendJobAssignedSms } = require('../lib/employee-notifier');
 const { slugify } = require('../lib/slugify');
 
 const router = express.Router();
@@ -143,6 +144,7 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
     // — that step is unrolled (delete on failure) only by an admin sweep,
     // never automatically. Same trade-off the original code made.
     let orderAdvanced = false;
+    let promotedJobId = null;
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
@@ -182,7 +184,8 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
       // arrive here un-promoted. The helper is idempotent — if the project
       // is already past Quote, this is a no-op. The check matters for the
       // case where the order was placed before auto-promote shipped.
-      await maybePromoteJob(dbClient, row.order_id);
+      const promo = await maybePromoteJob(dbClient, row.order_id);
+      promotedJobId = promo && promo.job_id ? promo.job_id : null;
 
       await dbClient.query('COMMIT');
     } catch (txErr) {
@@ -190,6 +193,13 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
       throw txErr;
     } finally {
       dbClient.release();
+    }
+
+    // Text the production employee if this upload promoted the job (assigning
+    // it to production). Idempotent per (job, employee); no-op if already sent
+    // at checkout. Fire-and-forget — never blocks the upload response.
+    if (promotedJobId) {
+      sendJobAssignedSms({ projectId: promotedJobId, db: { query, queryOne }, orderId: row.order_id }).catch(() => {});
     }
 
     res.json({

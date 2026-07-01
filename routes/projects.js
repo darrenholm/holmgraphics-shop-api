@@ -7,6 +7,8 @@ const { query, queryOne } = db;
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const { runBackfill } = require('../db/backfill-photos');
 const mailer = require('../lib/customer-mailer');
+const { sendJobAssignedSms } = require('../lib/employee-notifier');
+const { sendJobReadyNotifications } = require('../lib/client-notifier');
 const facebook = require('../lib/facebook');
 const multer = require('multer');
 const path = require('path');
@@ -521,7 +523,13 @@ router.post('/', requireStaff, async (req, res) => {
         po_number ? String(po_number).trim() || null : null,
       ]
     );
-    res.status(201).json({ id: rows[0]?.id, message: 'Project created' });
+    const newProjectId = rows[0]?.id;
+    // Text the assigned employee if the job was created already assigned to
+    // someone. Idempotent per (job, employee). Fire-and-forget.
+    if (newProjectId && assigned_employee_id) {
+      sendJobAssignedSms({ projectId: newProjectId, db }).catch(() => {});
+    }
+    res.status(201).json({ id: newProjectId, message: 'Project created' });
   } catch (e) {
     console.error('POST /projects:', e);
     res.status(500).json({ message: 'Failed to create project', detail: e.message });
@@ -536,7 +544,14 @@ router.put('/:id', requireStaff, async (req, res) => {
     assigned_employee_id, due_date, contact, contact_phone, contact_email,
     po_number,
   } = req.body;
+  const newEmpId = assigned_employee_id ? parseInt(assigned_employee_id) : null;
   try {
+    // Read the current assignee first so we can tell a genuine reassignment
+    // from an unrelated edit (this PUT rewrites every field on every save).
+    const before = await queryOne(
+      'SELECT production_emp_id FROM projects WHERE id = $1',
+      [id]
+    );
     await query(
       `UPDATE projects
           SET description       = $1,
@@ -555,7 +570,7 @@ router.put('/:id', requireStaff, async (req, res) => {
         parseInt(client_id),
         project_type_id ? parseInt(project_type_id) : null,
         status_id ? parseInt(status_id) : null,
-        assigned_employee_id ? parseInt(assigned_employee_id) : null,
+        newEmpId,
         due_date ? new Date(due_date) : null,
         contact || null,
         contact_phone || null,
@@ -564,10 +579,46 @@ router.put('/:id', requireStaff, async (req, res) => {
         id,
       ]
     );
+    // Text the newly-assigned employee only when the assignee actually changed
+    // to a real person. Idempotent per (job, employee). Fire-and-forget.
+    if (newEmpId && newEmpId !== (before ? before.production_emp_id : null)) {
+      sendJobAssignedSms({ projectId: id, db }).catch(() => {});
+    }
     res.json({ message: 'Project updated' });
   } catch (e) {
     console.error('PUT /projects/:id:', e);
     res.status(500).json({ message: 'Failed to update project', detail: e.message });
+  }
+});
+
+// ─── POST /api/projects/:id/notify-ready ─────────────────────────────────────
+// Staff "Notify ready for pickup" button on the job card. Emails and/or texts
+// the client that their job is ready. Sends over whichever channels are asked
+// for AND the client has on file; contact prefers the project-level contact,
+// falls back to the client account. Manual + repeatable (no dedupe).
+//
+// Body: { email?: boolean, sms?: boolean }  (both default true)
+// Returns the per-channel result so the UI can report exactly what went out.
+router.post('/:id/notify-ready', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  const email = req.body?.email !== false; // default true
+  const sms   = req.body?.sms   !== false; // default true
+  if (!email && !sms) {
+    return res.status(400).json({ message: 'select at least one channel' });
+  }
+  try {
+    const result = await sendJobReadyNotifications({ projectId: id, db, email, sms });
+    if (result.error) {
+      const code = result.error === 'project_not_found' ? 404 : 500;
+      return res.status(code).json({ message: result.error });
+    }
+    res.json(result);
+  } catch (e) {
+    console.error('POST /projects/:id/notify-ready:', e);
+    res.status(500).json({ message: 'Failed to notify client', detail: e.message });
   }
 });
 
