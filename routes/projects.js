@@ -615,6 +615,31 @@ router.post('/:id/notify-ready', requireStaff, async (req, res) => {
       const code = result.error === 'project_not_found' ? 404 : 500;
       return res.status(code).json({ message: result.error });
     }
+
+    // Log a note on the job recording what was sent. The note's author
+    // (notes.created_by = the staff member who clicked) captures "by who" —
+    // the Notes tab renders it. Best-effort: never block/fail the response.
+    const anySent = Boolean((result.email && result.email.sent) || (result.sms && result.sms.sent));
+    if (anySent && Number.isInteger(req.user?.id)) {
+      const humanize = (r) => ({
+        no_email: 'no email on file', no_phone: 'no phone on file',
+        invalid_phone: 'invalid phone', send_failed: 'send failed',
+      }[r] || r || 'not sent');
+      const parts = [];
+      if (result.email) parts.push(result.email.sent ? `email → ${result.email.to}` : `email not sent (${humanize(result.email.reason)})`);
+      if (result.sms)   parts.push(result.sms.sent   ? `text → ${result.sms.to}`   : `text not sent (${humanize(result.sms.reason)})`);
+      const note = `📣 Ready-for-pickup notification sent — ${parts.join('; ')}`;
+      try {
+        await query(
+          `INSERT INTO notes (project_id, note, created_by, created_at)
+           VALUES ($1, $2, $3, NOW())`,
+          [id, note, req.user.id]
+        );
+      } catch (noteErr) {
+        console.warn(`notify-ready: failed to add job note for project ${id}:`, noteErr.message);
+      }
+    }
+
     res.json(result);
   } catch (e) {
     console.error('POST /projects/:id/notify-ready:', e);
