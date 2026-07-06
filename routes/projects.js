@@ -7,7 +7,7 @@ const { query, queryOne } = db;
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const { runBackfill } = require('../db/backfill-photos');
 const mailer = require('../lib/customer-mailer');
-const { sendJobAssignedSms } = require('../lib/employee-notifier');
+const { sendJobAssignedSms, sendJobMessageSms } = require('../lib/employee-notifier');
 const { sendJobReadyNotifications } = require('../lib/client-notifier');
 const facebook = require('../lib/facebook');
 const multer = require('multer');
@@ -644,6 +644,53 @@ router.post('/:id/notify-ready', requireStaff, async (req, res) => {
   } catch (e) {
     console.error('POST /projects/:id/notify-ready:', e);
     res.status(500).json({ message: 'Failed to notify client', detail: e.message });
+  }
+});
+
+// ─── POST /api/projects/:id/message-employee ─────────────────────────────────
+// Staff "Text <assignee>" button on the job card. Sends a staff-composed SMS
+// to the employee currently assigned to the job (production_emp_id), prefixed
+// with the job number/title and suffixed with the job link. Manual +
+// repeatable (no dedupe — sms_log still records every send for audit).
+//
+// Body: { message: string }  (required, ≤600 chars)
+router.post('/:id/message-employee', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message) {
+    return res.status(400).json({ message: 'message is required' });
+  }
+  if (message.length > 600) {
+    return res.status(400).json({ message: 'message too long (600 char max)' });
+  }
+  try {
+    const result = await sendJobMessageSms({ projectId: id, message, db });
+    if (result.reason === 'project_not_found') {
+      return res.status(404).json({ message: 'project not found' });
+    }
+
+    // Record the send on the job's Notes tab — the note author (= the staff
+    // member who clicked) captures who sent it. Best-effort, never blocks.
+    if (result.sent && Number.isInteger(req.user?.id)) {
+      const note = `💬 Texted ${result.employee_name || 'assignee'} about this job: "${message}"`;
+      try {
+        await query(
+          `INSERT INTO notes (project_id, note, created_by, created_at)
+           VALUES ($1, $2, $3, NOW())`,
+          [id, note, req.user.id]
+        );
+      } catch (noteErr) {
+        console.warn(`message-employee: failed to add job note for project ${id}:`, noteErr.message);
+      }
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('POST /projects/:id/message-employee:', e);
+    res.status(500).json({ message: 'Failed to message employee', detail: e.message });
   }
 });
 
