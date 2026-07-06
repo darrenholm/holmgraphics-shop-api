@@ -7,7 +7,7 @@ const { query, queryOne } = db;
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const { runBackfill } = require('../db/backfill-photos');
 const mailer = require('../lib/customer-mailer');
-const { sendJobAssignedSms, sendJobMessageSms } = require('../lib/employee-notifier');
+const { sendJobAssignedSms, sendJobMessageSms, sendJobMessageEmail } = require('../lib/employee-notifier');
 const { sendJobReadyNotifications } = require('../lib/client-notifier');
 const facebook = require('../lib/facebook');
 const multer = require('multer');
@@ -648,12 +648,14 @@ router.post('/:id/notify-ready', requireStaff, async (req, res) => {
 });
 
 // ─── POST /api/projects/:id/message-employee ─────────────────────────────────
-// Staff "Text <assignee>" button on the job card. Sends a staff-composed SMS
-// to the employee currently assigned to the job (production_emp_id), prefixed
-// with the job number/title and suffixed with the job link. Manual +
-// repeatable (no dedupe — sms_log still records every send for audit).
+// Staff "Email <assignee>" button on the job card. Sends a staff-composed
+// message to the employee currently assigned to the job (production_emp_id),
+// with job #/title context and a link back to the job. Manual + repeatable.
 //
-// Body: { message: string }  (required, ≤600 chars)
+// Channel is email by default (Resend delivers today). channel:'sms' keeps
+// the SkySwitch path reachable for when outbound SMS provisioning is fixed.
+//
+// Body: { message: string, channel?: 'email' | 'sms' }  (message ≤600 chars)
 router.post('/:id/message-employee', requireStaff, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) {
@@ -666,8 +668,11 @@ router.post('/:id/message-employee', requireStaff, async (req, res) => {
   if (message.length > 600) {
     return res.status(400).json({ message: 'message too long (600 char max)' });
   }
+  const channel = req.body?.channel === 'sms' ? 'sms' : 'email';
   try {
-    const result = await sendJobMessageSms({ projectId: id, message, db });
+    const result = channel === 'sms'
+      ? await sendJobMessageSms({ projectId: id, message, db })
+      : await sendJobMessageEmail({ projectId: id, message, db, senderName: req.user?.name || null });
     if (result.reason === 'project_not_found') {
       return res.status(404).json({ message: 'project not found' });
     }
@@ -675,7 +680,8 @@ router.post('/:id/message-employee', requireStaff, async (req, res) => {
     // Record the send on the job's Notes tab — the note author (= the staff
     // member who clicked) captures who sent it. Best-effort, never blocks.
     if (result.sent && Number.isInteger(req.user?.id)) {
-      const note = `💬 Texted ${result.employee_name || 'assignee'} about this job: "${message}"`;
+      const verb = channel === 'sms' ? '💬 Texted' : '✉️ Emailed';
+      const note = `${verb} ${result.employee_name || 'assignee'} about this job: "${message}"`;
       try {
         await query(
           `INSERT INTO notes (project_id, note, created_by, created_at)
