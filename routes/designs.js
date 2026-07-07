@@ -89,6 +89,7 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
               o.client_id,
               o.job_id,
               o.status        AS order_status,
+              (SELECT pr.description FROM projects pr WHERE pr.id = o.job_id) AS job_description,
               c.id            AS client_id,
               c.fname, c.lname, c.company, c.files_folder,
               (SELECT pl.name
@@ -135,6 +136,7 @@ router.post('/:id/upload', requireCustomer, upload.single('file'), async (req, r
       fileName:  safeFilename,
       fileBuffer: req.file.buffer,
       mimeType:  req.file.mimetype,
+      desc:      row.job_description,
     });
 
     // Persist the artwork-path UPDATE, the order-status advancement, and the

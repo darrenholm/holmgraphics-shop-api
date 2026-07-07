@@ -63,7 +63,8 @@ router.post('/', requireStaff, upload.single('file'), async (req, res) => {
     if (!Number.isInteger(orderId)) return res.status(400).json({ error: 'order_id required' });
 
     const order = await queryOne(
-      `SELECT o.*, c.id AS client_id, c.email, c.fname, c.lname, c.company, c.files_folder
+      `SELECT o.*, c.id AS client_id, c.email, c.fname, c.lname, c.company, c.files_folder,
+              (SELECT pr.description FROM projects pr WHERE pr.id = o.job_id) AS job_description
          FROM orders o
          JOIN clients c ON c.id = o.client_id
         WHERE o.id = $1`,
@@ -94,6 +95,7 @@ router.post('/', requireStaff, upload.single('file'), async (req, res) => {
       fileName:  filename,
       fileBuffer: req.file.buffer,
       mimeType:  req.file.mimetype || 'application/octet-stream',
+      desc:      order.job_description,
     });
 
     // Insert the proof row.

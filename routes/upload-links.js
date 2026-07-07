@@ -292,7 +292,8 @@ router.post('/upload-links/:token/upload', upload.single('file'), async (req, re
     // resolution as routes/designs.js so client-uploaded files land
     // alongside customer-uploaded ones in the same job folder.
     const job = await queryOne(
-      `SELECT p.id, c.id AS client_id, c.fname, c.lname, c.company, c.files_folder,
+      `SELECT p.id, p.description AS job_description,
+              c.id AS client_id, c.fname, c.lname, c.company, c.files_folder,
               e.email AS assigned_email
          FROM projects p
          LEFT JOIN clients c   ON c.id = p.client_id
@@ -325,6 +326,7 @@ router.post('/upload-links/:token/upload', upload.single('file'), async (req, re
         fileName:  safeName,
         fileBuffer: req.file.buffer,
         mimeType:  req.file.mimetype,
+        desc:      job.job_description,
       });
     } catch (bridgeErr) {
       console.error(`[upload-links] bridge write failed for token ${token}:`, bridgeErr.message);
