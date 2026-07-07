@@ -10,7 +10,7 @@ router.post('/login', async (req, res) => {
   if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
   try {
     const user = await queryOne(
-      `SELECT id, first_name, last_name, email, role, password_hash, active
+      `SELECT id, first_name, last_name, email, role, password_hash, active, must_change_password
          FROM employees
         WHERE email = $1`,
       [email]
@@ -27,7 +27,9 @@ router.post('/login', async (req, res) => {
       name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
     };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
-    res.json({ token, user: payload });
+    // must_change_password rides on the user object (not the JWT) — the shop
+    // reads it to force a trip to /profile until the password is changed.
+    res.json({ token, user: { ...payload, must_change_password: user.must_change_password === true } });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ message: 'Login failed', detail: e.message });
@@ -43,11 +45,13 @@ router.post('/set-password', requireAdmin, async (req, res) => {
   if (!empNo || !password || password.length < 6) return res.status(400).json({ message: 'empNo and password required' });
   try {
     const hash = await bcrypt.hash(password, 12);
+    // Admin-assigned passwords are temporary by definition — flag the
+    // account so the shop forces a change on next login.
     await query(
-      `UPDATE employees SET password_hash = $1 WHERE id = $2`,
+      `UPDATE employees SET password_hash = $1, must_change_password = TRUE WHERE id = $2`,
       [hash, parseInt(empNo)]
     );
-    res.json({ message: 'Password updated' });
+    res.json({ message: 'Password updated; user must change it at next login' });
   } catch (e) {
     res.status(500).json({ message: 'Failed', detail: e.message });
   }
@@ -67,7 +71,7 @@ router.post('/change-password', requireAuth, async (req, res) => {
     if (!valid) return res.status(401).json({ message: 'Current password is incorrect' });
     const hash = await bcrypt.hash(new_password, 12);
     await query(
-      `UPDATE employees SET password_hash = $1 WHERE id = $2`,
+      `UPDATE employees SET password_hash = $1, must_change_password = FALSE WHERE id = $2`,
       [hash, req.user.id]
     );
     res.json({ message: 'Password changed successfully' });
