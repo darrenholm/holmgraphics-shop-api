@@ -2,7 +2,7 @@
 // Clients, Employees, Statuses, ProjectTypes — lookup/reference data.
 // Rewritten for Railway Postgres (pg driver, $1..$n placeholders).
 const express = require('express');
-const { query } = require('../db/connection');
+const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const router = express.Router();
 
@@ -154,6 +154,48 @@ router.put('/employees/:id/qbo-mapping', requireAdmin, async (req, res) => {
   } catch (e) {
     console.error('PUT /employees/:id/qbo-mapping:', e);
     res.status(500).json({ message: 'Update failed', detail: e.message });
+  }
+});
+
+// ─── POST /api/employees ─────────────────────────────────────────────────────
+// Create an employee. The row is immediately assignable to jobs and gets
+// notifications (email/text) if contact info is set — but CANNOT log into
+// the dashboard until an admin sets a password (password_hash stays NULL).
+//
+// Body: { first_name, last_name, email?, phone_number?, phone_extension?, role? }
+// role: 'staff' (default) | 'admin'
+router.post('/employees', requireAdmin, async (req, res) => {
+  const clean = (v) => {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s === '' ? null : s;
+  };
+  const first = clean(req.body?.first_name);
+  const last  = clean(req.body?.last_name);
+  if (!first && !last) {
+    return res.status(400).json({ message: 'first_name or last_name required' });
+  }
+  const email = clean(req.body?.email);
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ message: 'invalid email address' });
+  }
+  const role = req.body?.role === 'admin' ? 'admin' : 'staff';
+  try {
+    if (email) {
+      const dup = await queryOne(`SELECT id FROM employees WHERE LOWER(email) = LOWER($1)`, [email]);
+      if (dup) return res.status(409).json({ message: 'an employee with that email already exists' });
+    }
+    const result = await query(
+      `INSERT INTO employees (first_name, last_name, email, phone_number, phone_extension, role, active)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+       RETURNING id, first_name, last_name, email, role, qbo_employee_id,
+                 phone_number, phone_extension`,
+      [first, last, email, clean(req.body?.phone_number), clean(req.body?.phone_extension), role]
+    );
+    res.status(201).json(result[0]);
+  } catch (e) {
+    console.error('POST /employees:', e);
+    res.status(500).json({ message: 'Failed to create employee', detail: e.message });
   }
 });
 

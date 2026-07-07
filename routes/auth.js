@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query, queryOne } = require('../db/connection');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
 const router = express.Router();
 
 router.post('/login', async (req, res) => {
@@ -34,7 +34,11 @@ router.post('/login', async (req, res) => {
   }
 });
 
-router.post('/set-password', async (req, res) => {
+// Admin-only: sets ANY employee's password by id. This shipped with no auth
+// at all — anyone who found the API could take over any staff account.
+// Locked down 2026-07-07; admins set initial passwords for new staff, who
+// then use /change-password themselves.
+router.post('/set-password', requireAdmin, async (req, res) => {
   const { empNo, password } = req.body;
   if (!empNo || !password || password.length < 6) return res.status(400).json({ message: 'empNo and password required' });
   try {
