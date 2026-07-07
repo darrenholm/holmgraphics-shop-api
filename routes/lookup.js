@@ -158,10 +158,14 @@ router.put('/employees/:id/qbo-mapping', requireAdmin, async (req, res) => {
 });
 
 // ─── PUT /api/employees/:id/contact ──────────────────────────────────────────
-// Set an employee's mobile number (where job-assignment texts go) and their
-// SkySwitch PBX extension. Either field may be sent; an empty string clears it.
+// Set an employee's mobile number (where job-assignment texts go), their
+// SkySwitch PBX extension, and/or their email (where the job page's
+// "Email <assignee>" messages go). An empty string clears a field.
 //
-// Body: { phone_number?: string|null, phone_extension?: string|null }
+// Body: { phone_number?: string|null, phone_extension?: string|null, email?: string|null }
+//
+// email is only touched when the key is present in the body, so older UI
+// payloads that send just phone/extension can't clear it.
 //
 // Admin-only. Returns the updated row. phone_number is stored as entered —
 // lib/sms.js normalizes to E.164 at send time.
@@ -177,15 +181,21 @@ router.put('/employees/:id/contact', requireAdmin, async (req, res) => {
   };
   const phone = clean(req.body?.phone_number);
   const ext   = clean(req.body?.phone_extension);
+  const hasEmail = Object.prototype.hasOwnProperty.call(req.body || {}, 'email');
+  const email = clean(req.body?.email);
+  if (hasEmail && email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.status(400).json({ message: 'invalid email address' });
+  }
   try {
     const result = await query(
       `UPDATE employees
           SET phone_number    = $1,
-              phone_extension = $2
-        WHERE id = $3
+              phone_extension = $2,
+              email           = CASE WHEN $3 THEN $4 ELSE email END
+        WHERE id = $5
        RETURNING id, first_name, last_name, email, role, qbo_employee_id,
                  phone_number, phone_extension`,
-      [phone, ext, id]
+      [phone, ext, hasEmail, email, id]
     );
     if (result.length === 0) {
       return res.status(404).json({ message: 'Employee not found' });
