@@ -2,9 +2,18 @@
 // Clients, Employees, Statuses, ProjectTypes — lookup/reference data.
 // Rewritten for Railway Postgres (pg driver, $1..$n placeholders).
 const express = require('express');
+const multer = require('multer');
 const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
+const fleetStorage = require('../lib/fleet-storage');
 const router = express.Router();
+
+// In-memory upload for employee license images (cropped client-side, so
+// they arrive small — but cap at the storage layer's 25 MB regardless).
+const licenseUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: fleetStorage.MAX_BYTES, files: 1 },
+});
 
 // ─── GET /api/clients ────────────────────────────────────────────────────────
 // Optional: ?search=smith&limit=200
@@ -112,7 +121,7 @@ router.get('/employees', requireStaff, async (req, res) => {
   try {
     const rows = await query(
       `SELECT id, first_name, last_name, email, role, qbo_employee_id,
-              phone_number, phone_extension
+              phone_number, phone_extension, license_uploaded_at
          FROM employees
         WHERE active IS TRUE OR active IS NULL
         ORDER BY last_name, first_name`
@@ -246,6 +255,96 @@ router.put('/employees/:id/contact', requireAdmin, async (req, res) => {
   } catch (e) {
     console.error('PUT /employees/:id/contact:', e);
     res.status(500).json({ message: 'Update failed', detail: e.message });
+  }
+});
+
+// ─── Employee driver's license (admin-only, PII) ─────────────────────────────
+// The image lives on the fleet Railway Volume via lib/fleet-storage.js and is
+// only ever reachable through these authenticated routes — no public URL.
+
+// POST /api/employees/:id/license — upload/replace (multipart, field `file`).
+// The shop crops client-side before uploading. Replacing deletes the old file.
+router.post('/employees/:id/license', requireAdmin, licenseUpload.single('file'), async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'invalid id' });
+  if (!req.file) return res.status(400).json({ message: 'file field required (multipart/form-data)' });
+  try {
+    const emp = await queryOne(`SELECT id, license_file_path FROM employees WHERE id = $1`, [id]);
+    if (!emp) return res.status(404).json({ message: 'Employee not found' });
+
+    const saved = await fleetStorage.saveStaffDocument({
+      employeeId: id,
+      docType: 'license',
+      buffer: req.file.buffer,
+      mime: req.file.mimetype,
+    });
+
+    await query(
+      `UPDATE employees
+          SET license_file_path = $1, license_file_mime = $2, license_uploaded_at = NOW()
+        WHERE id = $3`,
+      [saved.file_path, saved.file_mime, id]
+    );
+
+    // Old image (if any) is superseded — best-effort cleanup, never fatal.
+    if (emp.license_file_path) {
+      fleetStorage.deleteDocument(emp.license_file_path).catch(() => {});
+    }
+
+    res.status(201).json({ ok: true, license_uploaded_at: new Date().toISOString() });
+  } catch (e) {
+    if (e.code === 'FILE_TOO_LARGE' || e.code === 'UNSUPPORTED_MIME') {
+      return res.status(400).json({ message: e.message });
+    }
+    console.error('POST /employees/:id/license:', e);
+    res.status(500).json({ message: 'Failed to save license', detail: e.message });
+  }
+});
+
+// GET /api/employees/:id/license — stream the image to the admin viewing it.
+router.get('/employees/:id/license', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'invalid id' });
+  try {
+    const emp = await queryOne(
+      `SELECT license_file_path, license_file_mime FROM employees WHERE id = $1`, [id]
+    );
+    if (!emp) return res.status(404).json({ message: 'Employee not found' });
+    if (!emp.license_file_path) return res.status(404).json({ message: 'No license on file' });
+
+    const stat = await fleetStorage.statDocument(emp.license_file_path).catch(() => null);
+    if (!stat) return res.status(404).json({ message: 'License file missing from storage' });
+
+    res.setHeader('Content-Type', emp.license_file_mime || 'application/octet-stream');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Cache-Control', 'private, no-store');
+    fleetStorage.streamDocument(emp.license_file_path).pipe(res);
+  } catch (e) {
+    console.error('GET /employees/:id/license:', e);
+    res.status(500).json({ message: 'Failed to load license', detail: e.message });
+  }
+});
+
+// DELETE /api/employees/:id/license — remove from record + disk.
+router.delete('/employees/:id/license', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'invalid id' });
+  try {
+    const emp = await queryOne(`SELECT license_file_path FROM employees WHERE id = $1`, [id]);
+    if (!emp) return res.status(404).json({ message: 'Employee not found' });
+    await query(
+      `UPDATE employees
+          SET license_file_path = NULL, license_file_mime = NULL, license_uploaded_at = NULL
+        WHERE id = $1`,
+      [id]
+    );
+    if (emp.license_file_path) {
+      fleetStorage.deleteDocument(emp.license_file_path).catch(() => {});
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /employees/:id/license:', e);
+    res.status(500).json({ message: 'Failed to delete license', detail: e.message });
   }
 });
 
