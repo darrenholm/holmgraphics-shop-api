@@ -3,11 +3,44 @@
 Phase 1: a Grandstream desk phone rings, a card appears in the shop app showing
 who is calling, their open jobs, and what they owe — before the handset is
 picked up. Nothing here depends on SkySwitch, the NetSapiens API, or A2P
-registration. The phones talk straight to our own API.
+registration. The phones talk plain http to a small relay on DesignCentre4,
+which forwards to the API over https -- see below for why.
 
 ---
 
-## The one thing that will waste your afternoon
+## Two things that will waste your afternoon
+
+### 1. The phones cannot speak https
+
+Settled by experiment on 2026-08-26, GXP1630 firmware 1.0.7.67:
+
+| URL | Result |
+|---|---|
+| `https://api.holmgraphics.ca/t/<12-char token>?r=$remote&e=$active_user` (67 ch) | nothing fired |
+| `https://api.holmgraphics.ca/t/<12-char token>?r=$remote` (52 ch) | nothing fired |
+| `http://10.10.1.24:8080/b?r=$remote&e=$active_user` (49 ch) | fired instantly |
+
+Length was the obvious suspect and it was wrong — the 52-character URL failed
+too. The firmware will not do TLS on an Action URL, and will not follow the
+301 that Railway returns on plain http either.
+
+Hence **phone-bridge** (`phone-bridge/`, installed at
+`C:\holmgraphics\phone-bridge\` on DesignCentre4): the handsets speak plain
+http to the LAN, the bridge speaks https to Railway. It also keeps the ingest
+token off the handsets, which is what gets the phone URL down to 49
+characters:
+
+```
+http://10.10.1.24:8085/t?r=$remote&e=$active_user
+```
+
+Runs as the scheduled task **Holm Phone Bridge** (SYSTEM / AtStartup /
+restart 999x, same shape as Holm Files Bridge). Health check:
+`curl http://10.10.1.24:8085/health`. Log: `C:\holmgraphics\phone-bridge\bridge.log`.
+
+⚠ If DesignCentre4 is off, every pop stops. Same exposure as files-bridge.
+
+### 2. The Action URL length ceiling
 
 **The Action URL field silently stops firing above roughly 60-70 characters.**
 The phone accepts a longer URL, stores it, shows it back to you in the GUI,
@@ -82,15 +115,19 @@ stays in step on its own — every write path that touches a phone number calls
 
 ## 4. Configure ONE phone
 
-Web GUI → **Settings → Outbound Notification → Action URL**. Paste the strings
-from `/api/telephony/config`:
+Web GUI → **Settings → Outbound Notification → Action URL**. Point at the
+LAN bridge, NOT at api.holmgraphics.ca — see the https note above:
 
 | GUI field | URL |
 |---|---|
-| Incoming Call | `https://api.holmgraphics.ca/t/<token>?r=$remote&e=$active_user` |
-| Answered Call | `https://api.holmgraphics.ca/ta/<token>?r=$remote&e=$active_user` |
-| Call Terminated | `https://api.holmgraphics.ca/te/<token>?r=$remote&e=$active_user` |
-| Outgoing Call | `https://api.holmgraphics.ca/to/<token>?r=$remote&e=$active_user` |
+| Incoming Call | `http://10.10.1.24:8085/t?r=$remote&e=$active_user` |
+| Answered Call | `http://10.10.1.24:8085/ta?r=$remote&e=$active_user` |
+| Call Terminated | `http://10.10.1.24:8085/te?r=$remote&e=$active_user` |
+| Outgoing Call | `http://10.10.1.24:8085/to?r=$remote&e=$active_user` |
+
+No token on the handset — the bridge adds it. `/api/telephony/config` still
+prints the direct public URLs, which are useful for testing with curl but are
+NOT what the phones can use.
 
 Only **Incoming Call** is required for the pop. Answered Call is what fills in
 `handled_by` and turns the card green. Call Terminated is what starts the 45s
@@ -180,6 +217,7 @@ acceptance criterion in the Phase 1 spec has a case there or in
 | `lib/screen-pop.js` | caller → client → open jobs → unpaid total |
 | `routes/telephony.js` | ingest endpoints + browser stream |
 | `scripts/backfill-client-phones.js` | one-off index build + unparseable report |
+| `phone-bridge/server.js` | LAN plain-http relay (the phones cannot do TLS) |
 
 Shop side: `src/lib/stores/call-pop.js`, `src/lib/components/CallPop.svelte`,
 mounted in `src/routes/+layout.svelte`.
