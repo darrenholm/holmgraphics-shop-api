@@ -156,13 +156,37 @@ subscriber count.
 
 Only after the first phone passes. Six phones by hand is about twenty minutes.
 
-Pushing the Action URL via SkySwitch NDP device overrides does **not** work
-yet: the override saves, renders into the generated config, and the phone
-syncs it, but nothing fires. P8304-P8314 were tried from an older GXP21xx
-manual; the GXP2170's real GUI field list has a "Register Failed" entry that
-manual doesn't, so the positional mapping is probably off by one. Correct
-P-code requested from SkySwitch (ticket T20260826.0394). Overrides need a phone
-reboot regardless — this fleet doesn't re-sync on its own.
+### Pushing it via SkySwitch NDP instead of by hand
+
+Correct P-codes, supplied by SkySwitch support 2026-08-26 (ticket
+T20260826.0394). Set these as NDP device overrides at Dashmanager -> PBX ->
+NDP -> Configurations -> Devices, then **reboot the phone** -- this fleet does
+not re-sync on its own.
+
+| GUI field | P-code | Value |
+|---|---|---|
+| Incoming Call | `P8310` | `http://10.10.1.24:8085/t?r=$remote&e=$active_user` |
+| Answered Call | `P22171` | `http://10.10.1.24:8085/ta?r=$remote&e=$active_user` |
+| Terminated Call | `P8314` | `http://10.10.1.24:8085/te?r=$remote&e=$active_user` |
+| Outgoing Call | `P8311` | `http://10.10.1.24:8085/to?r=$remote&e=$active_user` |
+
+**The earlier attempt failed because the block is not contiguous.** Guessing
+P8304-P8314 sequentially from an older GXP21xx manual puts Answered Call at
+**P8315, which is actually Rejected Call** -- that would not have failed
+loudly, it would have quietly logged "answered" every time somebody declined
+a call. Answered and Forwarded live in a separate P221xx range entirely:
+
+```
+P8304 Setup Completed    P8310 Incoming Call     P22171 Answered Call
+P8305 Registered         P8311 Outgoing Call     P22172 Forwarded Call
+P8306 Unregistered       P8312 Missed Call       P8313  Established Call
+P8307 Register Failed    P8315 Rejected Call     P8314  Terminated Call
+P8308 Off Hook           P8328 Idle to Busy      P8329  Busy to Idle
+P8309 On Hook            P8332 Auto-Provision Finish
+```
+
+The values point at the LAN bridge, not at api.holmgraphics.ca -- provisioning
+the phones does not change the fact that they cannot speak https.
 
 ---
 
