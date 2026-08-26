@@ -12,6 +12,7 @@
 const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff } = require('../middleware/auth');
+const { syncClientPhoneIndexAsync } = require('../lib/phone-index');
 
 const router = express.Router();
 
@@ -844,6 +845,9 @@ router.post('/:id/phones', requireStaff, async (req, res) => {
        RETURNING id, number AS phone_number, ext, phone_type AS type`,
       vals
     );
+    // Keep the E.164 caller-ID index in step (migration 057). Fire-and-forget
+    // so a normalization hiccup can't fail an otherwise-good save.
+    syncClientPhoneIndexAsync(clientId);
     res.status(201).json(created);
   } catch (e) {
     console.error('POST /clients/:id/phones:', e);
@@ -861,10 +865,11 @@ router.put('/phones/:id', requireStaff, async (req, res) => {
     const set = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
     const updated = await queryOne(
       `UPDATE client_phones SET ${set} WHERE id = $${cols.length + 1}
-       RETURNING id, number AS phone_number, ext, phone_type AS type`,
+       RETURNING id, client_id, number AS phone_number, ext, phone_type AS type`,
       [...vals, id]
     );
     if (!updated) return res.status(404).json({ message: 'Phone not found' });
+    syncClientPhoneIndexAsync(updated.client_id);
     res.json(updated);
   } catch (e) {
     console.error('PUT /clients/phones/:id:', e);
@@ -878,10 +883,11 @@ router.delete('/phones/:id', requireStaff, async (req, res) => {
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid phone id' });
   try {
     const deleted = await queryOne(
-      'DELETE FROM client_phones WHERE id = $1 RETURNING id',
+      'DELETE FROM client_phones WHERE id = $1 RETURNING id, client_id',
       [id]
     );
     if (!deleted) return res.status(404).json({ message: 'Phone not found' });
+    syncClientPhoneIndexAsync(deleted.client_id);
     res.json({ message: 'Deleted', id: deleted.id });
   } catch (e) {
     console.error('DELETE /clients/phones/:id:', e);

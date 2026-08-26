@@ -41,6 +41,10 @@ const { scheduleProofArchiveSweep } = require('./lib/proof-archive-sweep');
 const { scheduleFordproPoll } = require('./lib/fordpro-telematics');
 const schedulingRoutes    = require('./routes/scheduling');
 const inventoryRoutes     = require('./routes/inventory');
+// Telephony — inbound call screen pop (Phase 1). Owns BOTH the very short
+// ingest paths the desk phones hit (/t/:token …) and the browser SSE stream
+// (/api/telephony/stream), so it mounts at the app root rather than /api.
+const telephonyRoutes     = require('./routes/telephony');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -80,6 +84,10 @@ app.use(express.json({
 app.use(cookieParser());
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+// Telephony first: the phone ingest paths are deliberately tiny (/t/:token)
+// to stay under the Grandstream Action URL length ceiling, and mounting them
+// ahead of everything else keeps them out of reach of any future catch-all.
+app.use('/',               telephonyRoutes);
 app.use('/api/auth',       authRoutes);
 app.use('/api/customer',     customerAuthRoutes);
 app.use('/api/dtf',          dtfConfigRoutes);

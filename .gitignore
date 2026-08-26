@@ -6,3 +6,7 @@ node_modules/
 
 # Contains plaintext passwords — edit locally, never commit
 db/set-passwords.js
+
+# Backfill report from scripts/backfill-client-phones.js — contains client
+# names and phone numbers. Read it, fix the source rows, delete it.
+scripts/unparseable-phones.csv

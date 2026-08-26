@@ -44,6 +44,7 @@ const { query, queryOne } = require('../db/connection');
 const { signCustomerToken } = require('../lib/jwt-customer');
 const { requireCustomer }   = require('../middleware/customer-auth');
 const mailer = require('../lib/customer-mailer');
+const { syncClientPhoneIndexAsync } = require('../lib/phone-index');
 
 const router = express.Router();
 
@@ -188,6 +189,10 @@ router.post('/register', async (req, res) => {
     queueQboCustomerSync(inserted.id).catch((err) => {
       console.warn('QBO customer sync failed for client', inserted.id, err.message);
     });
+
+    // Index the signup phone number for inbound caller-ID matching
+    // (migration 057). Fire-and-forget — never block registration on it.
+    syncClientPhoneIndexAsync(inserted.id);
 
     const token = signCustomerToken(inserted);
     await query(`UPDATE clients SET last_login_at = NOW() WHERE id = $1`, [inserted.id]);
@@ -473,6 +478,7 @@ router.put('/me', requireCustomer, async (req, res) => {
                  account_status, email_verified_at, pricing_tier_id, created_at`,
       params
     );
+    if ('phone' in fields) syncClientPhoneIndexAsync(req.customer.id);
     // TODO: push profile update to QBO via /customer endpoint (sparse update).
     res.json({ profile: publicProfile(updated) });
   } catch (err) {
