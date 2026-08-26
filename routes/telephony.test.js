@@ -210,6 +210,38 @@ test('a known caller pops a full card, matching a differently-formatted stored n
   stream.close();
 });
 
+test('recent quotes ride along on the card but are counted separately', async () => {
+  // Rolling quotes into "open jobs" would turn one job in production into
+  // "seven open jobs" and make the number useless at a glance.
+  reset();
+  indexRows = [{ e164: '+15198891305', client_id: 42, name: 'Acme Signs Inc.' }];
+  clientJobs = { 42: [
+    { id: 8302, description: 'Monument sign', status: 'Production', is_quote: false,
+      created_date: '2026-05-01T12:00:00Z', due_date: null, total: '4200.00' },
+    { id: 9618, description: 'LED test', status: 'Quote', is_quote: true,
+      created_date: '2026-08-01T12:00:00Z', due_date: null, total: '0' },
+    { id: 9604, description: 'Online order', status: 'Quote', is_quote: true,
+      created_date: '2026-07-20T12:00:00Z', due_date: null, total: '0' },
+  ] };
+
+  const stream = await openStream();
+  await ring('r=15198891305&e=101');
+  await settle();
+
+  const c = stream.events[0].clients[0];
+  assert.equal(c.openJobCount, 1, 'quotes must not inflate the open-job count');
+  assert.equal(c.recentQuoteCount, 2);
+  // All three are reachable from the card…
+  assert.equal(c.openJobs.length, 3);
+  assert.equal(c.openJobs[0].number, 8302);
+  assert.equal(c.openJobs[0].isQuote, false);
+  assert.equal(c.openJobs[1].isQuote, true);
+  // …and "oldest" ignores quotes, or an unaccepted quote would make the
+  // waiting-since figure lie.
+  assert.equal(new Date(c.oldestOpenJobAt).toISOString(), '2026-05-01T12:00:00.000Z');
+  stream.close();
+});
+
 // ─── 2. Unknown number still pops ───────────────────────────────────────────
 
 test('an unknown number pops with no client attached', async () => {
