@@ -40,7 +40,7 @@ const express = require('express');
 const { query } = require('../db/connection');
 const { requireStaff, requireAdmin } = require('../middleware/auth');
 const { toE164, isAnonymous, isInternalExtension } = require('../lib/phone');
-const { buildPayload, employeeNameForExtension } = require('../lib/screen-pop');
+const { buildPayload, employeeNameForExtension, cardForClientId } = require('../lib/screen-pop');
 const { CallCorrelator } = require('../lib/call-correlate');
 const hub = require('../lib/call-hub');
 
@@ -230,6 +230,24 @@ router.get('/api/telephony/config', requireAdmin, (req, res) => {
     note: 'The GXP handsets silently ignore Action URLs above roughly 70 characters. '
         + 'Shorten TELEPHONY_INGEST_TOKEN if any entry reports overBudget.',
   });
+});
+
+// ─── One client's card ───────────────────────────────────────────────────────
+// Same shape the SSE payload carries per client. Used by the pop right after
+// a staffer links an unrecognised number to a customer: the card swaps to
+// their real one — jobs, quotes, unpaid total — without leaving the page they
+// were on or ending the call.
+router.get('/api/telephony/card/:clientId', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.clientId, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid client id' });
+  try {
+    const card = await cardForClientId(id);
+    if (!card) return res.status(404).json({ message: 'Client not found' });
+    res.json(card);
+  } catch (e) {
+    console.error('GET /api/telephony/card/:clientId:', e);
+    res.status(500).json({ message: 'Failed to load client card', detail: e.message });
+  }
 });
 
 // ─── Recent calls ────────────────────────────────────────────────────────────
