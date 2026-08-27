@@ -5,9 +5,13 @@
  * One-off populate of client_phone_index (migration 057) — the normalized
  * E.164 surface the inbound-call screen pop matches against.
  *
- * Reads every number from BOTH sources:
- *   client_phones.number   (staff-entered contact list)
- *   clients.phone          (DTF-store self-serve signup)
+ * Reads every number from ALL THREE sources:
+ *   client_phones.number    (staff-entered contact list)
+ *   clients.phone           (DTF-store self-serve signup)
+ *   projects.contact_phone  (the per-job contact)
+ *
+ * The third matters more than it sounds: plenty of clients have no
+ * client_phones row at all and exist only as a number typed onto a job.
  *
  * Every number that fails to parse is written to a report file rather than
  * silently dropped. Expect junk in that column — "call the shop", "same",
@@ -46,7 +50,7 @@ function csvCell(v) {
 async function main() {
   console.log(dryRun ? 'DRY RUN — no writes\n' : 'Backfilling client_phone_index\n');
 
-  const [phoneRows, clientRows] = await Promise.all([
+  const [phoneRows, clientRows, jobRows] = await Promise.all([
     query(`SELECT p.id, p.client_id, p.number, p.phone_type,
                   COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
              FROM client_phones p
@@ -57,10 +61,17 @@ async function main() {
              FROM clients
             WHERE phone IS NOT NULL AND phone <> ''
             ORDER BY id`),
+    query(`SELECT p.id, p.client_id, p.contact_phone,
+                  COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+             FROM projects p
+             JOIN clients c ON c.id = p.client_id
+            WHERE p.contact_phone IS NOT NULL AND p.contact_phone <> ''
+            ORDER BY p.client_id, p.created_date DESC NULLS LAST, p.id DESC`),
   ]);
 
-  console.log(`  client_phones rows : ${phoneRows.length}`);
-  console.log(`  clients.phone rows : ${clientRows.length}\n`);
+  console.log(`  client_phones rows    : ${phoneRows.length}`);
+  console.log(`  clients.phone rows    : ${clientRows.length}`);
+  console.log(`  job contact_phone rows: ${jobRows.length}\n`);
 
   // clientId → Map(e164 → { label, source_field }). The Map de-dupes the
   // common case where the same number sits in both sources.
@@ -96,6 +107,21 @@ async function main() {
       client_name: r.client_name,
       label: 'main',
       raw: r.phone,
+    });
+  }
+
+  // Read last, so a number already on the curated contact list keeps that
+  // list's label rather than being relabelled "Job contact".
+  for (const r of jobRows) {
+    const e164 = toE164(r.contact_phone);
+    if (e164) add(r.client_id, e164, 'Job contact', `projects.contact_phone#${r.id}`);
+    else bad.push({
+      source: 'projects.contact_phone',
+      source_id: r.id,
+      client_id: r.client_id,
+      client_name: r.client_name,
+      label: 'Job contact',
+      raw: r.contact_phone,
     });
   }
 

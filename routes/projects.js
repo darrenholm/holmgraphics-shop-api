@@ -10,6 +10,7 @@ const mailer = require('../lib/customer-mailer');
 const { sendJobAssignedSms, sendJobMessageSms, sendJobMessageEmail } = require('../lib/employee-notifier');
 const { sendJobReadyNotifications } = require('../lib/client-notifier');
 const facebook = require('../lib/facebook');
+const { syncClientPhoneIndexAsync } = require('../lib/phone-index');
 const multer = require('multer');
 const path = require('path');
 const ftp = require('basic-ftp');
@@ -524,6 +525,10 @@ router.post('/', requireStaff, async (req, res) => {
       ]
     );
     const newProjectId = rows[0]?.id;
+    // A job's contact_phone is a real source of caller ID — plenty of clients
+    // have no client_phones row at all and exist only as a number typed onto
+    // a job. Index it so the next call from it pops. Fire-and-forget.
+    if (contact_phone) syncClientPhoneIndexAsync(client_id);
     // Text the assigned employee if the job was created already assigned to
     // someone. Idempotent per (job, employee). Fire-and-forget.
     if (newProjectId && assigned_employee_id) {
@@ -584,6 +589,10 @@ router.put('/:id', requireStaff, async (req, res) => {
     if (newEmpId && newEmpId !== (before ? before.production_emp_id : null)) {
       sendJobAssignedSms({ projectId: id, db }).catch(() => {});
     }
+    // Re-derive the caller-ID index for this client: the job contact may have
+    // been added, changed, or cleared. The sync rebuilds from scratch, so an
+    // unconditional call is both correct and cheap.
+    if (client_id) syncClientPhoneIndexAsync(client_id);
     res.json({ message: 'Project updated' });
   } catch (e) {
     console.error('PUT /projects/:id:', e);
