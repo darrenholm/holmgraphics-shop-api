@@ -45,6 +45,11 @@ const inventoryRoutes     = require('./routes/inventory');
 // ingest paths the desk phones hit (/t/:token …) and the browser SSE stream
 // (/api/telephony/stream), so it mounts at the app root rather than /api.
 const telephonyRoutes     = require('./routes/telephony');
+// Counter POS — Stripe Terminal. terminalRoutes is staff-authenticated and
+// mounts under /api; stripeWebhookRoutes owns POST /webhooks/stripe at the
+// app root because Stripe posts to a fixed URL with its own signature auth.
+const terminalRoutes      = require('./routes/terminal');
+const stripeWebhookRoutes = require('./routes/stripe-webhook');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +93,10 @@ app.use(cookieParser());
 // to stay under the Grandstream Action URL length ceiling, and mounting them
 // ahead of everything else keeps them out of reach of any future catch-all.
 app.use('/',               telephonyRoutes);
+// Stripe webhook, also at the root. No CORS and no session auth — the
+// stripe-signature header over the raw body IS the authentication.
+app.use('/',               stripeWebhookRoutes);
+app.use('/api/terminal',   terminalRoutes);
 app.use('/api/auth',       authRoutes);
 app.use('/api/customer',     customerAuthRoutes);
 app.use('/api/dtf',          dtfConfigRoutes);

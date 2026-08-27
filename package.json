@@ -22,7 +22,8 @@
     "pdf-to-img": "^6.1.0",
     "pdfkit": "^0.18.0",
     "pg": "^8.11.5",
-    "smartcar": "^10.4.0"
+    "smartcar": "^10.4.0",
+    "stripe": "^22.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
