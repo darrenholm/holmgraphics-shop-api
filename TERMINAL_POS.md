@@ -331,14 +331,30 @@ Confirmed on the counter reader, not from the docs:
   type on a Terminal Configuration, and a Location without one inherits the
   account default; with neither, the reader shows "Stripe".
 
-  Dashboard → Terminal → **Locations** → the location → the **Splash screen**
-  row under *Local configurations* (or *Inherited configurations* to set the
-  account-wide default) → edit, choosing the **BBPOS WisePad 3** reader type.
-  A single image cannot be applied across reader types — each is configured
-  separately. Docs: https://docs.stripe.com/terminal/fleet/splash-screen
+  Dashboard → Terminal → **Locations** → the location → the ✏ next to the
+  **Splash screen** row under *Local configurations* (or *Inherited
+  configurations* for the account-wide default) → choose the **BBPOS
+  WisePad 3** reader type → upload → Done → **Apply changes** on the
+  configuration drawer. That last step is easy to miss and nothing takes
+  effect without it. A single image cannot be applied across reader types.
 
-  The reader picks it up on its next configuration sync, so power-cycle it
-  afterwards rather than expecting a quick reconnect to fetch it.
+  WisePad 3 image spec — the tightest of any Stripe reader:
+
+  | | |
+  |---|---|
+  | Resolution | **320 × 240** (landscape), must be cropped to fit exactly |
+  | Format | **PNG only** — no JPG, no GIF |
+  | Size | under 2 MB |
+  | Colour | **converted to black and white automatically**, and repositioned slightly |
+
+  So supply a high-contrast black-on-white mark. Anything relying on colour,
+  gradients or fine detail will come out as mud.
+
+  Being a *mobile* reader, the WisePad picks the splash screen up **when it
+  next connects to the Terminal SDK** — a reconnect from /pos is enough, no
+  power cycle needed. (Smart readers take up to 10 minutes instead.)
+
+  Docs: https://docs.stripe.com/terminal/fleet/splash-screen
 
 ## Plugin gotchas that shaped the code
 
