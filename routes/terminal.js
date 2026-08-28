@@ -358,9 +358,85 @@ router.post('/payments/:id/resync', requireStaff, async (req, res) => {
   }
 });
 
-// ─── GET /api/terminal/qbo-preflight ─────────────────────────────────────────
+// ─── Stripe-side preflight ───────────────────────────────────────────────────
+// An account can hold live keys, create PaymentIntents and even take a card
+// while still being unable to pay the money out. That failure surfaces days
+// later as money that never arrived, so it is worth asserting rather than
+// assuming — charges_enabled and payouts_enabled are separate flags and only
+// the first is proved by a successful sale.
+async function stripeChecks() {
+  const checks = [];
+  const add = (name, ok, detail) => checks.push({ name, ok, detail });
+
+  let acct;
+  try {
+    acct = await getStripe().accounts.retrieve();
+  } catch (err) {
+    add('Stripe account', false, err.message);
+    return checks;
+  }
+
+  add('Stripe account', true,
+    `${acct.business_profile?.name || acct.id} — ${(acct.country || '??')}, ` +
+    `${(acct.default_currency || '').toUpperCase()}`);
+
+  add('Charges enabled', !!acct.charges_enabled,
+    acct.charges_enabled
+      ? 'the account can take payments'
+      : `BLOCKED — ${acct.requirements?.disabled_reason || 'verification incomplete'}`);
+
+  // The one that bites quietly: cards approve, money never lands.
+  add('Payouts enabled', !!acct.payouts_enabled,
+    acct.payouts_enabled
+      ? 'money will reach the bank'
+      : 'BLOCKED — payments will succeed but nothing will be paid out');
+
+  const due = [
+    ...(acct.requirements?.past_due || []),
+    ...(acct.requirements?.currently_due || []),
+  ];
+  add('Outstanding requirements', due.length === 0,
+    due.length ? due.join(', ') : 'none — verification complete');
+
+  // A Location created in the other mode silently fails discovery, so check
+  // the one we are actually configured with resolves under this key.
+  const locId = terminalLocationId();
+  if (!locId) {
+    add('Terminal Location', false, 'STRIPE_TERMINAL_LOCATION_ID is not set');
+  } else {
+    try {
+      const loc = await getStripe().terminal.locations.retrieve(locId);
+      add('Terminal Location', true,
+        `${loc.display_name} (${loc.address?.city || '?'}, ${loc.address?.country || '?'}) — ` +
+        `${isTestMode() ? 'test' : 'live'} mode`);
+    } catch (err) {
+      add('Terminal Location', false,
+        `${locId} did not resolve: ${err.message}. A Location created in the other ` +
+        `mode will not work with this key.`);
+    }
+  }
+
+  return checks;
+}
+
+// ─── GET /api/terminal/preflight ─────────────────────────────────────────────
 // Run this before the first live sale. Every check that fails here would
-// otherwise fail as a webhook, with a customer already charged.
+// otherwise fail as a webhook, with a customer already charged — or worse, as
+// a payout that never arrives.
+router.get('/preflight', requireStaff, async (req, res) => {
+  try {
+    const qbo = await qboPreflight();
+    const stripe = stripeConfigured()
+      ? await stripeChecks()
+      : [{ name: 'Stripe', ok: false, detail: 'STRIPE_SECRET_KEY is not set' }];
+    const checks = [...stripe, ...qbo.checks];
+    res.json({ ok: checks.every((c) => c.ok), checks });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Kept so an older tablet build keeps working after a deploy.
 router.get('/qbo-preflight', requireStaff, async (req, res) => {
   try {
     res.json(await qboPreflight());
