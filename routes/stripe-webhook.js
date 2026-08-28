@@ -19,6 +19,7 @@ const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { getStripe, stripeConfigured } = require('../lib/stripe-client');
 const { writeBackPayment, writeBackRefund } = require('../lib/qbo-terminal-writeback');
+const { completeIfFullyPaid } = require('../lib/job-completion');
 
 const router = express.Router();
 
@@ -145,6 +146,20 @@ async function onPaymentSucceeded(pi) {
     );
   } catch (err) {
     console.error(`[stripe-webhook] QBO write-back failed for ${pi.id}:`, err.message);
+  }
+
+  // Close the job off if this payment settled it. Independent of the QBO
+  // write-back on purpose — a throttled QuickBooks shouldn't leave a paid job
+  // sitting in Billing, and a job-status problem shouldn't look like an
+  // accounting one. Only fires on full payment; see lib/job-completion.js.
+  try {
+    const done = await completeIfFullyPaid(row.project_id, { employeeId: row.taken_by_emp_id });
+    console.log(
+      `[stripe-webhook] ${pi.id} job #${row.project_id}: ` +
+      (done.changed ? `status ${done.from} → Complete` : `left as-is (${done.reason})`)
+    );
+  } catch (err) {
+    console.error(`[stripe-webhook] job completion check failed for ${pi.id}:`, err.message);
   }
 }
 
