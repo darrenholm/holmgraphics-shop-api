@@ -22,7 +22,7 @@ const { requireStaff } = require('../middleware/auth');
 const {
   getStripe, stripeConfigured, isTestMode, terminalLocationId,
 } = require('../lib/stripe-client');
-const { writeBackPayment, qboPreflight } = require('../lib/qbo-terminal-writeback');
+const { writeBackPayment, qboPreflight, invoiceSummaryForProject } = require('../lib/qbo-terminal-writeback');
 
 const router = express.Router();
 
@@ -68,6 +68,25 @@ router.post('/connection-token', requireStaff, requireStripe, async (req, res) =
     console.error('[terminal] connection-token:', err.message);
     res.status(502).json({ error: `Stripe refused the connection token: ${err.message}` });
   }
+});
+
+// ─── GET /api/terminal/job/:id/invoice ───────────────────────────────────────
+// What's actually outstanding on this job's QuickBooks invoice right now.
+//
+// For the customer who walks in holding a printed invoice. The job's line
+// items are the wrong number to charge from — they're ex-tax, and they don't
+// know about part payments or anything edited in QuickBooks since the invoice
+// was raised. This is the number on the paper in the customer's hand.
+//
+// Deliberately never fails the request: QuickBooks being down, disconnected or
+// throttled must not stop anyone taking a payment. It answers `found: false`
+// and the tablet falls back to the job total.
+router.get('/job/:id/invoice', requireStaff, async (req, res) => {
+  const projectId = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(projectId)) {
+    return res.status(400).json({ error: 'job id must be an integer' });
+  }
+  res.json(await invoiceSummaryForProject(projectId));
 });
 
 // ─── POST /api/terminal/payment-intent ───────────────────────────────────────
