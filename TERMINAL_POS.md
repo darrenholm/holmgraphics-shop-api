@@ -317,6 +317,29 @@ well-defined native addition. Not done here.
 
 ---
 
+## Hardware limits of the WisePad 3
+
+Confirmed on the counter reader, not from the docs:
+
+* **`setReaderDisplay` is not supported.** It rejects with "Reader does not
+  support setting display", so the itemised cart never appears on the reader.
+  The spec's §4.5 includes the call; it is kept as best-effort and never
+  fatal. The customer still sees the **amount** during collection, because
+  that comes from the PaymentIntent itself.
+* **The idle screen is a Terminal *splash screen*, not account branding.**
+  Settings → Business → Branding has no effect on it. It is set per reader
+  type on a Terminal Configuration, and a Location without one inherits the
+  account default; with neither, the reader shows "Stripe".
+
+  Dashboard → Terminal → **Locations** → the location → the **Splash screen**
+  row under *Local configurations* (or *Inherited configurations* to set the
+  account-wide default) → edit, choosing the **BBPOS WisePad 3** reader type.
+  A single image cannot be applied across reader types — each is configured
+  separately. Docs: https://docs.stripe.com/terminal/fleet/splash-screen
+
+  The reader picks it up on its next configuration sync, so power-cycle it
+  afterwards rather than expecting a quick reconnect to fetch it.
+
 ## Plugin gotchas that shaped the code
 
 Three things about `@capgo/capacitor-stripe-terminal` are easy to get wrong
