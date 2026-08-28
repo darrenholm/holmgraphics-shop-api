@@ -73,7 +73,7 @@ On the **Holm Graphics** Stripe account — not the Rodeo one.
 curl https://api.stripe.com/v1/terminal/locations \
   -u $STRIPE_SECRET_KEY: \
   -d display_name="Holm Graphics — Walkerton" \
-  -d "address[line1]"="130 Kincardine Hwy Suite 1" \
+  -d "address[line1]"="2-43 Eastridge Rd" \
   -d "address[city]"="Walkerton" \
   -d "address[state]"="ON" \
   -d "address[country]"="CA" \
