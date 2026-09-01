@@ -59,6 +59,13 @@ const upload = multer({
 // changing this never rewrites a report that's already been signed.
 const CARRIER_NAME = process.env.FLEET_CARRIER_NAME || 'HOLM GRAPHICS INC.';
 
+// Where checks are performed unless the driver says otherwise. Most happen
+// in the yard, so typing it every time is a field that gets skipped or
+// half-filled. Prefilled, never forced — s. 7 (1) 4 wants the city, town,
+// village or highway location the inspection was ACTUALLY conducted at, so
+// this stays an editable suggestion and is recorded as 'manual' either way.
+const DEFAULT_LOCATION = process.env.FLEET_DEFAULT_LOCATION || '43 Eastridge Rd, Walkerton';
+
 // A telematics odometer older than this is offered as a suggestion the driver
 // has to confirm rather than a value we assert. Two hours is the spec's
 // number: long enough to cover a truck sitting overnight and reporting on
@@ -450,6 +457,7 @@ router.get('/fleet/inspections/prefill', requireInspector, async (req, res, next
       existing_draft_id: existingDraft?.id || null,
       telematics_available: !!tel && !tel.last_fetch_error,
       inspection_policy: vehicle.inspection_policy,
+      default_location_text: DEFAULT_LOCATION,
       // Trailers the driver can say they're pulling. Offered on every check
       // because the operator's practice ties checks to towing.
       trailers: await query(
@@ -1575,6 +1583,7 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
 
     res.json({
       carrier_name: CARRIER_NAME,
+      default_location_text: DEFAULT_LOCATION,
       inspector: { employee_id: req.user.id, name: req.user.name },
       units,
       schedules: schedules.map((s) => ({
