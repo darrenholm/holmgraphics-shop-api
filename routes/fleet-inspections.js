@@ -201,10 +201,14 @@ async function openDefectsForVehicle(vehicleId) {
 async function loadInspection(id) {
   return queryOne(
     `SELECT i.*, v.unit_number, v.make, v.model, v.year, v.vin,
+            v.inspection_policy,
+            tow.unit_number AS towing_unit_number,
+            tow.license_plate AS towing_plate,
             s.name AS schedule_name, s.reg_reference, s.version AS schedule_version,
             s.source_verified AS schedule_source_verified
        FROM inspections i
        JOIN vehicles v            ON v.id = i.vehicle_id
+       LEFT JOIN vehicles tow     ON tow.id = i.towing_vehicle_id
        JOIN inspection_schedules s ON s.id = i.schedule_id
       WHERE i.id = $1 AND i.deleted_at IS NULL`,
     [id]
@@ -213,7 +217,11 @@ async function loadInspection(id) {
 
 async function loadDefects(inspectionId) {
   return query(
-    `SELECT d.*, it.group_name, it.item_label,
+    // minor_defect_text / major_defect_text are only populated on the v1
+    // placeholder schedule. From v2 the row IS the defect, so item_label
+    // carries the regulation's wording and severity is on the row.
+    `SELECT d.*, it.group_name, it.item_label, it.part_number, it.defect_letter,
+            it.condition_note, it.footnote_refs,
             it.minor_defect_text, it.major_defect_text,
             e.first_name || ' ' || e.last_name AS resolved_by_name
        FROM inspection_defects d
@@ -257,7 +265,7 @@ router.get('/fleet/inspections/scope', requireStaff, async (req, res, next) => {
       `SELECT v.id, v.unit_number, v.type, v.make, v.model, v.year,
               v.license_plate, v.plate_jurisdiction,
               v.registered_gross_weight_kg, v.inspection_required,
-              v.inspection_schedule_id,
+              v.inspection_policy, v.inspection_schedule_id,
               latest.id            AS latest_inspection_id,
               latest.completed_at  AS latest_completed_at,
               latest.valid_until   AS latest_valid_until,
@@ -312,15 +320,24 @@ router.get('/fleet/inspections/scope', requireStaff, async (req, res, next) => {
     });
 
     const inScope = units.filter((u) => u.inspection_required);
+    // "Overdue" only means anything for units the operator has put on a
+    // daily policy. On-demand units are checked when the driver decides to
+    // (in practice, when towing), so counting them as overdue every morning
+    // would be the system asserting a schedule nobody agreed to.
+    const daily = units.filter((u) => u.inspection_policy === 'daily');
     res.json({
       carrier_name: CARRIER_NAME,
       units,
       summary: {
-        in_scope:       inScope.length,
-        checked_today:  inScope.filter((u) => u.has_valid_inspection).length,
-        overdue:        inScope.filter((u) => !u.has_valid_inspection).length,
-        out_of_service: units.filter((u) => u.out_of_service).length,
-        rgw_unknown:    units.filter((u) => u.rgw_unknown).length,
+        in_scope:        inScope.length,
+        on_daily_policy: daily.length,
+        checked_today:   daily.filter((u) => u.has_valid_inspection).length,
+        overdue:         daily.filter((u) => !u.has_valid_inspection).length,
+        out_of_service:  units.filter((u) => u.out_of_service).length,
+        rgw_unknown:     units.filter((u) => u.rgw_unknown).length,
+        // Units the regulation covers but which nobody is being prompted
+        // about. Surfaced so the gap between the two is never invisible.
+        in_scope_on_demand: inScope.filter((u) => u.inspection_policy === 'on_demand').length,
       },
     });
   } catch (e) { next(e); }
@@ -432,6 +449,14 @@ router.get('/fleet/inspections/prefill', requireInspector, async (req, res, next
       warnings: docWarnings,
       existing_draft_id: existingDraft?.id || null,
       telematics_available: !!tel && !tel.last_fetch_error,
+      inspection_policy: vehicle.inspection_policy,
+      // Trailers the driver can say they're pulling. Offered on every check
+      // because the operator's practice ties checks to towing.
+      trailers: await query(
+        `SELECT id, unit_number, license_plate, make, model
+           FROM vehicles WHERE active = TRUE AND type = 'trailer'
+          ORDER BY unit_number`
+      ),
     });
   } catch (e) { next(e); }
 });
@@ -454,7 +479,8 @@ router.get('/fleet/inspection-schedules', requireStaff, async (req, res, next) =
     );
     const items = schedules.length
       ? await query(
-          `SELECT id, schedule_id, group_name, item_label, sort_order,
+          `SELECT id, schedule_id, part_number, group_name, defect_letter,
+                  item_label, severity, condition_note, footnote_refs, sort_order,
                   minor_defect_text, major_defect_text
              FROM inspection_schedule_items
             WHERE active = TRUE AND schedule_id = ANY($1::int[])
@@ -462,12 +488,50 @@ router.get('/fleet/inspection-schedules', requireStaff, async (req, res, next) =
           [schedules.map((s) => s.id)]
         )
       : [];
+    // The Notes to the schedules (O. Reg. 199/07, s. 19) are part of what
+    // the driver carries — several defects are only meaningful with the
+    // note that says where the limit is defined.
+    const notes = schedules.length
+      ? await query(
+          `SELECT schedule_id, note_number, note_text
+             FROM inspection_schedule_notes
+            WHERE schedule_id = ANY($1::int[])
+            ORDER BY note_number`,
+          [schedules.map((s) => s.id)]
+        )
+      : [];
+
     res.json({
       schedules: schedules.map((s) => ({
         ...s,
         items: items.filter((i) => i.schedule_id === s.id),
+        notes: notes.filter((n) => n.schedule_id === s.id),
       })),
     });
+  } catch (e) { next(e); }
+});
+
+// Switches a unit between an expected-daily check and on-demand.
+//
+// This changes only what the system ASKS FOR. It does not change
+// inspection_required, which is derived from the unit's registered gross
+// weight and records whether O. Reg. 199/07 covers the unit at all. The two
+// are reported side by side on the admin board for that reason.
+router.patch('/fleet/vehicles/:id/inspection-policy', requireAdmin, async (req, res, next) => {
+  try {
+    const id = intParam(req.params.id);
+    if (!id) return badRequest(res, 'Invalid vehicle id');
+    const policy = req.body?.inspection_policy;
+    if (!['daily', 'on_demand'].includes(policy)) {
+      return badRequest(res, 'inspection_policy must be daily or on_demand');
+    }
+    const row = await queryOne(
+      `UPDATE vehicles SET inspection_policy = $2 WHERE id = $1
+       RETURNING id, unit_number, inspection_policy, inspection_required`,
+      [id, policy]
+    );
+    if (!row) return res.status(404).json({ message: 'Vehicle not found' });
+    res.json({ ok: true, vehicle: row });
   } catch (e) { next(e); }
 });
 
@@ -632,6 +696,22 @@ router.patch('/fleet/inspections/:id', requireInspector, async (req, res, next) 
       put('driver_employee_id', b.driver_employee_id === null ? null : intParam(b.driver_employee_id));
     }
 
+    // Which trailer is attached, if any. Schedule 1 covers "trucks,
+    // tractors and trailers", so what is behind the truck is part of what
+    // was inspected — and the operator's practice ties checks to towing.
+    if (b.towing_vehicle_id !== undefined) {
+      const towId = b.towing_vehicle_id === null ? null : intParam(b.towing_vehicle_id);
+      if (towId !== null) {
+        const trailer = await queryOne(
+          `SELECT id FROM vehicles WHERE id = $1 AND active = TRUE AND type = 'trailer'`,
+          [towId]
+        );
+        if (!trailer) return badRequest(res, 'That is not an active trailer.');
+        if (towId === draft.vehicle_id) return badRequest(res, 'A unit cannot tow itself.');
+      }
+      put('towing_vehicle_id', towId);
+    }
+
     if (!sets.length) return badRequest(res, 'Nothing to update');
 
     vals.push(id);
@@ -651,40 +731,38 @@ router.post('/fleet/inspections/:id/defects', requireInspector, async (req, res,
     const draft = await requireOwnDraft(req, res, id);
     if (!draft) return;
 
-    const itemId   = intParam(req.body?.schedule_item_id);
-    const severity = req.body?.severity;
+    const itemId = intParam(req.body?.schedule_item_id);
     if (!itemId) return badRequest(res, 'schedule_item_id is required');
-    if (!['minor', 'major'].includes(severity)) {
-      return badRequest(res, 'severity must be minor or major');
-    }
 
     const item = await queryOne(
-      `SELECT id, group_name, item_label, major_defect_text
+      `SELECT id, group_name, item_label, severity
          FROM inspection_schedule_items
         WHERE id = $1 AND schedule_id = $2 AND active = TRUE`,
       [itemId, draft.schedule_id]
     );
-    if (!item) return badRequest(res, 'That item is not on this inspection\'s schedule.');
+    if (!item) return badRequest(res, 'That defect is not on this inspection\'s schedule.');
 
-    // An item with no major-defect class in the regulation cannot be flagged
-    // major. Letting a driver invent one would put a unit out of service on
-    // a basis the schedule doesn't support.
-    if (severity === 'major' && !item.major_defect_text) {
-      return badRequest(res,
-        `"${item.item_label}" has no major defect class on this schedule; it can only be recorded as minor.`,
-        { code: 'no_major_class' });
+    // Severity is NOT taken from the request. O. Reg. 199/07 prints each
+    // defect under either the Minor or the Major column, so which one it is
+    // was decided by the regulation, not by the person holding the phone.
+    // A driver classifying their own finding is how a major defect quietly
+    // becomes a minor one and the truck goes out anyway.
+    if (!['minor', 'major'].includes(item.severity)) {
+      return res.status(409).json({
+        message: 'This schedule entry has no severity recorded; the schedule needs re-seeding.',
+        code: 'schedule_item_no_severity',
+      });
     }
 
     const row = await queryOne(
       `INSERT INTO inspection_defects (inspection_id, schedule_item_id, severity, note)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (inspection_id, schedule_item_id)
-       DO UPDATE SET severity = EXCLUDED.severity,
-                     note     = COALESCE(EXCLUDED.note, inspection_defects.note)
+       DO UPDATE SET note = COALESCE(EXCLUDED.note, inspection_defects.note)
        RETURNING id`,
-      [id, itemId, severity, req.body?.note || null]
+      [id, itemId, item.severity, req.body?.note || null]
     );
-    res.status(201).json({ defect_id: row.id, defects: await loadDefects(id) });
+    res.status(201).json({ defect_id: row.id, severity: item.severity, defects: await loadDefects(id) });
   } catch (e) { next(e); }
 });
 
@@ -697,9 +775,8 @@ router.patch('/fleet/inspections/:id/defects/:defectId', requireInspector, async
     if (!draft) return;
 
     const existing = await queryOne(
-      `SELECT d.id, d.carried_from_id, it.major_defect_text
+      `SELECT d.id, d.carried_from_id
          FROM inspection_defects d
-         JOIN inspection_schedule_items it ON it.id = d.schedule_item_id
         WHERE d.id = $1 AND d.inspection_id = $2`,
       [defectId, id]
     );
@@ -708,20 +785,12 @@ router.patch('/fleet/inspections/:id/defects/:defectId', requireInspector, async
     const b = req.body || {};
     const sets = [];
     const vals = [];
+    // Severity is fixed by the regulation and is deliberately not editable.
+    // To change what was found, clear the defect and flag the right one.
     if (b.severity !== undefined) {
-      if (!['minor', 'major'].includes(b.severity)) return badRequest(res, 'severity must be minor or major');
-      if (b.severity === 'major' && !existing.major_defect_text) {
-        return badRequest(res, 'This item has no major defect class on the schedule.', { code: 'no_major_class' });
-      }
-      // A carried-forward major defect cannot be downgraded by the driver —
-      // that is a repair decision, and repairs are recorded by an admin.
-      if (existing.carried_from_id && b.severity === 'minor') {
-        return res.status(403).json({
-          message: 'A carried-forward defect can only be closed by an admin recording the repair.',
-          code: 'carried_forward_locked',
-        });
-      }
-      vals.push(b.severity); sets.push(`severity = $${vals.length}`);
+      return badRequest(res,
+        'Severity is set by the schedule, not by the inspector. Clear this defect and flag the entry that matches what you found.',
+        { code: 'severity_not_editable' });
     }
     if (b.note !== undefined) { vals.push(b.note); sets.push(`note = $${vals.length}`); }
     if (!sets.length) return badRequest(res, 'Nothing to update');
@@ -1216,10 +1285,23 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
       return res.status(409).json({ message: 'This schedule has no declaration wording configured.', code: 'no_declaration' });
     }
 
+    // Trailer attached, if the driver said so. Validated here rather than
+    // trusted, same as everything else arriving from a queued payload.
+    let towingId = intParam(b.towing_vehicle_id);
+    if (towingId) {
+      const trailer = await queryOne(
+        `SELECT id FROM vehicles WHERE id = $1 AND active = TRUE AND type = 'trailer'`,
+        [towingId]
+      );
+      if (!trailer || towingId === vehicleId) towingId = null;
+    } else {
+      towingId = null;
+    }
+
     // ── Validate the defect list against the schedule ──
     const rawDefects = Array.isArray(b.defects) ? b.defects : [];
     const items = await query(
-      `SELECT id, item_label, major_defect_text FROM inspection_schedule_items
+      `SELECT id, item_label, severity FROM inspection_schedule_items
         WHERE schedule_id = $1 AND active = TRUE`,
       [vehicle.inspection_schedule_id]
     );
@@ -1228,17 +1310,20 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
     for (const d of rawDefects) {
       const item = itemById.get(intParam(d.schedule_item_id));
       if (!item) return badRequest(res, 'A recorded defect is not on this unit\'s schedule.');
-      if (!['minor', 'major'].includes(d.severity)) {
-        return badRequest(res, 'severity must be minor or major');
-      }
-      if (d.severity === 'major' && !item.major_defect_text) {
-        return badRequest(res, `"${item.item_label}" has no major defect class on this schedule.`,
-          { code: 'no_major_class' });
-      }
       if (seenItems.has(item.id)) {
         return badRequest(res, `"${item.item_label}" is recorded twice on this report.`);
       }
       seenItems.add(item.id);
+      // Severity is resolved from the schedule, never from the payload — a
+      // queued check sat on a phone for hours and is not a trusted source
+      // for whether the regulation calls something major.
+      d._severity = item.severity;
+    }
+    if (rawDefects.some((d) => !['minor', 'major'].includes(d._severity))) {
+      return res.status(409).json({
+        message: 'A schedule entry has no severity recorded; the schedule needs re-seeding.',
+        code: 'schedule_item_no_severity',
+      });
     }
 
     if (rawDefects.length === 0 && b.no_defects !== true) {
@@ -1286,7 +1371,7 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
       });
     }
 
-    const hasMajor = rawDefects.some((d) => d.severity === 'major');
+    const hasMajor = rawDefects.some((d) => d._severity === 'major');
     const openMajor = await queryOne(
       `SELECT COUNT(*)::int AS n
          FROM inspection_defects d
@@ -1308,8 +1393,9 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
     const ins = await client.query(
       `INSERT INTO inspections
          (vehicle_id, schedule_id, carrier_name, plate, plate_jurisdiction,
-          inspector_employee_id, inspector_name, client_uuid, started_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9::timestamptz, $10::timestamptz))
+          inspector_employee_id, inspector_name, client_uuid, started_at,
+          towing_vehicle_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9::timestamptz, $10::timestamptz), $11)
        RETURNING id`,
       [
         vehicleId, vehicle.inspection_schedule_id, CARRIER_NAME,
@@ -1318,6 +1404,7 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
         clientUuid,
         b.client_started_at || null,
         clientAt.toISOString(),
+        towingId,
       ]
     );
     const inspectionId = ins.rows[0].id;
@@ -1338,7 +1425,7 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
       await client.query(
         `INSERT INTO inspection_defects (inspection_id, schedule_item_id, severity, note, carried_from_id)
          VALUES ($1, $2, $3, $4, $5)`,
-        [inspectionId, intParam(d.schedule_item_id), d.severity, d.note || null, carryOk ? carriedFrom : null]
+        [inspectionId, intParam(d.schedule_item_id), d._severity, d.note || null, carryOk ? carriedFrom : null]
       );
     }
 
@@ -1422,7 +1509,7 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
       query(
         `SELECT v.id, v.unit_number, v.type, v.make, v.model, v.year,
                 v.license_plate, v.plate_jurisdiction, v.inspection_required,
-                v.inspection_schedule_id
+                v.inspection_policy, v.inspection_schedule_id
            FROM vehicles v
           WHERE v.active = TRUE AND v.inspection_schedule_id IS NOT NULL
           ORDER BY v.inspection_required DESC, v.unit_number`
@@ -1450,7 +1537,8 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
 
     const items = schedules.length
       ? await query(
-          `SELECT id, schedule_id, group_name, item_label, sort_order,
+          `SELECT id, schedule_id, part_number, group_name, defect_letter,
+                  item_label, severity, condition_note, footnote_refs, sort_order,
                   minor_defect_text, major_defect_text
              FROM inspection_schedule_items
             WHERE active = TRUE AND schedule_id = ANY($1::int[])
@@ -1475,13 +1563,26 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
         ORDER BY i.vehicle_id, d.severity DESC, d.created_at`
     );
 
+    const notes = schedules.length
+      ? await query(
+          `SELECT schedule_id, note_number, note_text FROM inspection_schedule_notes
+            WHERE schedule_id = ANY($1::int[]) ORDER BY note_number`,
+          [schedules.map((s) => s.id)]
+        )
+      : [];
+
     res.json({
       carrier_name: CARRIER_NAME,
       inspector: { employee_id: req.user.id, name: req.user.name },
       units,
-      schedules: schedules.map((s) => ({ ...s, items: items.filter((i) => i.schedule_id === s.id) })),
+      schedules: schedules.map((s) => ({
+        ...s,
+        items: items.filter((i) => i.schedule_id === s.id),
+        notes: notes.filter((n) => n.schedule_id === s.id),
+      })),
       last_reports: latest,
       open_defects: openDefects,
+      trailers: units.filter((u) => u.type === 'trailer'),
       fetched_at: new Date().toISOString(),
     });
   } catch (e) { next(e); }
@@ -1525,10 +1626,11 @@ router.post('/fleet/inspection-jobs/:name/run', requireAdmin, async (req, res, n
   } catch (e) { next(e); }
 });
 
-// Prompt shown when a driver clocks in: does the unit they most recently
-// worked with still need a check today? Returns null rather than an error
-// when there is nothing to prompt, so the Time Clock UI can call it
-// unconditionally and ignore a null.
+// Prompt shown when a driver clocks in. Only fires for units the operator
+// has put on a DAILY policy — on-demand units are the driver's call, and
+// prompting on every clock-in would be nagging about a schedule that does
+// not exist. Returns null rather than an error when there is nothing to
+// say, so the Time Clock UI can call it unconditionally and ignore a null.
 router.get('/fleet/inspections/prompt', requireInspector, async (req, res, next) => {
   try {
     const last = await queryOne(
@@ -1538,7 +1640,7 @@ router.get('/fleet/inspections/prompt', requireInspector, async (req, res, next)
         WHERE i.inspector_employee_id = $1
           AND i.deleted_at IS NULL
           AND v.active = TRUE
-          AND v.inspection_required = TRUE
+          AND v.inspection_policy = 'daily'
         ORDER BY COALESCE(i.completed_at, i.started_at) DESC
         LIMIT 1`,
       [req.user.id]
@@ -1575,7 +1677,9 @@ router.get('/fleet/inspections/:id', requireStaff, async (req, res, next) => {
     const [defects, items] = await Promise.all([
       loadDefects(id),
       query(
-        `SELECT id, group_name, item_label, sort_order, minor_defect_text, major_defect_text
+        `SELECT id, part_number, group_name, defect_letter, item_label, severity,
+                  condition_note, footnote_refs, sort_order,
+                  minor_defect_text, major_defect_text
            FROM inspection_schedule_items
           WHERE schedule_id = $1 AND active = TRUE
           ORDER BY sort_order, id`,

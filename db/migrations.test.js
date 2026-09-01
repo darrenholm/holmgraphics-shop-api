@@ -39,7 +39,12 @@ try {
 }
 
 const MIGRATIONS = path.join(__dirname, 'migrations');
-const FILES = ['060_daily_inspections.sql', '061_inspection_jobs.sql', '062_inspection_offline.sql'];
+const FILES = [
+  '060_daily_inspections.sql',
+  '061_inspection_jobs.sql',
+  '062_inspection_offline.sql',
+  '063_schedule_1_official.sql',
+];
 const sqlFor = (f) => fs.readFileSync(path.join(MIGRATIONS, f), 'utf8');
 
 // Tables the migrations build on, as they exist by migration 023.
@@ -99,13 +104,15 @@ async function refuses(db, sql, because) {
 // Drives one unit through draft → defect → signed, and hands back the ids.
 async function signedInspection(db, { severity = 'major' } = {}) {
   const V = (await one(db, `SELECT id FROM vehicles WHERE unit_number='T-02'`)).id;
-  const S = (await one(db, `SELECT id FROM inspection_schedules WHERE version=1`)).id;
+  const S = (await one(db, `SELECT id FROM inspection_schedules WHERE active AND version=2`)).id;
   const E = (await one(db, `SELECT id FROM employees WHERE role='staff'`)).id;
   const A = (await one(db, `SELECT id FROM employees WHERE role='admin'`)).id;
   const item = (await one(db, `SELECT id FROM inspection_schedule_items
-                                WHERE major_defect_text IS NOT NULL ORDER BY sort_order LIMIT 1`)).id;
+                                WHERE schedule_id=${S} AND severity='${severity}'
+                                ORDER BY sort_order LIMIT 1`)).id;
   const spare = (await one(db, `SELECT id FROM inspection_schedule_items
-                                 WHERE major_defect_text IS NOT NULL ORDER BY sort_order DESC LIMIT 1`)).id;
+                                 WHERE schedule_id=${S} AND severity='${severity}'
+                                 ORDER BY sort_order DESC LIMIT 1`)).id;
 
   const { id } = await one(db, `
     INSERT INTO inspections (vehicle_id,schedule_id,carrier_name,plate,plate_jurisdiction,
@@ -138,24 +145,145 @@ test('a retried deploy can re-apply them without duplicating the seed', async ()
   const db = await freshDb({ rerun: true });
   const s = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedules`);
   const i = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items`);
-  assert.equal(s.n, 1, 'schedule seeded twice');
-  assert.equal(i.n, 34, 'items seeded twice');
+  const n = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_notes`);
+  assert.equal(s.n, 2, 'schedule seeded twice (expect v1 + v2 only)');
+  assert.equal(i.n, 34 + 76, 'items seeded twice');
+  assert.equal(n.n, 11, 'notes seeded twice');
+});
+
+test('Schedule 1 v2 matches the regulation part by part', async () => {
+  // Counted off O. Reg. 199/07, Sched. 1 as published: [part, minor, major].
+  // A carrier may ADD items to Schedule 1 but may not drop any, so a seed
+  // that quietly loses a defect is the failure this is here to catch.
+  const EXPECTED = [
+    [1,2,5],  [2,1,1],  [3,1,2],  [4,1,3],  [5,0,1],  [6,1,0],
+    [7,1,1],  [8,1,2],  [9,1,0],  [10,1,1], [11,1,1], [12,1,2],
+    [13,0,1], [14,2,0], [15,1,1], [16,1,0], [17,1,6], [18,2,4],
+    [19,1,2], [20,3,4], [21,2,6], [22,2,3], [23,2,1],
+  ];
+  const db = await freshDb();
+  const v2 = (await one(db, `SELECT id FROM inspection_schedules WHERE version=2`)).id;
+  const rows = (await db.query(
+    `SELECT part_number,
+            COUNT(*) FILTER (WHERE severity='minor')::int minor,
+            COUNT(*) FILTER (WHERE severity='major')::int major
+       FROM inspection_schedule_items WHERE schedule_id=${v2}
+      GROUP BY part_number ORDER BY part_number`)).rows;
+
+  assert.equal(rows.length, 23, 'Schedule 1 has 23 Parts');
+  for (const [part, minor, major] of EXPECTED) {
+    const got = rows.find((r) => r.part_number === part);
+    assert.ok(got, `Part ${part} missing`);
+    assert.equal(got.minor, minor, `Part ${part} minor defect count`);
+    assert.equal(got.major, major, `Part ${part} major defect count`);
+  }
+  const total = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items WHERE schedule_id=${v2}`);
+  assert.equal(total.n, 76);
+});
+
+test('every v2 defect carries a severity, and none say PLACEHOLDER', async () => {
+  // Severity now comes off the row rather than being chosen by the driver,
+  // so a row without one would be unusable — the API refuses to flag it.
+  const db = await freshDb();
+  const v2 = (await one(db, `SELECT id FROM inspection_schedules WHERE version=2`)).id;
+  const r = await one(db, `SELECT
+      COUNT(*) FILTER (WHERE severity IS NULL)::int no_sev,
+      COUNT(*) FILTER (WHERE item_label LIKE '%PLACEHOLDER%')::int placeholder,
+      COUNT(*) FILTER (WHERE item_label IS NULL OR item_label='')::int empty
+      FROM inspection_schedule_items WHERE schedule_id=${v2}`);
+  assert.equal(r.no_sev, 0);
+  assert.equal(r.placeholder, 0, 'v2 is the official text; nothing should be marked placeholder');
+  assert.equal(r.empty, 0);
+});
+
+test('the conditional major defects in Parts 18 and 23 keep their qualifier', async () => {
+  // "When use of lamps is required" and "At all times" change what the
+  // defect means. Dropping them would change what the regulation says.
+  const db = await freshDb();
+  const v2 = (await one(db, `SELECT id FROM inspection_schedules WHERE version=2`)).id;
+  const rows = (await db.query(
+    `SELECT DISTINCT condition_note FROM inspection_schedule_items
+      WHERE schedule_id=${v2} AND condition_note IS NOT NULL ORDER BY 1`)).rows
+    .map((r) => r.condition_note);
+  assert.deepEqual(rows, [
+    'At all times',
+    'When use of lamps is required',
+    'When use of wipers or washer is required',
+  ]);
+});
+
+test('footnote references survive into the seed', async () => {
+  const db = await freshDb();
+  const v2 = (await one(db, `SELECT id FROM inspection_schedules WHERE version=2`)).id;
+  const r = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items
+                            WHERE schedule_id=${v2} AND footnote_refs IS NOT NULL`);
+  assert.equal(r.n, 11, 'eleven Schedule 1 entries carry a superscript note reference');
+  const notes = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_notes WHERE schedule_id=${v2}`);
+  assert.equal(notes.n, 11);
+});
+
+test('v1 is retired but not deleted', async () => {
+  // Reports signed against the placeholder schedule still point at it and
+  // must keep rendering the text they were signed against.
+  const db = await freshDb();
+  const r = await one(db, `SELECT active FROM inspection_schedules WHERE version=1`);
+  assert.equal(r.active, false, 'v1 should no longer be offered for new checks');
+  const items = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items i
+                                 JOIN inspection_schedules s ON s.id=i.schedule_id WHERE s.version=1`);
+  assert.equal(items.n, 34, 'v1 items must survive for already-signed reports');
+});
+
+// ─── On-demand policy (063) ─────────────────────────────────────────────────
+
+test('the fleet defaults to on-demand checks, not daily', async () => {
+  const db = await freshDb();
+  const r = await one(db, `SELECT COUNT(*) FILTER (WHERE inspection_policy='on_demand')::int od,
+                                  COUNT(*)::int total FROM vehicles`);
+  assert.equal(r.od, r.total);
+});
+
+test('policy is independent of whether the regulation applies', async () => {
+  // The two must not collapse into one flag: inspection_required is a fact
+  // about O. Reg. 199/07, inspection_policy is an operating decision. T-02
+  // is in scope AND on-demand at the same time, and the board says so.
+  const db = await freshDb();
+  const r = await one(db, `SELECT inspection_required ir, inspection_policy p
+                             FROM vehicles WHERE unit_number='T-02'`);
+  assert.equal(r.ir, true,  'T-02 is still covered by the regulation');
+  assert.equal(r.p, 'on_demand', 'and is still only checked on demand');
+
+  await db.exec(`UPDATE vehicles SET inspection_policy='daily' WHERE unit_number='T-02'`);
+  const after = await one(db, `SELECT inspection_required ir, inspection_policy p
+                                 FROM vehicles WHERE unit_number='T-02'`);
+  assert.equal(after.p, 'daily');
+  assert.equal(after.ir, true, 'changing policy must not touch the regulatory fact');
+});
+
+test('a check records the trailer that was attached', async () => {
+  const db = await freshDb();
+  const { id } = await signedInspection(db);
+  const tr = (await one(db, `SELECT id FROM vehicles WHERE unit_number='Tr-03'`)).id;
+  // Set before signing in real use; here the row is already frozen, so this
+  // doubles as a check that towing_vehicle_id is part of the frozen record.
+  await refuses(db, `UPDATE inspections SET towing_vehicle_id=${tr} WHERE id=${id}`, 'is immutable');
 });
 
 // ─── The seed ───────────────────────────────────────────────────────────────
 
 test('the seeded schedule is marked unverified', async () => {
   const db = await freshDb();
-  const r = await one(db, `SELECT source_verified FROM inspection_schedules WHERE version=1`);
+  const r = await one(db, `SELECT source_verified FROM inspection_schedules WHERE active AND version=2`);
   assert.equal(r.source_verified, false,
     'placeholder wording must never ship as verified — the banner and the per-report warning key off this');
 });
 
-test('every seeded string is marked PLACEHOLDER', async () => {
+test('the retired v1 seed is still entirely marked PLACEHOLDER', async () => {
   const db = await freshDb();
-  const r = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items
-                            WHERE COALESCE(minor_defect_text,'') NOT LIKE '%PLACEHOLDER%'
-                              AND COALESCE(major_defect_text,'') NOT LIKE '%PLACEHOLDER%'`);
+  const r = await one(db, `SELECT COUNT(*)::int n FROM inspection_schedule_items i
+                             JOIN inspection_schedules s ON s.id=i.schedule_id
+                            WHERE s.version=1
+                              AND COALESCE(i.minor_defect_text,'') NOT LIKE '%PLACEHOLDER%'
+                              AND COALESCE(i.major_defect_text,'') NOT LIKE '%PLACEHOLDER%'`);
   assert.equal(r.n, 0, 'unmarked text could be mistaken for regulation wording on a signed report');
 });
 
@@ -201,16 +329,15 @@ test('re-plating a unit re-derives its scope automatically', async () => {
   assert.equal((await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='Tr-03'`)).ir, false);
 });
 
-test('trailers are not given the power-unit schedule', async () => {
-  // A trailer over 4,500 kg needs its own schedule; handing it Schedule 1
-  // would have a driver inspecting a trailer against power-unit items.
+test('every active unit, trailers included, is on Schedule 1 v2', async () => {
+  // Schedule 1 is titled "DAILY INSPECTION OF TRUCKS, TRACTORS AND
+  // TRAILERS". Migration 060 assumed trailers needed a separate schedule
+  // and left them unassigned; 063 corrects that.
   const db = await freshDb();
-  const r = await one(db, `SELECT
-      COUNT(*) FILTER (WHERE type='truck'   AND inspection_schedule_id IS NULL)::int trucks_missing,
-      COUNT(*) FILTER (WHERE type='trailer' AND inspection_schedule_id IS NOT NULL)::int trailers_set
-      FROM vehicles`);
-  assert.equal(r.trucks_missing, 0);
-  assert.equal(r.trailers_set, 0);
+  const v2 = (await one(db, `SELECT id FROM inspection_schedules WHERE version=2`)).id;
+  const r = await one(db, `SELECT COUNT(*)::int n FROM vehicles
+                            WHERE active AND inspection_schedule_id IS DISTINCT FROM ${v2}`);
+  assert.equal(r.n, 0, 'some active unit is not pointed at Schedule 1 v2');
 });
 
 // ─── Draft lifecycle ────────────────────────────────────────────────────────
