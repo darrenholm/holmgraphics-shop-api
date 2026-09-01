@@ -471,11 +471,13 @@ router.get('/fleet/inspections/prefill', requireInspector, async (req, res, next
 router.get('/fleet/inspection-schedules', requireStaff, async (req, res, next) => {
   try {
     const schedules = await query(
-      `SELECT id, name, reg_reference, version, unit_type, declaration_text,
-              source_verified, verified_at, active
-         FROM inspection_schedules
-        WHERE active = TRUE
-        ORDER BY unit_type, name, version DESC`
+      `SELECT s.id, s.name, s.reg_reference, s.version, s.unit_type, s.declaration_text,
+              s.source_verified, s.verified_at, s.active,
+              e.first_name || ' ' || e.last_name AS verified_by_name
+         FROM inspection_schedules s
+         LEFT JOIN employees e ON e.id = s.verified_by
+        WHERE s.active = TRUE
+        ORDER BY s.unit_type, s.name, s.version DESC`
     );
     const items = schedules.length
       ? await query(
