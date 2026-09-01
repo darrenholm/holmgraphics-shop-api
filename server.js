@@ -33,12 +33,14 @@ const fleetRoutes        = require('./routes/fleet');
 const fleetSmartcarRoutes = require('./routes/fleet-smartcar');
 const fleetFordproRoutes = require('./routes/fleet-fordpro');
 const fleetTelematicsRoutes = require('./routes/fleet-telematics');
+const fleetInspectionRoutes = require('./routes/fleet-inspections');
 const cookieParser       = require('cookie-parser');
 const quoteSheetRoutes   = require('./routes/quote-sheet');
 const inboundEmailRoutes = require('./routes/inbound-email');
 const projectProofsRoutes = require('./routes/project-proofs');
 const { scheduleProofArchiveSweep } = require('./lib/proof-archive-sweep');
 const { scheduleFordproPoll } = require('./lib/fordpro-telematics');
+const { scheduleInspectionJobs } = require('./lib/inspection-jobs');
 const schedulingRoutes    = require('./routes/scheduling');
 const inventoryRoutes     = require('./routes/inventory');
 // Telephony — inbound call screen pop (Phase 1). Owns BOTH the very short
@@ -154,6 +156,9 @@ app.use('/api/fleet',        fleetSmartcarRoutes);
 app.use('/api',              fleetFordproRoutes);
 // Provider-agnostic telematics read layer at /api/fleet/telematics/...
 app.use('/api',              fleetTelematicsRoutes);
+// Daily inspections (O. Reg. 199/07) at /api/fleet/inspections/... — also
+// specific paths, mounted ahead of the generic /fleet/vehicles handlers.
+app.use('/api',              fleetInspectionRoutes);
 app.use('/api/fleet',        fleetRoutes);
 
 // ─── Health check ─────────────────────────────────────────────────────────────
@@ -211,6 +216,13 @@ app.use((err, req, res, next) => {
   // FORD_TELEMATICS_POLL_MINUTES). Self-scheduling; no-ops until the
   // service-account creds are set. See lib/fordpro-telematics.js.
   scheduleFordproPoll();
+
+  // Background: daily-inspection digests + retention archive. Unlike the two
+  // above, these fire on shop-local wall-clock windows (07:00 weekdays,
+  // Monday, the 1st) rather than a period from boot, so a redeploy cannot
+  // drift them. Claims are held in the DB, so restarts and extra replicas
+  // cannot double-send. See lib/inspection-jobs.js.
+  scheduleInspectionJobs();
 
   app.listen(PORT, () => {
     let dbHost = '(DATABASE_URL not set)';
