@@ -539,7 +539,12 @@ router.post('/documents/:id/rebuild-statement', requireStaff, async (req, res) =
     if (!doc.extract_raw) return res.status(400).json({ error: 'No stored extraction to rebuild from' });
 
     const { normalizeExtraction } = require('../lib/ap-extract');
-    const result = normalizeExtraction(doc.extract_raw);
+    // extract_raw is { first_pass, gap_pass? } on anything extracted since the
+    // second pass shipped, and the bare model output on rows written before
+    // it. Statements never trigger a gap pass, so first_pass is the whole
+    // answer whenever it is present.
+    const rawDoc = doc.extract_raw.first_pass || doc.extract_raw;
+    const result = normalizeExtraction(rawDoc);
     const statementId = await upsertStatement(
       doc.id, result,
       doc.vendor_qbo_id ? { id: doc.vendor_qbo_id } : null
