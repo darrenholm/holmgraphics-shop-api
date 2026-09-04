@@ -52,6 +52,10 @@ const telephonyRoutes     = require('./routes/telephony');
 // app root because Stripe posts to a fixed URL with its own signature auth.
 const terminalRoutes      = require('./routes/terminal');
 const stripeWebhookRoutes = require('./routes/stripe-webhook');
+// Accounts payable — supplier invoice/statement intake, Claude extraction,
+// review queue, QBO Bill posting, and supplier-statement reconciliation.
+// Replaces forwarding bills to holmgraphics@qbodocs.com.
+const apRoutes            = require('./routes/ap');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -109,6 +113,9 @@ app.use('/api/payment',       paymentRoutes);
 // /api/internal — public tokenize endpoint for holmgraphics.ca/advertise
 // + shared-secret charge endpoint for led.holmgraphics.ca. Has its own CORS.
 app.use('/api/internal',     internalPaymentsRoutes);
+// Accounts payable. Self-contained under /api/ap — no path collisions with
+// the generic /api mounts below.
+app.use('/api/ap',           apRoutes);
 app.use('/api/quote-request', quoteRoutes);
 app.use('/api/admin/dtf',    dtfAdminRoutes);
 app.use('/api/admin/orders', ordersAdminRoutes);

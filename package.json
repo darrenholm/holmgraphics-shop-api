@@ -10,6 +10,7 @@
     "test:schema": "node --test \"db/*.test.js\""
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.123.0",
     "basic-ftp": "^5.0.5",
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
@@ -24,7 +25,8 @@
     "pdfkit": "^0.18.0",
     "pg": "^8.11.5",
     "smartcar": "^10.4.0",
-    "stripe": "^22.6.0"
+    "stripe": "^22.6.0",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
