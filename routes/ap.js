@@ -30,6 +30,7 @@ const { ingestDocument, runExtraction, upsertStatement } = require('../lib/ap-in
 const { normalizeVendor } = require('../lib/ap-extract');
 const {
   postBillForDocument, resolveVendor, learnVendorAlias, searchVendors,
+  listExpenseAccounts,
 } = require('../lib/ap-qbo-bills');
 const { reconcileStatement } = require('../lib/ap-reconcile');
 
@@ -330,6 +331,17 @@ router.get('/vendors', requireStaff, async (req, res) => {
     res.json({ vendors: await searchVendors(req.query.q) });
   } catch (err) {
     console.error('[ap] vendor search failed:', err);
+    res.status(502).json({ error: `QuickBooks lookup failed: ${err.message}` });
+  }
+});
+
+// GET /api/ap/accounts — the expense side of the chart of accounts, for the
+// per-line coding dropdown on the review screen.
+router.get('/accounts', requireStaff, async (req, res) => {
+  try {
+    res.json({ accounts: await listExpenseAccounts() });
+  } catch (err) {
+    console.error('[ap] account list failed:', err);
     res.status(502).json({ error: `QuickBooks lookup failed: ${err.message}` });
   }
 });
