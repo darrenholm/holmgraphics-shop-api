@@ -69,10 +69,32 @@ node -r dotenv/config scripts/run-sql.js db/migrations/064_ap_bills.sql
    own tax-exclusive default and adds 13% on top of an amount that already
    includes it.
 
-4. **Point intake at it.** An Outlook rule that saves attachments to a
-   watched folder, plus a small script POSTing to `/api/ap/inbound`, is the
-   lowest-friction option. Until that exists, staff upload through
-   `POST /api/ap/documents`.
+4. **Point intake at it** with `scripts/ap-outlook-watcher.ps1`, which feeds
+   `/api/ap/inbound` from two sources:
+
+   * **An Outlook folder.** Make an ordinary Outlook rule that moves supplier
+     invoice emails into, say, `InboxAP Invoices`. The watcher pulls the PDF
+     attachments out and moves each message to a `Processed` subfolder, so the
+     original email is kept and never read twice.
+   * **A filesystem folder.** Anything dropped in it -- a scan, a download, an
+     attachment saved by hand -- is posted and moved to `processed`.
+
+   Register it once:
+
+   ```powershell
+   setx AP_INBOUND_SECRET "<same value as the API>"
+   .scriptsap-outlook-watcher.ps1 -Install -OutlookFolder "darren@holmgraphics.caInboxAP Invoices" -WatchFolder "C:AP-Inbox"
+   ```
+
+   Add `-DryRun` to see what it would post without posting. It runs every 10
+   minutes and logs to `%LOCALAPPDATA%HolmGraphicsap-watcher.log`.
+
+   **It must run as the signed-in user on a machine with Outlook open** --
+   Outlook COM does not exist in a SYSTEM session, so unlike the files-bridge
+   this cannot be a SYSTEM AtStartup task. The folder half works regardless.
+
+   Duplicate posts are harmless: the API hashes the bytes, so the same invoice
+   arriving by both routes lands on one row.
 
 ## Endpoints
 
