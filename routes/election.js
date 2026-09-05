@@ -11,6 +11,7 @@
 // Mounted at /api/election.
 //
 //   GET  /api/election/catalogue        what is sold and what it costs  (public)
+//   GET  /api/election/apparel          styles, colours, sizes, placements (public)
 //   POST /api/election/quote            price a basket, save nothing    (public)
 //   PUT  /api/election/drafts/:code     save a half-finished basket     (public)
 //   GET  /api/election/drafts/:code     read one back                   (public)
@@ -40,7 +41,12 @@ const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireCustomer } = require('../middleware/customer-auth');
 const { requireStaff } = require('../middleware/auth');
-const { catalogue, priceOrder } = require('../lib/election-catalogue');
+const { ARTWORK_FEE, catalogue, priceOrder } = require('../lib/election-catalogue');
+const {
+  apparelOptions,
+  printLocations,
+  priceApparel,
+} = require('../lib/election-apparel');
 
 const router = express.Router();
 
@@ -64,18 +70,65 @@ router.get('/catalogue', (req, res) => {
   res.json(catalogue());
 });
 
+// ─── GET /api/election/apparel ───────────────────────────────────────────────
+// Public, like the rest of the price list. Apparel is priced by the shop's DTF
+// engine rather than the election catalogue, so its options come from the
+// supplier catalogue and the DTF configuration instead.
+router.get('/apparel', async (req, res) => {
+  try {
+    const [styles, locations] = await Promise.all([apparelOptions(), printLocations()]);
+    res.json({ styles, print_locations: locations });
+  } catch (e) {
+    console.error('GET /election/apparel:', e);
+    res.status(500).json({ message: 'Could not load the apparel options', detail: e.message });
+  }
+});
+
+/**
+ * One basket, two engines.
+ *
+ * Signs, cards and decals come from the election price list; apparel comes from
+ * lib/dtf-pricing.js. The caller should not have to know that, so both are
+ * priced here and the lines come back in one list, in the order the form shows
+ * them.
+ */
+async function priceBasket(body) {
+  const { signs, print, decals, apparel, needs_artwork } = body || {};
+
+  // Artwork is added here rather than by priceOrder, because priceOrder only
+  // knows about its own lines: an order of nothing but shirts would otherwise
+  // be given the artwork for free.
+  const printed = priceOrder({
+    signs: signs || [],
+    print: print || [],
+    decals: decals || [],
+    needsArtwork: false,
+  });
+
+  const { lines: apparelLines, warnings } = await priceApparel(apparel || []);
+
+  const lines = [...printed.lines, ...apparelLines];
+  if (needs_artwork && lines.length > 0) {
+    lines.push({
+      item_type: 'Printing',
+      description: 'Artwork — one charge for the whole job, however many pieces are on it',
+      quantity: 1,
+      unit_price: ARTWORK_FEE,
+      total: ARTWORK_FEE,
+      source: { kind: 'artwork', index: 0 },
+    });
+  }
+
+  const subtotal = Math.round(lines.reduce((sum, l) => sum + l.total, 0) * 100) / 100;
+  return { lines, subtotal, warnings };
+}
+
 // ─── POST /api/election/quote ────────────────────────────────────────────────
 // Public. Prices a basket and saves nothing, so the form can show a running
 // total while it is being filled in.
-router.post('/quote', (req, res) => {
+router.post('/quote', async (req, res) => {
   try {
-    const { signs, print, decals, needs_artwork } = req.body || {};
-    const priced = priceOrder({
-      signs: signs || [],
-      print: print || [],
-      decals: decals || [],
-      needsArtwork: Boolean(needs_artwork),
-    });
+    const priced = await priceBasket(req.body);
     res.json({ ok: true, ...priced });
   } catch (e) {
     res.status(400).json({ ok: false, message: e.message });
@@ -161,13 +214,7 @@ router.get('/drafts/:code', async (req, res) => {
 
     // Priced fresh from the price list, never from anything the draft stored:
     // a basket saved last week should quote at this week's prices.
-    const basket = draft.basket || {};
-    const priced = priceOrder({
-      signs: basket.signs || [],
-      print: basket.print || [],
-      decals: basket.decals || [],
-      needsArtwork: Boolean(basket.needs_artwork),
-    });
+    const priced = await priceBasket(draft.basket || {});
     res.json({ ...draft, ...priced });
   } catch (e) {
     console.error('GET /election/drafts:', e);
@@ -209,12 +256,7 @@ router.post('/jobs', requireCustomer, async (req, res) => {
     due_date, notes,
   } = req.body || {};
 
-  const priced = priceOrder({
-    signs: signs || [],
-    print: print || [],
-    decals: decals || [],
-    needsArtwork: Boolean(needs_artwork),
-  });
+  const priced = await priceBasket(req.body);
 
   if (priced.lines.length === 0) {
     return res.status(400).json({ message: 'Nothing on the order.' });
