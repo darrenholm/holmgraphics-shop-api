@@ -12,8 +12,17 @@
 //
 //   GET  /api/election/catalogue        what is sold and what it costs  (public)
 //   POST /api/election/quote            price a basket, save nothing    (public)
+//   PUT  /api/election/drafts/:code     save a half-finished basket     (public)
+//   GET  /api/election/drafts/:code     read one back                   (public)
+//   GET  /api/election/drafts           the recent ones, for the phone  (staff)
 //   POST /api/election/jobs             create the job as a Quote       (customer)
 //   POST /api/election/jobs/:id/order   Quote -> Ordered                (customer)
+//
+// DRAFTS EXIST FOR THE TELEPHONE. Candidates ring partway through — "I'm on the
+// sign bit and I don't know which thickness" — and without a saved draft the
+// person answering is working blind. The caller reads out an eight-character
+// code and staff open the same basket. The code is the access control; it holds
+// sign quantities and a phone number, which is what that is worth.
 //
 // THE JOB IT CREATES. Type "Mixed", status "Quote", with one `items` row per
 // line — the same rows staff add by hand, so the board, the totals and the
@@ -26,9 +35,11 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireCustomer } = require('../middleware/customer-auth');
+const { requireStaff } = require('../middleware/auth');
 const { catalogue, priceOrder } = require('../lib/election-catalogue');
 
 const router = express.Router();
@@ -68,6 +79,122 @@ router.post('/quote', (req, res) => {
     res.json({ ok: true, ...priced });
   } catch (e) {
     res.status(400).json({ ok: false, message: e.message });
+  }
+});
+
+// ─── drafts ──────────────────────────────────────────────────────────────────
+
+// No vowels, no 0/O or 1/I/L: it has to survive being read down a phone line
+// and must not accidentally spell anything.
+const CODE_ALPHABET = '23456789BCDFGHJKMNPQRSTVWXYZ';
+
+function newCode() {
+  const bytes = crypto.randomBytes(8);
+  let out = '';
+  for (const b of bytes) out += CODE_ALPHABET[b % CODE_ALPHABET.length];
+  return out;
+}
+
+function cleanCode(raw) {
+  const code = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return /^[A-Z0-9]{4,16}$/.test(code) ? code : null;
+}
+
+// PUT /api/election/drafts/:code — save as they type. Public: most of this form
+// can be filled in before signing in, which is the whole point of showing
+// prices to somebody who has not decided to run yet.
+router.put('/drafts/:code', async (req, res) => {
+  const code = cleanCode(req.params.code);
+  if (!code) return res.status(400).json({ message: 'Bad code' });
+
+  const {
+    basket, candidate_name, office, municipality, ward,
+    contact_name, contact_phone, contact_email, notes,
+  } = req.body || {};
+
+  try {
+    await query(
+      `INSERT INTO election_drafts (
+          code, basket, candidate_name, office, municipality, ward,
+          contact_name, contact_phone, contact_email, notes, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+       ON CONFLICT (code) DO UPDATE SET
+          basket = EXCLUDED.basket,
+          candidate_name = EXCLUDED.candidate_name,
+          office = EXCLUDED.office,
+          municipality = EXCLUDED.municipality,
+          ward = EXCLUDED.ward,
+          contact_name = EXCLUDED.contact_name,
+          contact_phone = EXCLUDED.contact_phone,
+          contact_email = EXCLUDED.contact_email,
+          notes = EXCLUDED.notes,
+          updated_at = NOW()`,
+      [
+        code, JSON.stringify(basket || {}),
+        candidate_name || null, office || null, municipality || null, ward || null,
+        contact_name || null, contact_phone || null, contact_email || null,
+        notes ? String(notes).slice(0, 2000) : null,
+      ],
+    );
+    res.json({ code });
+  } catch (e) {
+    console.error('PUT /election/drafts:', e);
+    res.status(500).json({ message: 'Could not save the draft', detail: e.message });
+  }
+});
+
+// GET /api/election/drafts/:code — what staff open when the phone rings, and
+// what the candidate's own browser reloads from.
+router.get('/drafts/:code', async (req, res) => {
+  const code = cleanCode(req.params.code);
+  if (!code) return res.status(400).json({ message: 'Bad code' });
+
+  try {
+    const draft = await queryOne(
+      `SELECT code, basket, candidate_name, office, municipality, ward,
+              contact_name, contact_phone, contact_email, notes,
+              submitted_project_id, updated_at
+         FROM election_drafts WHERE code = $1`,
+      [code],
+    );
+    if (!draft) return res.status(404).json({ message: 'No draft with that code' });
+
+    // Priced fresh from the price list, never from anything the draft stored:
+    // a basket saved last week should quote at this week's prices.
+    const basket = draft.basket || {};
+    const priced = priceOrder({
+      signs: basket.signs || [],
+      print: basket.print || [],
+      decals: basket.decals || [],
+      needsArtwork: Boolean(basket.needs_artwork),
+    });
+    res.json({ ...draft, ...priced });
+  } catch (e) {
+    console.error('GET /election/drafts:', e);
+    res.status(500).json({ message: 'Could not load the draft', detail: e.message });
+  }
+});
+
+// GET /api/election/drafts — the ones on the go, newest first. For the person
+// answering the phone to a caller who has lost their code but knows their name.
+router.get('/drafts', requireStaff, async (req, res) => {
+  const search = String(req.query.q || '').trim();
+  try {
+    const rows = await query(
+      `SELECT code, candidate_name, office, municipality, contact_phone,
+              submitted_project_id, updated_at
+         FROM election_drafts
+        WHERE submitted_project_id IS NULL
+          AND ($1 = '' OR LOWER(candidate_name) LIKE LOWER('%' || $1 || '%')
+                       OR contact_phone LIKE '%' || $1 || '%')
+        ORDER BY updated_at DESC
+        LIMIT 50`,
+      [search],
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /election/drafts list:', e);
+    res.status(500).json({ message: 'Could not list drafts', detail: e.message });
   }
 });
 
@@ -157,6 +284,20 @@ router.post('/jobs', requireCustomer, async (req, res) => {
         [project.id, String(notes).trim().slice(0, 2000)],
       ).catch(() => {
         // A note is worth having and not worth failing an order over.
+      });
+    }
+
+    // Keep the draft rather than deleting it, marked with the job it became:
+    // a call that comes in just after can still be traced to what was ordered.
+    const draftCode = cleanCode(req.body?.draft_code);
+    if (draftCode) {
+      await query(
+        `UPDATE election_drafts
+            SET submitted_project_id = $1, client_id = $2, updated_at = NOW()
+          WHERE code = $3`,
+        [project.id, req.customer.id, draftCode],
+      ).catch(() => {
+        // A draft that cannot be marked is not worth failing an order over.
       });
     }
 
