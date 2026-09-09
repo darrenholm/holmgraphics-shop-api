@@ -27,7 +27,7 @@ const crypto  = require('crypto');
 const { query, queryOne } = require('../db/connection');
 const { requireStaff, requireAdmin } = require('../middleware/auth');
 const { ingestDocument, runExtraction, upsertStatement } = require('../lib/ap-intake');
-const { normalizeVendor } = require('../lib/ap-extract');
+const { normalizeVendor, linesReconcile } = require('../lib/ap-extract');
 const {
   postBillForDocument, resolveVendor, learnVendorAlias, searchVendors,
   listExpenseAccounts,
@@ -408,11 +408,30 @@ router.post('/documents/:id/approve', requireStaff, async (req, res) => {
     if (!doc.vendor_qbo_id) problems.push('no QuickBooks vendor assigned');
     if (doc.doc_kind === 'invoice' || doc.doc_kind === 'credit_note') {
       const lines = await query(
-        `SELECT COALESCE(SUM(amount_cents), 0) AS total, COUNT(*) AS n
-           FROM ap_document_lines WHERE document_id = $1`,
+        `SELECT amount_cents FROM ap_document_lines WHERE document_id = $1`,
         [req.params.id]
       );
-      if (Number(lines[0].n) === 0) problems.push('no lines to post');
+      if (lines.length === 0) problems.push('no lines to post');
+
+      // The arithmetic gate. A bill whose lines do not add up to the printed
+      // total is wrong in the way that costs money: it looks fine in
+      // QuickBooks and can never match the supplier's statement. This used to
+      // be a warning the reviewer could click straight past, and the first
+      // real bill posted at double because of it.
+      const sums = linesReconcile({
+        lines,
+        taxCents:   doc.tax_cents,
+        totalCents: doc.total_cents,
+      });
+      if (!sums.ok) {
+        const fmt = (c) => `$${(c / 100).toFixed(2)}`;
+        problems.push(
+          `the lines do not add up — ${fmt(sums.lineTotalCents)} plus tax ` +
+          `${fmt(doc.tax_cents || 0)} is ${fmt(sums.expectedCents)}, but the document ` +
+          `says ${fmt(doc.total_cents)} (out by ${fmt(Math.abs(sums.differenceCents))}). ` +
+          `Usually a charge captured twice: once as a summary and again broken out`
+        );
+      }
     }
     if (problems.length) {
       return res.status(400).json({ error: `Cannot approve: ${problems.join('; ')}` });
