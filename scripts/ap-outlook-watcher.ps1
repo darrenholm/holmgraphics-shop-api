@@ -60,6 +60,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$TASK_NAME = 'HolmGraphics AP Watcher'
+
 # Extensions the API accepts. Anything else in the folder is left alone rather
 # than deleted -- a stray file is someone's, not ours to throw away.
 $AllowedExt = @('.pdf', '.jpg', '.jpeg', '.png')
@@ -347,18 +349,38 @@ function Install-Task {
   $atLogon = New-ScheduledTaskTrigger -AtLogOn
   $repeat  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
                -RepetitionInterval (New-TimeSpan -Minutes 10)
-  # Interactive, not SYSTEM: Outlook COM only exists inside a signed-in
-  # session with Outlook actually open.
-  $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive
-  $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-                 -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
-                 -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
+                -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
 
-  Register-ScheduledTask -TaskName 'HolmGraphics AP Watcher' `
-    -Action $action -Trigger @($atLogon, $repeat) `
-    -Principal $principal -Settings $settings -Force | Out-Null
+  # No explicit -Principal. Register-ScheduledTask then registers the task for
+  # whoever is running it, which is what we want anyway: Outlook COM only
+  # exists inside a signed-in session with Outlook open, so this can never be
+  # a SYSTEM task. Naming the principal by hand was worse than useless -- on
+  # an Entra-joined machine the account is "AzureAD+Name" and the
+  # "$env:USERDOMAIN\$env:USERNAME" form is not a principal Windows accepts,
+  # which is what produced an access-denied error that looked like a
+  # permissions problem.
+  try {
+    Register-ScheduledTask -TaskName $TASK_NAME `
+      -Action $action -Trigger @($atLogon, $repeat) `
+      -Settings $settings -Force -ErrorAction Stop | Out-Null
+  } catch {
+    Write-Log "Could not register the scheduled task: $($_.Exception.Message)" 'ERROR'
+    Write-Log "Try again from a PowerShell started with 'Run as administrator'." 'ERROR'
+    return
+  }
 
-  Write-Log "Scheduled task 'HolmGraphics AP Watcher' registered (every 10 minutes)."
+  # Verify rather than assume. The previous version logged success
+  # unconditionally, so a failed registration was reported as done and the
+  # watcher silently never ran.
+  $task = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+  if (-not $task) {
+    Write-Log "Registration reported no error but the task does not exist." 'ERROR'
+    return
+  }
+
+  Write-Log "Scheduled task '$TASK_NAME' registered and verified (every 10 minutes, and at logon)."
   Write-Log "AP_INBOUND_SECRET must be set as a USER environment variable for the task to authenticate."
 }
 
