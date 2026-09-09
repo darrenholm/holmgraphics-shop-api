@@ -397,7 +397,11 @@ router.post('/documents/:id/vendor', requireStaff, async (req, res) => {
 router.post('/documents/:id/approve', requireStaff, async (req, res) => {
   try {
     const doc = await queryOne(
-      `SELECT id, vendor_qbo_id, total_cents, doc_kind FROM ap_documents WHERE id = $1`,
+      // tax_cents is load-bearing here: linesReconcile() needs it, and a
+      // column left out of the SELECT arrives as undefined, which reads as
+      // zero tax and fails every taxable invoice by exactly its own tax.
+      `SELECT id, vendor_qbo_id, doc_kind, tax_cents, total_cents
+         FROM ap_documents WHERE id = $1`,
       [req.params.id]
     );
     if (!doc) return res.status(404).json({ error: 'Not found' });
