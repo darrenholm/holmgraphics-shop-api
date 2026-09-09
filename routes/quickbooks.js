@@ -23,6 +23,7 @@ const express = require('express');
 const crypto  = require('crypto');
 const { query, queryOne } = require('../db/connection');
 const { requireAdmin } = require('../middleware/auth');
+const { qboLineAmounts } = require('../lib/qbo-line-amount');
 const {
   REQUIRED_SCOPES: SCOPES,
   QB_TOKEN_URL,
@@ -312,14 +313,23 @@ router.post('/invoice/project/:id', async (req, res) => {
         const product = hits.find((i) => i.Type !== 'Category') || null;
         itemId = product?.Id || miscItemId;
       }
+      // QBO rejects the whole invoice with 6070 unless Amount is exactly
+      // UnitPrice * Qty. Our line total is authoritative and unit_price is a
+      // rounded display figure, so re-derive the trio rather than trusting
+      // that they already agree. See lib/qbo-line-amount.js.
+      const { Amount, UnitPrice, Qty } = qboLineAmounts({
+        amount:    item.total,
+        unitPrice: item.unit_price,
+        qty:       item.qty,
+      });
       return {
-        Amount:      parseFloat(item.total),
+        Amount,
         DetailType:  'SalesItemLineDetail',
         Description: item.description || '',
         SalesItemLineDetail: {
           ItemRef:    { value: itemId },
-          UnitPrice:  parseFloat(item.unit_price),
-          Qty:        parseFloat(item.qty),
+          UnitPrice,
+          Qty,
           TaxCodeRef: { value: '7' },
         },
       };
