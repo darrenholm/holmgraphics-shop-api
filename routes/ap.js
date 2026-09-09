@@ -159,7 +159,8 @@ router.get('/documents', requireStaff, async (req, res) => {
               extract_confidence, vendor_name, vendor_qbo_id, doc_number, txn_date,
               due_date, terms, currency, subtotal_cents, tax_cents, total_cents,
               review_status, qbo_bill_id, posted_at, post_error,
-              (file_bytes IS NOT NULL) AS has_file, byte_size, created_at
+              (file_bytes IS NOT NULL) AS has_file, byte_size, created_at,
+              parent_document_id, page_from, page_to
          FROM ap_documents
         ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
         ORDER BY created_at DESC
@@ -215,6 +216,7 @@ router.get('/documents/:id', requireStaff, async (req, res) => {
               total_cents, memo, review_status, reviewed_by, reviewed_at,
               qbo_bill_id, qbo_attachable_id, posted_at, post_error,
               (file_bytes IS NOT NULL) AS has_file, file_purged_at,
+              parent_document_id, page_from, page_to,
               created_at, updated_at
          FROM ap_documents WHERE id = $1`,
       [req.params.id]
@@ -238,7 +240,18 @@ router.get('/documents/:id', requireStaff, async (req, res) => {
       [req.params.id]
     );
 
-    res.json({ document: doc, lines, statement });
+    // The invoices a bundle was split into, so the reviewer can see where the
+    // twelve bills in one PDF went and check none was lost.
+    const children = await query(
+      `SELECT id, doc_number, vendor_name, total_cents, page_from, page_to,
+              review_status, posted_at
+         FROM ap_documents
+        WHERE parent_document_id = $1
+        ORDER BY page_from`,
+      [req.params.id]
+    );
+
+    res.json({ document: doc, lines, statement, children });
   } catch (err) {
     console.error('[ap] get failed:', err);
     res.status(500).json({ error: err.message });
