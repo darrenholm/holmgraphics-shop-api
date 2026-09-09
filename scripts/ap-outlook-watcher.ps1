@@ -54,7 +54,8 @@ param(
   [string] $WatchFolder   = $env:AP_WATCH_FOLDER,
   [string] $LogPath       = "$env:LOCALAPPDATA\HolmGraphics\ap-watcher.log",
   [switch] $Install,
-  [switch] $DryRun
+  [switch] $DryRun,
+  [switch] $ListFolders
 )
 
 $ErrorActionPreference = 'Stop'
@@ -185,6 +186,39 @@ function Invoke-FolderSweep {
   }
 }
 
+# Prints the mailbox tree with the exact path to pass as -OutlookFolder.
+# Guessing that path is the most likely thing to go wrong on first setup,
+# and the failure ("Folder not found") does not say what the real names are.
+function Show-OutlookFolders {
+  try {
+    $outlook = New-Object -ComObject Outlook.Application
+  } catch {
+    Write-Log "Outlook is not running. Open Outlook, then try again." 'ERROR'
+    return
+  }
+  $ns = $outlook.GetNamespace('MAPI')
+
+  function Show-Level {
+    param($Folder, [string] $Prefix, [int] $Depth)
+    # Two levels below the mailbox is plenty to find an invoice folder, and
+    # stops a big archive tree from scrolling for a page.
+    if ($Depth -gt 2) { return }
+    $path = if ($Prefix) { "$Prefix\$($Folder.Name)" } else { $Folder.Name }
+    $count = 0
+    try { $count = $Folder.Items.Count } catch { }
+    Write-Host ("  " * $Depth) -NoNewline
+    Write-Host "$($Folder.Name)  ($count items)" -NoNewline
+    Write-Host "   ->  $path" -ForegroundColor DarkGray
+    foreach ($sub in $Folder.Folders) { Show-Level -Folder $sub -Prefix $path -Depth ($Depth + 1) }
+  }
+
+  Write-Host ""
+  Write-Host "Outlook folders (pass the path after '->' as -OutlookFolder):"
+  Write-Host ""
+  foreach ($store in $ns.Folders) { Show-Level -Folder $store -Prefix '' -Depth 0 }
+  Write-Host ""
+}
+
 # --- Outlook source ------------------------------------------------------
 function Resolve-OutlookFolder {
   param($Namespace, [string] $Path)
@@ -248,12 +282,23 @@ function Invoke-OutlookSweep {
     $mail = $items.Item($i)
 
     try {
-      if ($mail.Class -ne 43) { continue }   # olMail
+      # The item class depends on how the invoice got here: 43 (olMail) when
+      # the whole email was moved into the folder, 41 (olDocument) when just
+      # the PDF was dragged in on its own. Both carry .Attachments and both
+      # can be moved, so take anything that hands us an attachment list
+      # rather than whitelisting classes -- an unexpected class used to be
+      # skipped in silence, which looked exactly like "found nothing".
+      $attachments = $null
+      try { $attachments = $mail.Attachments } catch { }
+      if (-not $attachments) {
+        Write-Log "Skipping item $i (class $($mail.Class)): carries no attachments" 'WARN'
+        continue
+      }
 
       $sent = 0
       $failed = $false
 
-      foreach ($att in $mail.Attachments) {
+      foreach ($att in $attachments) {
         $ext = [System.IO.Path]::GetExtension($att.FileName)
         if (-not $ext -or ($AllowedExt -notcontains $ext.ToLower())) { continue }
         # Inline signature images and logos ride along on almost every
@@ -323,7 +368,15 @@ if ($Install) {
   return
 }
 
-if (-not $Secret) {
+if ($ListFolders) {
+  Show-OutlookFolders
+  return
+}
+
+# A dry run posts nothing, so it must not demand the secret -- being able to
+# see what WOULD be picked up before wiring up credentials is most of the
+# point of having a dry run.
+if (-not $Secret -and -not $DryRun) {
   Write-Log "AP_INBOUND_SECRET is not set. Pass -Secret or set the environment variable." 'ERROR'
   exit 1
 }
