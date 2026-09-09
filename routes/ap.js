@@ -30,7 +30,7 @@ const { ingestDocument, runExtraction, upsertStatement } = require('../lib/ap-in
 const { normalizeVendor, linesReconcile } = require('../lib/ap-extract');
 const {
   postBillForDocument, resolveVendor, learnVendorAlias, searchVendors,
-  listExpenseAccounts,
+  listExpenseAccounts, suggestAccountForVendor,
 } = require('../lib/ap-qbo-bills');
 const { reconcileStatement } = require('../lib/ap-reconcile');
 
@@ -173,6 +173,37 @@ router.get('/documents', requireStaff, async (req, res) => {
   }
 });
 
+/**
+ * Code any still-uncoded lines from what this vendor was coded to last time.
+ *
+ * Only touches lines with no account, so a reviewer's own coding is never
+ * overwritten, and only on documents that have not gone to QuickBooks yet.
+ * Silent on failure: a suggestion that cannot be worked out is a blank field
+ * the reviewer fills in, not an error worth failing the page for.
+ */
+async function applyRememberedAccounts(doc) {
+  if (!doc?.vendor_qbo_id || doc.posted_at) return;
+  try {
+    const blanks = await queryOne(
+      `SELECT COUNT(*)::int AS n FROM ap_document_lines
+        WHERE document_id = $1 AND account_qbo_id IS NULL`,
+      [doc.id]
+    );
+    if (!blanks?.n) return;
+
+    const suggested = await suggestAccountForVendor(doc.vendor_qbo_id);
+    if (!suggested) return;
+
+    await query(
+      `UPDATE ap_document_lines SET account_qbo_id = $1, account_name = $2
+        WHERE document_id = $3 AND account_qbo_id IS NULL`,
+      [suggested.id, suggested.name, doc.id]
+    );
+  } catch (err) {
+    console.warn(`[ap] account recall failed for doc ${doc.id}: ${err.message}`);
+  }
+}
+
 // GET /api/ap/documents/:id
 router.get('/documents/:id', requireStaff, async (req, res) => {
   try {
@@ -189,6 +220,14 @@ router.get('/documents/:id', requireStaff, async (req, res) => {
       [req.params.id]
     );
     if (!doc) return res.status(404).json({ error: 'Not found' });
+
+    // Intake codes the lines from what this vendor was coded to last time, but
+    // only at the moment a document arrives — so anything already sitting in
+    // the queue when the first bill from that supplier was approved stayed
+    // uncoded forever, and re-extracting to pick the coding up costs a model
+    // call. Filling the blanks on open makes the queue benefit from every
+    // approval, not just later arrivals.
+    await applyRememberedAccounts(doc);
 
     const lines = await query(
       `SELECT * FROM ap_document_lines WHERE document_id = $1 ORDER BY line_no`,
