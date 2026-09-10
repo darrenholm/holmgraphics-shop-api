@@ -34,6 +34,7 @@ const {
 } = require('../lib/ap-qbo-bills');
 const { reconcileStatement } = require('../lib/ap-reconcile');
 const { postFinanceChargeBill, selectFinanceCharges } = require('../lib/ap-finance-charge');
+const { rereadAsBundle } = require('../lib/ap-reread-bundle');
 
 const router = express.Router();
 
@@ -301,6 +302,22 @@ router.post('/documents/:id/extract', requireStaff, async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('[ap] extract failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/ap/documents/:id/reread-as-bundle
+// For a file that holds several invoices but was filed as one. Unlike the
+// ordinary re-read this is allowed on a posted document, because a bundle is
+// incomplete rather than wrong: the bill already posted is real and is handed
+// to the child invoice it belongs to. Admin-gated — it can create several new
+// payables. Puts everything back untouched if the file does not actually split.
+router.post('/documents/:id/reread-as-bundle', requireAdmin, async (req, res) => {
+  try {
+    const result = await rereadAsBundle(req.params.id);
+    res.json(result);
+  } catch (err) {
+    console.error('[ap] re-read as bundle failed:', err);
     res.status(500).json({ error: err.message });
   }
 });
