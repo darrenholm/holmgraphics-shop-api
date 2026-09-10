@@ -33,6 +33,7 @@ const {
   listExpenseAccounts, suggestAccountForVendor,
 } = require('../lib/ap-qbo-bills');
 const { reconcileStatement } = require('../lib/ap-reconcile');
+const { postFinanceChargeBill, selectFinanceCharges } = require('../lib/ap-finance-charge');
 
 const router = express.Router();
 
@@ -607,6 +608,49 @@ router.post('/statements/:id/reconcile', requireStaff, async (req, res) => {
   } catch (err) {
     console.error(`[ap] reconcile failed for statement ${req.params.id}:`, err.message);
     res.status(502).json({ error: err.message });
+  }
+});
+
+// POST /api/ap/statements/:id/finance-charge — enter the statement's finance
+// charges as one Bill. Admin-gated like the document post route: it creates a
+// real payable in QBO. Idempotent, so a double-click is harmless.
+router.post('/statements/:id/finance-charge', requireAdmin, async (req, res) => {
+  try {
+    const result = await postFinanceChargeBill(req.params.id);
+    res.json(result);
+  } catch (err) {
+    console.error(`[ap] finance charge post failed for statement ${req.params.id}:`, err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// GET /api/ap/statements/:id/finance-charge — what WOULD be posted, so the
+// review screen can show the figure on the button instead of making the
+// reviewer press it to find out. Read-only, staff-gated.
+router.get('/statements/:id/finance-charge', requireStaff, async (req, res) => {
+  try {
+    const stmt = await queryOne(`SELECT * FROM ap_statements WHERE id = $1`, [req.params.id]);
+    if (!stmt) return res.status(404).json({ error: 'Not found' });
+    const lines = await query(
+      `SELECT * FROM ap_statement_lines WHERE statement_id = $1 ORDER BY line_no`,
+      [req.params.id]
+    );
+    const { charges, skipped, totalCents } = selectFinanceCharges(lines);
+    res.json({
+      posted_bill_id: stmt.finance_charge_bill_id,
+      posted_cents:   stmt.finance_charge_cents,
+      posted_at:      stmt.finance_charge_at,
+      total_cents:    totalCents,
+      charges: charges.map(({ line, cents }) => ({
+        line_no: line.line_no, doc_number: line.doc_number, cents,
+      })),
+      skipped: skipped.map(({ line, reason }) => ({
+        line_no: line.line_no, doc_number: line.doc_number, reason,
+      })),
+    });
+  } catch (err) {
+    console.error('[ap] finance charge preview failed:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
