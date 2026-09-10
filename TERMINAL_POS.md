@@ -290,30 +290,68 @@ Worth telling staff before they hit it and think something is broken.
 
 ## Refunds
 
-**Interac refunds must be done in person with the original card present.** They
-cannot be issued from the Stripe API or the Stripe Dashboard.
+Both kinds are done from the **Counter sales** table on `/pos` — the **Refund**
+button on any settled row. Staff pick nothing: the screen works out which of the
+two mechanisms applies from how the customer paid, and tells them what to do.
 
-`@capgo/capacitor-stripe-terminal@8.0.3` **does not expose**
-`collectRefundPaymentMethod` / `processRefund` — verified against
-`dist/esm/definitions.d.ts` in the installed package; the plugin's whole method
-list is initialize / discoverReaders / setConnectionToken /
-setSimulatorConfiguration / connectReader / getConnectedReader /
-disconnectReader / cancelDiscoverReaders / collectPaymentMethod /
-cancelCollectPaymentMethod / confirmPaymentIntent / installAvailableUpdate /
-cancelInstallUpdate / setReaderDisplay / clearReaderDisplay / rebootReader /
-cancelReaderReconnection. Nothing refund-related.
+**Credit** — `POST /api/terminal/payments/:id/refund` asks Stripe to refund the
+charge. No card needed, so it also covers the customer who phoned in.
 
-**Launch position:**
+**Interac** — has to happen **at the reader, with the customer's original card**.
+The network requires it; Stripe's API and Dashboard both refuse. The tablet
+drives this natively.
 
-- **Credit-card refunds** — issue from the Stripe Dashboard. They work
-  normally, no card present required, and `charge.refunded` posts a
-  RefundReceipt to QuickBooks automatically.
-- **Interac refunds** — out of band: cash, cheque or e-transfer, recorded
-  manually in QuickBooks. Workable at ~5 debit transactions a month.
+Either way the refund arrives back as a `charge.refunded` webhook, and that is
+the **only** thing that posts a RefundReceipt to QuickBooks. Nothing else writes
+it — two writers would post the refund twice.
 
-The permanent fix is to fork the plugin and bridge the two native methods —
-they exist in the underlying Stripe Terminal Android SDK, so it's a small,
-well-defined native addition. Not done here.
+### How the Interac path is wired
+
+`@capgo/capacitor-stripe-terminal@8.0.3` does not expose
+`collectRefundPaymentMethod` / `confirmRefund` — its whole method list is
+initialize / discoverReaders / setConnectionToken / setSimulatorConfiguration /
+connectReader / getConnectedReader / disconnectReader / cancelDiscoverReaders /
+collectPaymentMethod / cancelCollectPaymentMethod / confirmPaymentIntent /
+installAvailableUpdate / cancelInstallUpdate / setReaderDisplay /
+clearReaderDisplay / rebootReader / cancelReaderReconnection.
+
+The plugin is **not** forked. Instead `HgPosPlugin.java` in the shop app calls
+those two SDK methods against the **same `Terminal` singleton** the capgo plugin
+initialises, so there is nothing to vendor and nothing to keep in sync — the app
+module just declares `com.stripe:stripeterminal-core` / `-external` at 5.6.+ to
+get them on its own compile classpath.
+
+Shape, mirroring a sale so the screen can say "present the card" in between:
+
+    HgPos.collectRefund({ chargeId, amountCents, currency })   waits for the card
+    HgPos.confirmRefund()                                       moves the money
+    HgPos.cancelCollectRefund()                                 backed out
+
+`chargeId` — not the PaymentIntent — comes off the `terminal_payments` row, so a
+sale Stripe has not settled yet has no Refund button. **Nothing is refunded
+until `confirmRefund` resolves.**
+
+Front end: `refundPayment()` in `src/lib/pos/terminal.js`, driven by
+`src/lib/components/RefundModal.svelte`.
+
+### Receipts
+
+A refund prints **two** copies, always — unlike a sale, which prints one unless
+a signature was required. The signed merchant copy is the shop's only proof the
+money went back to the person owed it, and a refund is the one counter
+transaction where that argument actually comes up.
+
+### Verified 2026-09-10
+
+On reader WPC323121027973, against a real settled Interac sale: the SDK ran
+`transactionType=REFUND, amount=1.13 CAD, checkCardMode=INSERT_OR_TAP` and the
+reader waited for the card, then cancelled cleanly on
+`cancelReason=MERCHANT_CANCELLED`. **The card tap itself has not been exercised**
+— the first real Interac refund will be the first time a card is presented, so
+do that one where it can be watched.
+
+Partial refunds are supported on both paths; the amount field defaults to
+whatever is left on the sale.
 
 ---
 
@@ -415,6 +453,7 @@ All under `/api/terminal`, all staff-authenticated.
 | GET | `/payments` | `?jobId= &status= &unsynced=1 &limit=` |
 | GET | `/payments/:id` | One row, incl. fee and EMV block, for the receipt |
 | POST | `/payments/:id/resync` | Retry the QuickBooks write-back (idempotent) |
+| POST | `/payments/:id/refund` | Refunds a **credit** sale; refuses Interac with `inPersonRequired` |
 | GET | `/qbo-preflight` | Checks the accounts and connection before go-live |
 
 Plus `POST /webhooks/stripe` at the app root — no CORS, no session auth; the

@@ -236,10 +236,12 @@ async function onPaymentCanceled(pi) {
 }
 
 // ─── charge.refunded ─────────────────────────────────────────────────────────
-// Fires for credit-card refunds issued from the Stripe Dashboard or API.
-// Interac refunds never arrive here: Interac requires the original card
-// physically present at the reader and cannot be refunded through the API or
-// the Dashboard at all. See TERMINAL_POS.md §Refunds.
+// The single place a refund becomes a QuickBooks document, whichever way it
+// was issued: the Stripe Dashboard, POST /payments/:id/refund, or an Interac
+// refund taken at the reader on the tablet. Interac still cannot be refunded
+// through the API — the network wants the original card back at the reader —
+// but once the reader has done it, Stripe reports it here like any other
+// refund. See TERMINAL_POS.md §Refunds.
 async function onChargeRefunded(charge) {
   const piId = typeof charge.payment_intent === 'string'
     ? charge.payment_intent
@@ -268,6 +270,10 @@ async function onChargeRefunded(charge) {
       WHERE id = $3`,
     [refunded, status, row.id]
   );
+
+  // A re-delivered event, or a refund we already posted, leaves nothing new
+  // to book. Posting a $0 RefundReceipt would just be litter in QuickBooks.
+  if (delta <= 0) return;
 
   try {
     await writeBackRefund(row.id, { refundedCents: delta });

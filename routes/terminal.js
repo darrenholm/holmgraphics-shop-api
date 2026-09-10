@@ -377,6 +377,82 @@ router.post('/payments/:id/resync', requireStaff, async (req, res) => {
   }
 });
 
+// ─── POST /api/terminal/payments/:id/refund ──────────────────────────────────
+// Refunds a CREDIT card sale. Interac is deliberately refused here.
+//
+// Interac cannot be refunded through the Stripe API or the Dashboard at all —
+// the network requires the original card back at the reader. That refund is
+// driven natively on the tablet (HgPosPlugin.collectRefund/confirmRefund) and
+// never touches this route; it lands back here as a charge.refunded webhook
+// like any other refund, which is what posts the RefundReceipt to QuickBooks.
+//
+// So: this route exists so staff can refund a credit sale from the counter
+// instead of logging into the Stripe Dashboard. Nothing here writes to
+// QuickBooks — the webhook owns that, and giving it two writers would post
+// the refund twice.
+router.post('/payments/:id/refund', requireStaff, requireStripe, async (req, res) => {
+  try {
+    const row = await queryOne(
+      `SELECT * FROM terminal_payments WHERE id = $1`,
+      [Number.parseInt(req.params.id, 10)]
+    );
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (row.status !== 'succeeded' && row.status !== 'partially_refunded') {
+      return res.status(409).json({ error: `Nothing to refund — this sale is ${row.status}.` });
+    }
+    if (!row.charge_id) {
+      return res.status(409).json({
+        error: 'Stripe has not finished settling this sale yet. Try again in a minute.',
+      });
+    }
+    if (row.payment_method_type === 'interac_present') {
+      return res.status(409).json({
+        error: 'Interac refunds have to be done at the reader with the original card.',
+        inPersonRequired: true,
+      });
+    }
+
+    const remaining = row.amount_cents - (row.amount_refunded_cents || 0);
+    const amount = req.body?.amountCents == null
+      ? remaining
+      : Number.parseInt(req.body.amountCents, 10);
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amountCents must be a positive number of cents.' });
+    }
+    if (amount > remaining) {
+      return res.status(400).json({
+        error: `Only ${(remaining / 100).toFixed(2)} is left to refund on this sale.`,
+      });
+    }
+
+    // Keyed on what has already been refunded, so a double-tap on Refund
+    // replays the same request instead of refunding twice, while a genuine
+    // second partial refund later gets its own key.
+    const refund = await getStripe().refunds.create(
+      {
+        charge:   row.charge_id,
+        amount,
+        metadata: {
+          hg_payment_id: String(row.id),
+          hg_project_id: row.project_id == null ? '' : String(row.project_id),
+          refunded_by:   String(req.user?.id || ''),
+        },
+      },
+      { idempotencyKey: `hg-refund-${row.id}-${row.amount_refunded_cents || 0}-${amount}` }
+    );
+
+    res.json({
+      ok: true,
+      refundId:    refund.id,
+      amountCents: refund.amount,
+      status:      refund.status,
+    });
+  } catch (err) {
+    console.error('[terminal] refund:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ─── Stripe-side preflight ───────────────────────────────────────────────────
 // An account can hold live keys, create PaymentIntents and even take a card
 // while still being unable to pay the money out. That failure surfaces days
