@@ -453,6 +453,107 @@ router.post('/payments/:id/refund', requireStaff, requireStripe, async (req, res
   }
 });
 
+// ─── Card-reader diary ───────────────────────────────────────────────────────
+// The tablet writes down what the reader does so the next disconnect can be
+// diagnosed from evidence instead of from whoever happens to be standing in
+// front of it afterwards. See migration 069.
+//
+// Deliberately forgiving: this is diagnostics, and a logging endpoint that
+// rejects a batch — or worse, throws on the tablet — would be worse than no
+// logging at all. Unknown fields are dropped, a bad row is skipped rather
+// than failing its batch, and the response never carries anything the tablet
+// needs to act on.
+
+// How many events one POST may carry. The tablet queues while offline and
+// flushes on reconnect, so a batch is normal; a batch of thousands is a bug.
+const MAX_EVENTS_PER_POST = 200;
+// Diagnostics are worth keeping for a few weeks, not forever. Trimmed on
+// write so nothing has to remember to run a cron.
+const EVENT_RETENTION_DAYS = 30;
+
+function cleanEvent(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const event = String(raw.event || '').trim().slice(0, 64);
+  if (!event) return null;
+
+  const battery = Number.parseInt(raw.batteryPct, 10);
+  const when = raw.occurredAt ? new Date(raw.occurredAt) : new Date();
+
+  return {
+    event,
+    reason:       raw.reason == null ? null : String(raw.reason).slice(0, 500),
+    readerSerial: raw.readerSerial == null ? null : String(raw.readerSerial).slice(0, 64),
+    batteryPct:   Number.isInteger(battery) && battery >= 0 && battery <= 100 ? battery : null,
+    detail:       raw.detail && typeof raw.detail === 'object' ? raw.detail : null,
+    // A tablet with a wrong clock must not bury every real event under a row
+    // dated 2031, nor hide one behind a row dated 1970.
+    occurredAt:   Number.isFinite(when.getTime()) ? when : new Date(),
+  };
+}
+
+router.post('/reader-events', requireStaff, async (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body?.events)
+      ? req.body.events
+      : [req.body].filter(Boolean);
+
+    const rows = incoming.slice(0, MAX_EVENTS_PER_POST).map(cleanEvent).filter(Boolean);
+    if (!rows.length) return res.json({ ok: true, stored: 0 });
+
+    // One statement rather than a loop: the tablet flushes a backlog in a
+    // single POST after a WiFi outage, and that must not become 200 queries.
+    const values = [];
+    const params = [];
+    for (const r of rows) {
+      const i = params.length;
+      values.push(`($${i + 1}, $${i + 2}, $${i + 3}, $${i + 4}, $${i + 5}, $${i + 6})`);
+      params.push(r.event, r.reason, r.readerSerial, r.batteryPct,
+                  r.detail ? JSON.stringify(r.detail) : null, r.occurredAt);
+    }
+    await query(
+      `INSERT INTO reader_events
+         (event, reason, reader_serial, battery_pct, detail, occurred_at)
+       VALUES ${values.join(', ')}`,
+      params
+    );
+
+    await query(
+      `DELETE FROM reader_events WHERE occurred_at < NOW() - INTERVAL '${EVENT_RETENTION_DAYS} days'`
+    );
+
+    res.json({ ok: true, stored: rows.length });
+  } catch (err) {
+    // Never make the tablet care. It has a customer at the counter and the
+    // diary is the least important thing it is doing.
+    console.error('[terminal] reader-events:', err.message);
+    res.json({ ok: false });
+  }
+});
+
+// The story, newest first. Read from the POS screen, and by whoever is
+// working out why the reader dropped.
+router.get('/reader-events', requireStaff, async (req, res) => {
+  try {
+    const limit = Math.min(Number.parseInt(req.query.limit, 10) || 100, 1000);
+    const params = [];
+    const where = ['1=1'];
+    if (req.query.since) {
+      params.push(new Date(req.query.since));
+      where.push(`occurred_at >= $${params.length}`);
+    }
+    const rows = await query(
+      `SELECT * FROM reader_events
+        WHERE ${where.join(' AND ')}
+        ORDER BY occurred_at DESC
+        LIMIT ${limit}`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Stripe-side preflight ───────────────────────────────────────────────────
 // An account can hold live keys, create PaymentIntents and even take a card
 // while still being unable to pay the money out. That failure surfaces days
