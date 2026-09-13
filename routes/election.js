@@ -18,6 +18,7 @@
 //   GET  /api/election/drafts           the recent ones, for the phone  (staff)
 //   POST /api/election/jobs             create the job as a Quote       (customer)
 //   POST /api/election/jobs/:id/order   Quote -> Ordered                (customer)
+//   POST /api/election/jobs/:id/items   add the basket to a job         (staff)
 //
 // DRAFTS EXIST FOR THE TELEPHONE. Candidates ring partway through — "I'm on the
 // sign bit and I don't know which thickness" — and without a saved draft the
@@ -245,6 +246,54 @@ router.get('/drafts', requireStaff, async (req, res) => {
   }
 });
 
+/**
+ * Put a priced basket onto a job: its lines, the note, and the draft marked
+ * with the job it went to. Shared by the candidate's own submit and by staff
+ * adding an order to a job that already exists.
+ */
+async function writeBasket(projectId, clientId, lines, body) {
+  // One row per line, in the same table staff type into by hand. The item
+  // type leads the description so the board sorts and reads by it.
+  for (const line of lines) {
+    await query(
+      `INSERT INTO items (project_id, description, qty, price, ext_price)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        projectId,
+        `[${line.item_type}] ${line.description}`.slice(0, 500),
+        line.quantity,
+        line.unit_price,
+        line.total,
+      ],
+    );
+  }
+
+  const notes = body?.notes;
+  if (notes && String(notes).trim()) {
+    await query(
+      `INSERT INTO notes (project_id, note, created_at)
+       VALUES ($1, $2, NOW())`,
+      [projectId, String(notes).trim().slice(0, 2000)],
+    ).catch(() => {
+      // A note is worth having and not worth failing an order over.
+    });
+  }
+
+  // Keep the draft rather than deleting it, marked with the job it became:
+  // a call that comes in just after can still be traced to what was ordered.
+  const draftCode = cleanCode(body?.draft_code);
+  if (draftCode) {
+    await query(
+      `UPDATE election_drafts
+          SET submitted_project_id = $1, client_id = $2, updated_at = NOW()
+        WHERE code = $3`,
+      [projectId, clientId, draftCode],
+    ).catch(() => {
+      // A draft that cannot be marked is not worth failing an order over.
+    });
+  }
+}
+
 // ─── POST /api/election/jobs ─────────────────────────────────────────────────
 // Create the job. Priced here from the basket, never from figures the browser
 // sends: what a customer posts is what they want, not what it costs.
@@ -303,45 +352,7 @@ router.post('/jobs', requireCustomer, async (req, res) => {
       ],
     );
 
-    // One row per line, in the same table staff type into by hand. The item
-    // type leads the description so the board sorts and reads by it.
-    for (const line of priced.lines) {
-      await query(
-        `INSERT INTO items (project_id, description, qty, price, ext_price)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [
-          project.id,
-          `[${line.item_type}] ${line.description}`.slice(0, 500),
-          line.quantity,
-          line.unit_price,
-          line.total,
-        ],
-      );
-    }
-
-    if (notes && String(notes).trim()) {
-      await query(
-        `INSERT INTO notes (project_id, note, created_at)
-         VALUES ($1, $2, NOW())`,
-        [project.id, String(notes).trim().slice(0, 2000)],
-      ).catch(() => {
-        // A note is worth having and not worth failing an order over.
-      });
-    }
-
-    // Keep the draft rather than deleting it, marked with the job it became:
-    // a call that comes in just after can still be traced to what was ordered.
-    const draftCode = cleanCode(req.body?.draft_code);
-    if (draftCode) {
-      await query(
-        `UPDATE election_drafts
-            SET submitted_project_id = $1, client_id = $2, updated_at = NOW()
-          WHERE code = $3`,
-        [project.id, req.customer.id, draftCode],
-      ).catch(() => {
-        // A draft that cannot be marked is not worth failing an order over.
-      });
-    }
+    await writeBasket(project.id, req.customer.id, priced.lines, req.body);
 
     res.status(201).json({
       id: project.id,
@@ -384,6 +395,62 @@ router.post('/jobs/:id/order', requireCustomer, async (req, res) => {
   } catch (e) {
     console.error('POST /election/jobs/:id/order:', e);
     res.status(500).json({ message: 'Could not place the order', detail: e.message });
+  }
+});
+
+// ─── POST /api/election/jobs/:id/items ───────────────────────────────────────
+// Staff filling the form in for a candidate who will not. The job usually
+// exists already — made at the counter or over the phone under the candidate's
+// own client — so the basket goes onto it rather than onto a new job under
+// whoever happens to be signed in to the shop. Priced here, like every other
+// path; the job's status is left alone.
+router.post('/jobs/:id/items', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Job number must be a number' });
+  }
+
+  try {
+    const priced = await priceBasket(req.body);
+    if (priced.lines.length === 0) {
+      return res.status(400).json({ message: 'Nothing on the order.' });
+    }
+
+    const project = await queryOne(
+      `SELECT p.id, p.client_id, p.description, s.name AS status_name,
+              COALESCE(c.company, CONCAT_WS(' ', c.fname, c.lname)) AS client_name
+         FROM projects p
+         LEFT JOIN status  s ON s.id = p.status_id
+         LEFT JOIN clients c ON c.id = p.client_id
+        WHERE p.id = $1`,
+      [id],
+    );
+    if (!project) {
+      return res.status(404).json({ message: `There is no job #${id}.` });
+    }
+    // A closed job taking new work is almost always a mistyped number.
+    if (String(project.status_name).toLowerCase() === 'complete') {
+      return res.status(409).json({
+        message: `Job #${id} is Complete. Reopen it first if these really belong on it.`,
+      });
+    }
+
+    await writeBasket(project.id, project.client_id, priced.lines, req.body);
+    await query('UPDATE projects SET updated_at = NOW() WHERE id = $1', [id]);
+
+    res.status(201).json({
+      id: project.id,
+      status: project.status_name,
+      client_name: project.client_name,
+      description: project.description,
+      subtotal: priced.subtotal,
+      lines: priced.lines,
+      added: true,
+      message: `Added to job #${id}.`,
+    });
+  } catch (e) {
+    console.error('POST /election/jobs/:id/items:', e);
+    res.status(500).json({ message: 'Could not add to the job', detail: e.message });
   }
 });
 
