@@ -57,6 +57,7 @@ const stripeWebhookRoutes = require('./routes/stripe-webhook');
 // review queue, QBO Bill posting, and supplier-statement reconciliation.
 // Replaces forwarding bills to holmgraphics@qbodocs.com.
 const apRoutes            = require('./routes/ap');
+const designAssistantRoutes = require('./routes/design-assistant');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -87,6 +88,10 @@ app.use(cors({
 // hundreds of vector shapes, and big quote sheets are also JSON-heavy.
 // Multipart uploads (proofs, photos) don't hit this parser because their
 // content type is multipart/form-data; they go through multer's own limit.
+// Design Assistant turns carry the whole conversation, including the logos and
+// photos staff attached (downscaled in the browser), so they outgrow 5 MB.
+// Parsed here first; the global parser below skips an already-parsed body.
+app.use('/api/design-assistant', express.json({ limit: '30mb' }));
 app.use(express.json({
   limit: '5mb',
   verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
@@ -118,6 +123,8 @@ app.use('/api/internal',     internalPaymentsRoutes);
 // Accounts payable. Self-contained under /api/ap — no path collisions with
 // the generic /api mounts below.
 app.use('/api/ap',           apRoutes);
+// Design Assistant (Claude chat on the staff job page). Staff-only.
+app.use('/api/design-assistant', designAssistantRoutes);
 app.use('/api/quote-request', quoteRoutes);
 app.use('/api/admin/dtf',    dtfAdminRoutes);
 app.use('/api/admin/orders', ordersAdminRoutes);
