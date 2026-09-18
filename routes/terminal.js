@@ -453,6 +453,139 @@ router.post('/payments/:id/refund', requireStaff, requireStripe, async (req, res
   }
 });
 
+// ─── Internet readers (WisePOS E) ────────────────────────────────────────────
+// A different animal from the WisePad, and the reason this section exists.
+//
+// The WisePad is a Bluetooth reader: the tablet holds the connection, runs the
+// Stripe SDK, and drives the sale. That connection is the thing that kept
+// failing — the tablet's own Bluetooth service crashes, and nothing in the app
+// can recover it (see reader_events and TERMINAL_POS.md).
+//
+// A WisePOS E talks to Stripe over WiFi instead. Nothing holds a connection to
+// it, so there is nothing to drop. The server tells the reader which
+// PaymentIntent to collect, the reader does the whole card interaction itself,
+// and the outcome arrives on the webhook exactly as before. The till stops
+// depending on one tablet's Bluetooth, and any browser in the shop can send a
+// sale to the counter reader — which is what Darren asked for weeks ago and
+// Bluetooth could never do.
+
+// Everything the POS screen needs to show a reader and decide if it is usable.
+function readerSummary(r) {
+  return {
+    id:          r.id,
+    label:       r.label,
+    deviceType:  r.device_type,
+    serial:      r.serial_number,
+    status:      r.status,                 // online | offline
+    ipAddress:   r.ip_address,
+    location:    r.location,
+    // Present while a sale is in flight on the reader, and the only place the
+    // outcome of a reader-driven collection shows up synchronously.
+    action:      r.action ? {
+      type:           r.action.type,
+      status:         r.action.status,     // in_progress | succeeded | failed
+      failureCode:    r.action.failure_code || null,
+      failureMessage: r.action.failure_message || null,
+      paymentIntent:  r.action.process_payment_intent?.payment_intent || null,
+    } : null,
+  };
+}
+
+router.get('/readers', requireStaff, requireStripe, async (req, res) => {
+  try {
+    const list = await getStripe().terminal.readers.list({ limit: 20 });
+    res.json(list.data.map(readerSummary));
+  } catch (err) {
+    console.error('[terminal] list readers:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+router.get('/readers/:id', requireStaff, requireStripe, async (req, res) => {
+  try {
+    res.json(readerSummary(await getStripe().terminal.readers.retrieve(req.params.id)));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Claims a new reader for the shop. The code comes off the reader's own screen
+// (Settings → Generate pairing code) and is good for a few minutes.
+router.post('/readers/register', requireStaff, requireStripe, async (req, res) => {
+  const code = String(req.body?.registrationCode || '').trim();
+  if (!code) return res.status(400).json({ error: 'registrationCode is required' });
+  const location = terminalLocationId();
+  if (!location) {
+    return res.status(503).json({ error: 'STRIPE_TERMINAL_LOCATION_ID is not set on the server.' });
+  }
+  try {
+    const reader = await getStripe().terminal.readers.create({
+      registration_code: code,
+      location,
+      label: String(req.body?.label || 'Front counter').slice(0, 80),
+    });
+    res.json(readerSummary(reader));
+  } catch (err) {
+    console.error('[terminal] register reader:', err.message);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/terminal/readers/:id/collect ──────────────────────────────────
+// Hands a sale to the reader. Returns as soon as the reader has accepted it —
+// the customer has not tapped yet at that point, so the caller polls
+// GET /readers/:id until the action stops being in_progress.
+//
+// No money moves here that the webhook does not already know about: this is
+// the same PaymentIntent /payment-intent created and wrote to
+// terminal_payments, so a browser that closes mid-sale loses nothing.
+router.post('/readers/:id/collect', requireStaff, requireStripe, async (req, res) => {
+  const paymentId = Number.parseInt(req.body?.paymentId, 10);
+  if (!Number.isInteger(paymentId)) {
+    return res.status(400).json({ error: 'paymentId (the terminal_payments row) is required' });
+  }
+  try {
+    const row = await queryOne(`SELECT * FROM terminal_payments WHERE id = $1`, [paymentId]);
+    if (!row) return res.status(404).json({ error: 'Payment not found' });
+    if (row.status !== 'pending') {
+      return res.status(409).json({ error: `That sale is already ${row.status}.` });
+    }
+
+    const reader = await getStripe().terminal.readers.processPaymentIntent(req.params.id, {
+      payment_intent: row.payment_intent_id,
+      // Lets the customer cancel on the reader's own screen rather than
+      // leaving staff to notice and back out for them.
+      process_config: { enable_customer_cancellation: true },
+    });
+
+    // Worth recording which reader took it: the fleet is mixed while the
+    // WisePad is still in service, and "which one did this sale" is the first
+    // question when something goes wrong.
+    await query(
+      `UPDATE terminal_payments SET reader_serial = $1, updated_at = NOW() WHERE id = $2`,
+      [reader.serial_number || req.params.id, paymentId]
+    );
+
+    res.json(readerSummary(reader));
+  } catch (err) {
+    console.error('[terminal] reader collect:', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Staff backed out, or the customer walked. Clears the reader's screen; the
+// PaymentIntent itself is cancelled separately by /payment-intent/:id/cancel.
+router.post('/readers/:id/cancel', requireStaff, requireStripe, async (req, res) => {
+  try {
+    res.json(readerSummary(await getStripe().terminal.readers.cancelAction(req.params.id)));
+  } catch (err) {
+    // A reader with nothing in flight rejects this, which is not worth
+    // surfacing at a counter — the desired state is the actual state.
+    if (/no active action|not currently/i.test(err.message || '')) return res.json({ ok: true });
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ─── Card-reader diary ───────────────────────────────────────────────────────
 // The tablet writes down what the reader does so the next disconnect can be
 // diagnosed from evidence instead of from whoever happens to be standing in
