@@ -6,6 +6,9 @@ const multer = require('multer');
 const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff, requireAdmin } = require('../middleware/auth');
 const fleetStorage = require('../lib/fleet-storage');
+// Job status that means "finished" — same constant the payment path uses to
+// close a job, so "still assigned" here counts the same jobs the board does.
+const { STATUS_COMPLETE } = require('../lib/job-completion');
 const router = express.Router();
 
 // In-memory upload for employee license images (cropped client-side, so
@@ -118,13 +121,19 @@ router.post('/clients', requireStaff, async (req, res) => {
 
 // ─── GET /api/employees ──────────────────────────────────────────────────────
 router.get('/employees', requireStaff, async (req, res) => {
+  // Active-only by default: every assignee dropdown in the shop reads this
+  // endpoint and must not offer someone who has left. ?include_inactive=1 is
+  // for /admin/staff, which has to show retired staff to bring them back.
+  const includeInactive = req.query.include_inactive === '1'
+                       || req.query.include_inactive === 'true';
   try {
     const rows = await query(
       `SELECT id, first_name, last_name, email, role, qbo_employee_id,
-              phone_number, phone_extension, license_uploaded_at
+              phone_number, phone_extension, license_uploaded_at,
+              COALESCE(active, TRUE) AS active
          FROM employees
-        WHERE active IS TRUE OR active IS NULL
-        ORDER BY last_name, first_name`
+        WHERE ${includeInactive ? 'TRUE' : '(active IS TRUE OR active IS NULL)'}
+        ORDER BY COALESCE(active, TRUE) DESC, last_name, first_name`
     );
     res.json(rows);
   } catch (e) {
@@ -254,6 +263,104 @@ router.put('/employees/:id/contact', requireAdmin, async (req, res) => {
     res.json(result[0]);
   } catch (e) {
     console.error('PUT /employees/:id/contact:', e);
+    res.status(500).json({ message: 'Update failed', detail: e.message });
+  }
+});
+
+// ─── PUT /api/employees/:id/active ───────────────────────────────────────────
+// Retire an employee who has left, or bring one back.
+//
+// This is a soft flag on purpose. Employees are never hard-deleted: the fleet
+// audit log's user_id is NOT NULL against employees, and job_task_assignees
+// references employees with no ON DELETE action, so a real DELETE either fails
+// or would have to tear down history. See the note in
+// db/migrations/023_fleet_documents.sql.
+//
+// Flipping active=false does the rest on its own:
+//   • /auth/login rejects them ("Account is inactive")
+//   • they drop out of GET /employees, so every assignee dropdown loses them
+//   • trg_employee_to_resource_sync (migration 039) flips their person-resource
+//     inactive, so they leave the install calendar while booked work stays valid
+//   • timesheets, pay history and past jobs are untouched — jobs join on id,
+//     so their name still shows on work they did
+//
+// Body: { active: boolean }
+//
+// Admin-only. Deactivating returns how much open work is still pointed at them
+// (jobs, tasks, installs) so the caller can tell someone to reassign it. This
+// does NOT block: a stale assignment must never be the reason a departed
+// employee keeps their access. It matters because job notifications follow the
+// job's assignee and not this flag — lib/employee-notifier.js joins employees
+// on projects.production_emp_id — so anything left assigned to them keeps
+// texting and emailing them after they have gone.
+router.put('/employees/:id/active', requireAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'invalid id' });
+  }
+  if (typeof req.body?.active !== 'boolean') {
+    return res.status(400).json({ message: 'active must be true or false' });
+  }
+  const active = req.body.active;
+  // Locking yourself out of the admin screens would take another admin (or a
+  // hand-run SQL update) to undo.
+  if (!active && id === req.user.id) {
+    return res.status(400).json({ message: 'You cannot deactivate your own account' });
+  }
+  try {
+    const result = await query(
+      `UPDATE employees
+          SET active = $1
+        WHERE id = $2
+       RETURNING id, first_name, last_name, email, role, qbo_employee_id,
+                 phone_number, phone_extension, license_uploaded_at,
+                 COALESCE(active, TRUE) AS active`,
+      [active, id]
+    );
+    if (result.length === 0) {
+      return res.status(404).json({ message: 'Employee not found' });
+    }
+
+    const payload = { ...result[0] };
+
+    if (!active) {
+      // Open work still pointed at them, from the three places work gets
+      // attached to a person. Note the two status vocabularies are different
+      // tables' and not interchangeable (see migration 035):
+      //   • jobs   — projects.production_emp_id, closed by status_id
+      //   • tasks  — job_task_assignees, which migration 042 backfilled and
+      //              keeps in sync with job_tasks.assigned_emp_id, so this
+      //              covers the lead and any helpers from one source.
+      //              job_tasks.status: pending/in_progress/completed/blocked/skipped
+      //   • installs — booked against their person-resource from migration 039,
+      //              not against the employee row.
+      //              project_install_schedule.status: scheduled/in_progress/
+      //              completed/postponed/cancelled
+      const counts = await queryOne(
+        `SELECT (SELECT COUNT(*)
+                   FROM projects
+                  WHERE production_emp_id = $1
+                    AND status_id IS DISTINCT FROM $2)::int AS open_jobs,
+                (SELECT COUNT(*)
+                   FROM job_task_assignees jta
+                   JOIN job_tasks jt ON jt.id = jta.task_id
+                  WHERE jta.employee_id = $1
+                    AND jt.status IN ('pending', 'in_progress', 'blocked'))::int AS open_tasks,
+                (SELECT COUNT(*)
+                   FROM project_install_schedule pis
+                   JOIN resources r ON r.id = pis.crew_resource_id
+                  WHERE r.employee_id = $1
+                    AND pis.status IN ('scheduled', 'in_progress', 'postponed'))::int AS open_installs`,
+        [id, STATUS_COMPLETE]
+      );
+      payload.open_jobs     = counts?.open_jobs     ?? 0;
+      payload.open_tasks    = counts?.open_tasks    ?? 0;
+      payload.open_installs = counts?.open_installs ?? 0;
+    }
+
+    res.json(payload);
+  } catch (e) {
+    console.error('PUT /employees/:id/active:', e);
     res.status(500).json({ message: 'Update failed', detail: e.message });
   }
 });
