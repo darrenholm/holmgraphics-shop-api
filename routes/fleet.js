@@ -50,6 +50,40 @@ const DOC_TYPES = ['ownership', 'insurance', 'inspection'];
 // liability cert, etc).
 const OPERATOR_DOC_TYPES = ['cvor'];
 
+// Roster types. 'equipment' (migration 071) is yard gear — the scissor
+// lifts — not a road vehicle: no plate, no VIN, and out of O. Reg. 199/07.
+const VEHICLE_TYPES = ['truck', 'trailer', 'equipment'];
+const VEHICLE_TYPE_MSG = "type must be 'truck', 'trailer' or 'equipment'";
+
+// Which per-vehicle documents a given type can hold. The annual PMVI
+// sticker is a road-vehicle thing, so it does not apply to equipment —
+// showing an "inspection" slot on a scissor lift would read as a missing
+// document forever. Ownership and insurance stay available because the
+// purchase paperwork and the equipment floater certificate are worth
+// having on a phone at a job site.
+const DOC_TYPES_BY_VEHICLE_TYPE = {
+  truck:     ['ownership', 'insurance', 'inspection'],
+  trailer:   ['ownership', 'insurance', 'inspection'],
+  equipment: ['ownership', 'insurance']
+};
+function docTypesFor(vehicleType) {
+  return DOC_TYPES_BY_VEHICLE_TYPE[vehicleType] || DOC_TYPES;
+}
+
+// Shared RETURNING list so create and update hand back the same shape.
+const VEHICLE_COLUMNS = `id, unit_number, type, make, model, year,
+  license_plate, vin, serial_number, capacity, hours, hours_at,
+  notes, active, created_at, updated_at`;
+
+// Distinct from null, which is a legitimate "clear the hour meter".
+const INVALID = Symbol('invalid');
+function parseHours(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return INVALID;
+  return n;
+}
+
 function statusForDoc(doc) {
   if (!doc || !doc.id) return 'missing';
   if (!doc.expiry_date) return 'valid';
@@ -162,6 +196,7 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
     const rows = await query(
       `SELECT v.id, v.unit_number, v.type, v.make, v.model, v.year,
               v.license_plate, v.vin, v.notes, v.active,
+              v.serial_number, v.capacity, v.hours, v.hours_at,
               v.created_at, v.updated_at,
               o.id AS o_id, o.expiry_date AS o_expiry,
               i.id AS i_id, i.expiry_date AS i_expiry,
@@ -176,23 +211,37 @@ router.get('/vehicles', requireStaff, async (req, res, next) => {
         ${includeInactive ? '' : 'WHERE v.active = TRUE'}
         ORDER BY v.unit_number`
     );
-    const vehicles = rows.map((r) => ({
-      id: r.id,
-      unit_number: r.unit_number,
-      type: r.type,
-      make: r.make, model: r.model, year: r.year,
-      license_plate: r.license_plate,
-      vin: r.vin,
-      notes: r.notes,
-      active: r.active,
-      created_at: r.created_at,
-      updated_at: r.updated_at,
-      documents: {
-        ownership:  { id: r.o_id, expiry_date: r.o_expiry, status: statusForDoc({ id: r.o_id, expiry_date: r.o_expiry }) },
-        insurance:  { id: r.i_id, expiry_date: r.i_expiry, status: statusForDoc({ id: r.i_id, expiry_date: r.i_expiry }) },
-        inspection: { id: r.n_id, expiry_date: r.n_expiry, status: statusForDoc({ id: r.n_id, expiry_date: r.n_expiry }) }
-      }
-    }));
+    const vehicles = rows.map((r) => {
+      const applies = docTypesFor(r.type);
+      // A document type this vehicle type cannot hold reports 'na', not
+      // 'missing'. The difference matters on the dashboard: 'missing' is a
+      // job for somebody, 'na' is nothing to do.
+      const doc = (type, id, expiry_date) => ({
+        id, expiry_date,
+        status: applies.includes(type) ? statusForDoc({ id, expiry_date }) : 'na'
+      });
+      return {
+        id: r.id,
+        unit_number: r.unit_number,
+        type: r.type,
+        make: r.make, model: r.model, year: r.year,
+        license_plate: r.license_plate,
+        vin: r.vin,
+        serial_number: r.serial_number,
+        capacity: r.capacity,
+        hours: r.hours,
+        hours_at: r.hours_at,
+        notes: r.notes,
+        active: r.active,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        documents: {
+          ownership:  doc('ownership',  r.o_id, r.o_expiry),
+          insurance:  doc('insurance',  r.i_id, r.i_expiry),
+          inspection: doc('inspection', r.n_id, r.n_expiry)
+        }
+      };
+    });
     res.json({ vehicles });
   } catch (err) { next(err); }
 });
@@ -205,21 +254,29 @@ router.post('/vehicles', requireStaff, async (req, res, next) => {
     const unit_number = (b.unit_number || '').trim();
     const type        = (b.type || '').trim();
     if (!unit_number) return res.status(400).json({ message: 'unit_number required' });
-    if (!['truck', 'trailer'].includes(type)) return res.status(400).json({ message: "type must be 'truck' or 'trailer'" });
+    if (!VEHICLE_TYPES.includes(type)) return res.status(400).json({ message: VEHICLE_TYPE_MSG });
 
     const year = b.year ? parseInt(b.year, 10) : null;
     if (year != null && (Number.isNaN(year) || year < 1900 || year > 2099)) {
       return res.status(400).json({ message: 'year out of range' });
     }
 
+    const hours = parseHours(b.hours);
+    if (hours === INVALID) return res.status(400).json({ message: 'hours must be a number of 0 or more' });
+
     const row = await queryOne(
-      `INSERT INTO vehicles (unit_number, type, make, model, year, license_plate, vin, notes, active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, TRUE))
-       RETURNING id, unit_number, type, make, model, year, license_plate, vin, notes, active, created_at, updated_at`,
+      `INSERT INTO vehicles (unit_number, type, make, model, year, license_plate, vin,
+                             serial_number, capacity, hours, hours_at, notes, active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+               CASE WHEN $10::numeric IS NULL THEN NULL ELSE NOW() END,
+               $11, COALESCE($12, TRUE))
+       RETURNING ${VEHICLE_COLUMNS}`,
       [
         unit_number, type,
         b.make || null, b.model || null, year,
-        b.license_plate || null, b.vin || null, b.notes || null,
+        b.license_plate || null, b.vin || null,
+        b.serial_number || null, b.capacity || null, hours,
+        b.notes || null,
         b.active == null ? null : !!b.active
       ]
     );
@@ -260,9 +317,7 @@ async function vehicleDetailHandler(req, res, next) {
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: 'invalid id' });
 
     const vehicle = await queryOne(
-      `SELECT id, unit_number, type, make, model, year, license_plate, vin,
-              notes, active, created_at, updated_at
-         FROM vehicles WHERE id = $1`,
+      `SELECT ${VEHICLE_COLUMNS} FROM vehicles WHERE id = $1`,
       [id]
     );
     if (!vehicle) return res.status(404).json({ message: 'vehicle not found' });
@@ -280,9 +335,10 @@ async function vehicleDetailHandler(req, res, next) {
       [id]
     );
 
-    const grouped = { ownership:  { current: null, history: [] },
-                      insurance:  { current: null, history: [] },
-                      inspection: { current: null, history: [] } };
+    // Only the sections this vehicle type can hold — equipment gets no
+    // annual-PMVI slot, so the page doesn't render one to leave empty.
+    const grouped = {};
+    for (const t of docTypesFor(vehicle.type)) grouped[t] = { current: null, history: [] };
     for (const d of docs) {
       // Legacy per-vehicle CVOR rows (retired by migration 027) are no
       // longer surfaced here — skip them so the UI sees CVOR only via
@@ -309,16 +365,33 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
     const sets = [];
     const args = [];
     let i = 1;
-    const fields = ['unit_number', 'type', 'make', 'model', 'year', 'license_plate', 'vin', 'notes', 'active'];
+    const fields = ['unit_number', 'type', 'make', 'model', 'year', 'license_plate', 'vin',
+                    'serial_number', 'capacity', 'hours', 'notes', 'active'];
     for (const f of fields) {
       if (b[f] === undefined) continue;
-      if (f === 'type' && !['truck', 'trailer'].includes(b[f])) {
-        return res.status(400).json({ message: "type must be 'truck' or 'trailer'" });
+      if (f === 'type' && !VEHICLE_TYPES.includes(b[f])) {
+        return res.status(400).json({ message: VEHICLE_TYPE_MSG });
       }
       if (f === 'year' && b.year != null) {
         const y = parseInt(b.year, 10);
         if (Number.isNaN(y) || y < 1900 || y > 2099) return res.status(400).json({ message: 'year out of range' });
         sets.push(`year = $${i++}`); args.push(y);
+        continue;
+      }
+      if (f === 'hours') {
+        const h = parseHours(b.hours);
+        if (h === INVALID) return res.status(400).json({ message: 'hours must be a number of 0 or more' });
+        sets.push(`hours = $${i++}`); args.push(h);
+        // Stamp the reading date here rather than asking staff for it, and
+        // only when the number actually moves — re-saving the details card
+        // without touching the meter shouldn't claim a fresh reading.
+        // Clearing the meter clears the date with it; a read date with no
+        // reading is a claim about nothing.
+        sets.push(`hours_at = CASE
+                                WHEN $${i - 1}::numeric IS NULL THEN NULL
+                                WHEN hours IS DISTINCT FROM $${i - 1}::numeric THEN NOW()
+                                ELSE hours_at
+                              END`);
         continue;
       }
       sets.push(`${f} = $${i++}`); args.push(b[f]);
@@ -328,7 +401,7 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
 
     const row = await queryOne(
       `UPDATE vehicles SET ${sets.join(', ')} WHERE id = $${i}
-       RETURNING id, unit_number, type, make, model, year, license_plate, vin, notes, active, created_at, updated_at`,
+       RETURNING ${VEHICLE_COLUMNS}`,
       args
     );
     if (!row) return res.status(404).json({ message: 'vehicle not found' });
@@ -369,6 +442,12 @@ async function handleUpload(req, res) {
 
   const vehicle = await queryOne(`SELECT id, type FROM vehicles WHERE id = $1`, [vehicleId]);
   if (!vehicle) return res.status(404).json({ message: 'vehicle not found' });
+
+  if (!docTypesFor(vehicle.type).includes(doc_type)) {
+    return res.status(400).json({
+      message: `A ${vehicle.type} has no ${doc_type} document.`
+    });
+  }
 
   if (issued_date) {
     const today = new Date(); today.setHours(0,0,0,0);
@@ -614,7 +693,12 @@ router.get('/expiry-summary', requireStaff, async (req, res, next) => {
       `SELECT
          COUNT(*) FILTER (WHERE d.expiry_date IS NOT NULL AND d.expiry_date < CURRENT_DATE) AS expired,
          COUNT(*) FILTER (WHERE d.expiry_date IS NOT NULL AND d.expiry_date >= CURRENT_DATE AND d.expiry_date <= CURRENT_DATE + INTERVAL '30 days') AS expiring_soon,
-         COUNT(*) FILTER (WHERE d.expiry_date IS NULL OR d.expiry_date > CURRENT_DATE + INTERVAL '30 days') AS valid
+         COUNT(*) FILTER (WHERE d.expiry_date IS NULL OR d.expiry_date > CURRENT_DATE + INTERVAL '30 days') AS valid,
+         -- Only road vehicles feed the "missing" arithmetic below; see the
+         -- note there. Equipment docs still count toward the three status
+         -- buckets above, because an expiring certificate is worth showing
+         -- wherever it hangs.
+         COUNT(*) FILTER (WHERE v.type <> 'equipment') AS road_docs
          FROM fleet_documents d
          JOIN vehicles v ON v.id = d.vehicle_id
         WHERE d.is_current = TRUE AND v.active = TRUE`
@@ -622,15 +706,22 @@ router.get('/expiry-summary', requireStaff, async (req, res, next) => {
 
     const fleet = await queryOne(
       `SELECT
-         COUNT(*) FILTER (WHERE type = 'truck')   AS trucks,
-         COUNT(*) FILTER (WHERE type = 'trailer') AS trailers
+         COUNT(*) FILTER (WHERE type = 'truck')     AS trucks,
+         COUNT(*) FILTER (WHERE type = 'trailer')   AS trailers,
+         COUNT(*) FILTER (WHERE type = 'equipment') AS equipment
          FROM vehicles WHERE active = TRUE`
     );
 
-    // Every active vehicle expects 3 per-vehicle docs (ownership, insurance,
-    // inspection). CVOR is operator-level and tracked separately.
+    // Every active road vehicle expects 3 per-vehicle docs (ownership,
+    // insurance, inspection). CVOR is operator-level and tracked separately.
+    //
+    // Equipment expects none. Its ownership and insurance slots exist to be
+    // used if there's paperwork worth carrying, but nothing about a scissor
+    // lift is produced at a roadside stop — counting them here would post a
+    // "missing documents" number against the yard gear that nobody can ever
+    // clear, and that buries the truck documents that do matter.
     const expected = (Number(fleet.trucks) || 0) * 3 + (Number(fleet.trailers) || 0) * 3;
-    const actual   = Number(counts.expired) + Number(counts.expiring_soon) + Number(counts.valid);
+    const actual   = Number(counts.road_docs);
     const missing  = Math.max(0, expected - actual);
 
     const attention = await query(
@@ -658,8 +749,9 @@ router.get('/expiry-summary', requireStaff, async (req, res, next) => {
         missing
       },
       fleet: {
-        trucks:   Number(fleet.trucks),
-        trailers: Number(fleet.trailers)
+        trucks:    Number(fleet.trucks),
+        trailers:  Number(fleet.trailers),
+        equipment: Number(fleet.equipment)
       },
       attention
     });

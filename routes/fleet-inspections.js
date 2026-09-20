@@ -303,7 +303,13 @@ router.get('/fleet/inspections/scope', requireStaff, async (req, res, next) => {
               AND i2.completed_at IS NOT NULL
               AND d.resolved_at IS NULL
          ) od ON TRUE
-        WHERE v.active = TRUE
+        -- Equipment (migration 071) is yard gear — the scissor lifts. O.
+        -- Reg. 199/07 covers "trucks, tractors and trailers", so a lift is
+        -- not a unit this board has anything to say about. Left in, each
+        -- one would sit here forever as an "RGW unknown" gap that nobody
+        -- can close, which is exactly the signal this board exists to keep
+        -- meaningful.
+        WHERE v.active = TRUE AND v.type <> 'equipment'
         ORDER BY v.inspection_required DESC, v.unit_number`
     );
 

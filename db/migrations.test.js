@@ -1,6 +1,7 @@
 // db/migrations.test.js
 //
-// Runs the daily-inspection migrations (060–062) against a real PostgreSQL
+// Runs the daily-inspection migrations (060–063) and the fleet-equipment
+// migration (071) against a real PostgreSQL
 // and asserts the invariants they exist to enforce.
 //
 //   npm i -D @electric-sql/pglite      # ~25 MB, one time
@@ -44,6 +45,7 @@ const FILES = [
   '061_inspection_jobs.sql',
   '062_inspection_offline.sql',
   '063_schedule_1_official.sql',
+  '071_fleet_equipment.sql',
 ];
 const sqlFor = (f) => fs.readFileSync(path.join(MIGRATIONS, f), 'utf8');
 
@@ -327,6 +329,79 @@ test('re-plating a unit re-derives its scope automatically', async () => {
   assert.equal((await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='Tr-03'`)).ir, true);
   await db.exec(`UPDATE vehicles SET registered_gross_weight_kg=3000 WHERE unit_number='Tr-03'`);
   assert.equal((await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='Tr-03'`)).ir, false);
+});
+
+// ─── Equipment (071) ────────────────────────────────────────────────────────
+
+test('equipment can be added to the roster', async () => {
+  // The whole point of 071: before it, the type CHECK rejected this and
+  // the lifts lived in a notes field.
+  const db = await freshDb();
+  await db.exec(`INSERT INTO vehicles (unit_number,type,make,model,serial_number,capacity,hours)
+                 VALUES ('E-01','equipment','Skyjack','SJ3219','3219-0000123','500 lb · 19 ft',412.5)`);
+  const r = await one(db, `SELECT type, serial_number s, capacity c, hours h
+                             FROM vehicles WHERE unit_number='E-01'`);
+  assert.equal(r.type, 'equipment');
+  assert.equal(r.s, '3219-0000123');
+  assert.equal(r.c, '500 lb · 19 ft');
+  assert.equal(Number(r.h), 412.5);
+});
+
+test('the type CHECK still refuses anything outside the three types', async () => {
+  // Re-adding the constraint in 071 is where a typo would silently open
+  // the column to free text.
+  const db = await freshDb();
+  await refuses(db,
+    `INSERT INTO vehicles (unit_number,type) VALUES ('X-01','forklift')`,
+    'vehicles_type_check');
+});
+
+test('equipment is never in O. Reg. 199/07 scope, whatever weight is entered', async () => {
+  // A lift is not a commercial motor vehicle. Without the short-circuit,
+  // typing a weight against one would put a scissor lift on the daily
+  // circle-check board and the report would be meaningless.
+  const db = await freshDb();
+  await db.exec(`INSERT INTO vehicles (unit_number,type,registered_gross_weight_kg)
+                 VALUES ('E-02','equipment',9000)`);
+  assert.equal(
+    (await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='E-02'`)).ir,
+    false);
+});
+
+test('re-typing a unit to equipment drops it out of scope in that statement', async () => {
+  // 060 fired the scope trigger on registered_gross_weight_kg only, so a
+  // re-typed unit would have kept a stale inspection_required = TRUE until
+  // somebody happened to touch its weight.
+  const db = await freshDb();
+  assert.equal((await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='T-02'`)).ir, true);
+  await db.exec(`UPDATE vehicles SET type='equipment' WHERE unit_number='T-02'`);
+  assert.equal((await one(db, `SELECT inspection_required ir FROM vehicles WHERE unit_number='T-02'`)).ir, false);
+});
+
+test('the RGW rule is untouched for road vehicles', async () => {
+  // 071 rewrites set_vehicle_inspection_required(). The 4,500 kg boundary
+  // must survive that rewrite intact.
+  const db = await freshDb();
+  const by = Object.fromEntries((await db.query(
+    `SELECT unit_number, inspection_required ir FROM vehicles`)).rows.map((r) => [r.unit_number, r.ir]));
+  assert.equal(by['T-01'], false, 'exactly 4,500 kg stays out');
+  assert.equal(by['T-02'], true,  '6,000 kg stays in');
+});
+
+test('a negative hour meter is refused', async () => {
+  const db = await freshDb();
+  await refuses(db,
+    `INSERT INTO vehicles (unit_number,type,hours) VALUES ('E-03','equipment',-5)`,
+    'vehicles_hours_nonneg');
+});
+
+test('071 is re-runnable', async () => {
+  // The runner tracks applied files, but a failed run can leave a
+  // migration half-applied and it gets re-run by hand.
+  const db = await freshDb({ rerun: true });
+  await db.exec(`INSERT INTO vehicles (unit_number,type) VALUES ('E-04','equipment')`);
+  assert.equal(
+    (await one(db, `SELECT COUNT(*)::int n FROM vehicles WHERE type='equipment'`)).n, 1);
 });
 
 test('every active unit, trailers included, is on Schedule 1 v2', async () => {
