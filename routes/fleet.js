@@ -73,7 +73,16 @@ function docTypesFor(vehicleType) {
 // Shared RETURNING list so create and update hand back the same shape.
 const VEHICLE_COLUMNS = `id, unit_number, type, make, model, year,
   license_plate, vin, serial_number, capacity, hours, hours_at,
-  notes, active, created_at, updated_at`;
+  notes, active, created_at, updated_at,
+  registered_gross_weight_kg, inspection_required, inspection_schedule_id`;
+
+// Registered gross weight in kg, off the plate permit. Blank clears it.
+function parseRgw(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 100000) return INVALID;
+  return n;
+}
 
 // Distinct from null, which is a legitimate "clear the hour meter".
 const INVALID = Symbol('invalid');
@@ -263,13 +272,25 @@ router.post('/vehicles', requireStaff, async (req, res, next) => {
 
     const hours = parseHours(b.hours);
     if (hours === INVALID) return res.status(400).json({ message: 'hours must be a number of 0 or more' });
+    const rgw = parseRgw(b.registered_gross_weight_kg);
+    if (rgw === INVALID) return res.status(400).json({ message: 'registered gross weight must be a whole number of kg' });
 
+    // Trucks and trailers start on the active Schedule 1 so a new unit can
+    // be circle-checked the day it arrives. Units added before this was here
+    // had no schedule and the check refused them (migration 073 backfilled).
+    // Equipment gets none — O. Reg. 199/07 doesn't reach a lift.
     const row = await queryOne(
       `INSERT INTO vehicles (unit_number, type, make, model, year, license_plate, vin,
-                             serial_number, capacity, hours, hours_at, notes, active)
+                             serial_number, capacity, hours, hours_at, notes, active,
+                             registered_gross_weight_kg, inspection_schedule_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                CASE WHEN $10::numeric IS NULL THEN NULL ELSE NOW() END,
-               $11, COALESCE($12, TRUE))
+               $11, COALESCE($12, TRUE), $13,
+               CASE WHEN $2 IN ('truck', 'trailer') THEN
+                 (SELECT id FROM inspection_schedules
+                   WHERE name = 'Schedule 1 — Power Unit' AND active = TRUE
+                   ORDER BY version DESC LIMIT 1)
+               END)
        RETURNING ${VEHICLE_COLUMNS}`,
       [
         unit_number, type,
@@ -277,7 +298,8 @@ router.post('/vehicles', requireStaff, async (req, res, next) => {
         b.license_plate || null, b.vin || null,
         b.serial_number || null, b.capacity || null, hours,
         b.notes || null,
-        b.active == null ? null : !!b.active
+        b.active == null ? null : !!b.active,
+        rgw
       ]
     );
     res.status(201).json(row);
@@ -366,7 +388,8 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
     const args = [];
     let i = 1;
     const fields = ['unit_number', 'type', 'make', 'model', 'year', 'license_plate', 'vin',
-                    'serial_number', 'capacity', 'hours', 'notes', 'active'];
+                    'serial_number', 'capacity', 'hours', 'notes', 'active',
+                    'registered_gross_weight_kg', 'inspection_schedule_id'];
     for (const f of fields) {
       if (b[f] === undefined) continue;
       if (f === 'type' && !VEHICLE_TYPES.includes(b[f])) {
@@ -392,6 +415,24 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
                                 WHEN hours IS DISTINCT FROM $${i - 1}::numeric THEN NOW()
                                 ELSE hours_at
                               END`);
+        continue;
+      }
+      if (f === 'registered_gross_weight_kg') {
+        // inspection_required follows from this via the DB trigger (060/071).
+        const w = parseRgw(b[f]);
+        if (w === INVALID) return res.status(400).json({ message: 'registered gross weight must be a whole number of kg' });
+        sets.push(`${f} = $${i++}`); args.push(w);
+        continue;
+      }
+      if (f === 'inspection_schedule_id') {
+        let sid = null;
+        if (b[f] !== null && b[f] !== '') {
+          sid = parseInt(b[f], 10);
+          const ok = Number.isInteger(sid) && await queryOne(
+            'SELECT id FROM inspection_schedules WHERE id = $1 AND active = TRUE', [sid]);
+          if (!ok) return res.status(400).json({ message: 'inspection schedule not found or not active' });
+        }
+        sets.push(`${f} = $${i++}`); args.push(sid);
         continue;
       }
       sets.push(`${f} = $${i++}`); args.push(b[f]);
