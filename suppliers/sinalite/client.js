@@ -182,7 +182,9 @@ async function listProducts() {
       id: Number(p.id),
       sku: p.sku || '',
       name: String(p.name || '').trim(),
-      category: String(p.category || 'Other').trim(),
+      // SinaLite has near-duplicate categories like "Pull Up Banners-";
+      // drop the trailing dash so they merge in the picker.
+      category: String(p.category || 'Other').trim().replace(/\s*-+$/, '') || 'Other',
       enabled: Number(p.enabled) === 1,
     }))
     .sort((a, b) => naturalCompare(a.category, b.category) || naturalCompare(a.name, b.name));
