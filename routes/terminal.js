@@ -24,6 +24,7 @@ const {
   publishableKey, motoEnabled,
 } = require('../lib/stripe-client');
 const { sendPayLink } = require('../lib/customer-mailer');
+const { refreshStripeFee } = require('../lib/stripe-fee');
 const {
   writeBackPayment, writeBackOfflinePayment, qboPreflight, invoiceSummaryForProject,
 } = require('../lib/qbo-terminal-writeback');
@@ -376,6 +377,8 @@ router.get('/payments/:id', requireStaff, async (req, res) => {
 // no-op, not a duplicate posting.
 router.post('/payments/:id/resync', requireStaff, async (req, res) => {
   try {
+    // A fee Stripe hadn't worked out at payment time gets picked up here.
+    try { await refreshStripeFee(Number.parseInt(req.params.id, 10)); } catch { /* sale may not be settled */ }
     const result = await writeBackPayment(Number.parseInt(req.params.id, 10));
     res.json({ ok: true, ...result });
   } catch (err) {

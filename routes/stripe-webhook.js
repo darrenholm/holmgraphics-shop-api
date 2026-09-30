@@ -20,6 +20,7 @@ const { query, queryOne } = require('../db/connection');
 const { getStripe, stripeConfigured } = require('../lib/stripe-client');
 const { writeBackPayment, writeBackRefund } = require('../lib/qbo-terminal-writeback');
 const { completeIfFullyPaid } = require('../lib/job-completion');
+const { waitForStripeFee } = require('../lib/stripe-fee');
 
 const router = express.Router();
 
@@ -160,6 +161,12 @@ async function onPaymentSucceeded(pi) {
     );
   } catch (err) {
     console.error(`[stripe-webhook] job completion check failed for ${pi.id}:`, err.message);
+  }
+
+  // Keyed / pay-link card charges usually get their fee a few seconds after
+  // this event. Keep looking so the fee still reaches QuickBooks.
+  if (details.chargeId && details.feeCents == null) {
+    await waitForStripeFee(row.id);
   }
 }
 
