@@ -526,27 +526,76 @@ router.delete('/wifi/:id', requireStaff, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// MODULES — CRUD + sign linker
+// MODULES — shelf inventory + sign linker
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// modules is a flat inventory table with no client_id. A module "belongs"
-// to a client only via led_signs.module_id. That means:
+// modules is a flat inventory table with no client_id. One row is one PART
+// NUMBER with a shelf count (on_hand), not one physical module. A module
+// "belongs" to a client only via led_signs.module_id. That means:
 //   - Creating / listing all modules happens at the top-level /modules.
 //   - The "Used by" link is managed on led_signs, not modules.
-// The existing GET /clients/:id/modules (above) joins the two to produce
-// the per-client view shown on the Modules tab.
+// Signs made in the same production run share a row; signs from their own
+// run get their own row. The existing GET /clients/:id/modules (above) joins
+// the two to produce the per-client view shown on the Modules tab; the
+// shop-wide /modules page on the frontend uses /modules/inventory below.
 
-const MODULE_WRITABLE = ['module_id_no', 'starting_inventory', 'on_hand'];
+const MODULE_WRITABLE = ['module_id_no', 'starting_inventory', 'on_hand',
+                         'description', 'shelf_location', 'notes'];
 
-// ─── GET /api/modules ────────────────────────────────────────────────────────
-// Full inventory list — used by the sign→module picker on the LED Signs
+const MODULE_COLS = `m.id, m.module_id_no, m.starting_inventory, m.on_hand,
+                     m.description, m.shelf_location, m.notes,
+                     m.last_counted_at, m.created_at, m.updated_at`;
+
+// Every sign (any client) pointing at module m, as a JSON array. Client name
+// uses the same COALESCE the rest of the app uses for display.
+const MODULE_SIGNS_JSON = `
+  COALESCE(
+    (SELECT json_agg(json_build_object(
+              'id',          s.id,
+              'sign_name',   s.sign_name,
+              'location',    s.location,
+              'pitch',       s.pitch,
+              'module_size', s.module_size,
+              'client_id',   s.client_id,
+              'client_name', COALESCE(NULLIF(TRIM(c.company), ''),
+                                      NULLIF(TRIM(CONCAT_WS(' ', c.fname, c.lname)), ''))
+            ) ORDER BY c.company NULLS LAST, s.sign_name NULLS LAST, s.id)
+       FROM led_signs s
+       LEFT JOIN clients c ON c.id = s.client_id
+      WHERE s.module_id = m.id),
+    '[]'::json
+  ) AS signs`;
+
+// Another row already using this part number (ignoring case and spaces at
+// the ends)? Returns it, or null. excludeId skips the row being edited.
+async function findDuplicateModule(moduleIdNo, excludeId = null) {
+  return queryOne(
+    `SELECT id, module_id_no FROM modules
+      WHERE LOWER(TRIM(module_id_no)) = LOWER(TRIM($1))
+        AND ($2::int IS NULL OR id <> $2)
+      LIMIT 1`,
+    [moduleIdNo, excludeId]
+  );
+}
+
+// on_hand arrives from a form: '' / null means "not counted", otherwise it
+// must be a whole number >= 0. Returns { ok, value } or { ok:false }.
+function parseCount(v) {
+  if (v === undefined || v === null || v === '') return { ok: true, value: null };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) return { ok: false };
+  return { ok: true, value: n };
+}
+
+// ─── GET /api/clients/modules/all ────────────────────────────────────────────
+// Flat inventory list — used by the sign→module picker on the LED Signs
 // tab so staff can choose which module a sign uses.
 router.get('/modules/all', requireAuth, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, module_id_no, starting_inventory, on_hand, created_at, updated_at
-         FROM modules
-        ORDER BY module_id_no NULLS LAST, id`
+      `SELECT ${MODULE_COLS}
+         FROM modules m
+        ORDER BY m.module_id_no NULLS LAST, m.id`
     );
     res.json(rows);
   } catch (e) {
@@ -555,14 +604,70 @@ router.get('/modules/all', requireAuth, async (req, res) => {
   }
 });
 
-// ─── POST /api/modules ───────────────────────────────────────────────────────
+// ─── GET /api/clients/modules/inventory ──────────────────────────────────────
+// Shop-wide inventory for the /modules page: every part number with the
+// signs (across all clients) it works in, nested as `signs`.
+router.get('/modules/inventory', requireAuth, async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT ${MODULE_COLS}, ${MODULE_SIGNS_JSON}
+         FROM modules m
+        ORDER BY m.module_id_no NULLS LAST, m.id`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /modules/inventory:', e);
+    res.status(500).json({ message: 'Failed to load module inventory', detail: e.message });
+  }
+});
+
+// ─── GET /api/clients/modules/:id ────────────────────────────────────────────
+// One part number + its signs. This is where a scanned module label lands
+// (the QR on the label opens /modules/<id> on the frontend).
+router.get('/modules/:id', requireAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Invalid module id' });
+  }
+  try {
+    const row = await queryOne(
+      `SELECT ${MODULE_COLS}, ${MODULE_SIGNS_JSON}
+         FROM modules m
+        WHERE m.id = $1`,
+      [id]
+    );
+    if (!row) return res.status(404).json({ message: 'Module not found' });
+    res.json(row);
+  } catch (e) {
+    console.error('GET /modules/:id:', e);
+    res.status(500).json({ message: 'Failed to load module', detail: e.message });
+  }
+});
+
+// ─── POST /api/clients/modules ───────────────────────────────────────────────
 router.post('/modules', requireStaff, async (req, res) => {
   const moduleIdNo = cleanValue(req.body?.module_id_no);
   if (!moduleIdNo) {
     return res.status(400).json({ message: 'module_id_no is required' });
   }
+  const count = parseCount(req.body?.on_hand);
+  if (!count.ok) {
+    return res.status(400).json({ message: 'On hand must be a whole number, 0 or more' });
+  }
   const { cols, vals } = extractFields(req.body, MODULE_WRITABLE);
+  // A count entered with the new row is a physical count.
+  if (count.value !== null) {
+    cols.push('last_counted_at');
+    vals.push(new Date());
+  }
   try {
+    const dup = await findDuplicateModule(moduleIdNo);
+    if (dup) {
+      return res.status(409).json({
+        message: `Part number ${dup.module_id_no} is already in the inventory`,
+        existing_id: dup.id,
+      });
+    }
     const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
     const created = await queryOne(
       `INSERT INTO modules (${cols.join(', ')})
@@ -577,23 +682,46 @@ router.post('/modules', requireStaff, async (req, res) => {
   }
 });
 
-// ─── PUT /api/modules/:id ────────────────────────────────────────────────────
+// ─── PUT /api/clients/modules/:id ────────────────────────────────────────────
 router.put('/modules/:id', requireStaff, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ message: 'Invalid module id' });
   }
-  const { cols, vals } = extractFields(req.body, MODULE_WRITABLE);
+  if ('module_id_no' in (req.body || {}) && !cleanValue(req.body.module_id_no)) {
+    return res.status(400).json({ message: 'module_id_no cannot be blank' });
+  }
+  if ('on_hand' in (req.body || {}) && !parseCount(req.body.on_hand).ok) {
+    return res.status(400).json({ message: 'On hand must be a whole number, 0 or more' });
+  }
+  const { cols, vals } = extractFields(req.body || {}, MODULE_WRITABLE);
   if (cols.length === 0) {
     return res.status(400).json({ message: 'No writable fields provided' });
   }
   try {
-    const setClause = cols.map((c, i) => `${c} = $${i + 1}`).join(', ');
+    if (cols.includes('module_id_no')) {
+      const dup = await findDuplicateModule(vals[cols.indexOf('module_id_no')], id);
+      if (dup) {
+        return res.status(409).json({
+          message: `Part number ${dup.module_id_no} is already in the inventory`,
+          existing_id: dup.id,
+        });
+      }
+    }
+    const setParts = cols.map((c, i) => `${c} = $${i + 1}`);
     vals.push(id);
+    const idParam = `$${vals.length}`;
+    // Stamp last_counted_at only when the count actually changed, so saving
+    // a shelf-location edit doesn't look like a fresh count.
+    if (cols.includes('on_hand')) {
+      const p = `$${cols.indexOf('on_hand') + 1}`;
+      setParts.push(`last_counted_at = CASE WHEN ${p}::int IS DISTINCT FROM on_hand
+                                            THEN NOW() ELSE last_counted_at END`);
+    }
     const updated = await queryOne(
       `UPDATE modules
-          SET ${setClause}, updated_at = NOW()
-        WHERE id = $${vals.length}
+          SET ${setParts.join(', ')}, updated_at = NOW()
+        WHERE id = ${idParam}
         RETURNING *`,
       vals
     );
@@ -605,7 +733,37 @@ router.put('/modules/:id', requireStaff, async (req, res) => {
   }
 });
 
-// ─── DELETE /api/modules/:id ─────────────────────────────────────────────────
+// ─── POST /api/clients/modules/:id/adjust ────────────────────────────────────
+// { delta: -1 } when a module is pulled off the shelf for a repair,
+// { delta: 1 } when one goes back. Done in SQL so two people tapping at once
+// can't lose a count. Never goes below 0; an uncounted row starts from 0.
+router.post('/modules/:id/adjust', requireStaff, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const delta = Number(req.body?.delta);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ message: 'Invalid module id' });
+  }
+  if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 1000) {
+    return res.status(400).json({ message: 'delta must be a non-zero whole number' });
+  }
+  try {
+    const updated = await queryOne(
+      `UPDATE modules
+          SET on_hand = GREATEST(COALESCE(on_hand, 0) + $1, 0),
+              updated_at = NOW()
+        WHERE id = $2
+        RETURNING *`,
+      [delta, id]
+    );
+    if (!updated) return res.status(404).json({ message: 'Module not found' });
+    res.json(updated);
+  } catch (e) {
+    console.error('POST /modules/:id/adjust:', e);
+    res.status(500).json({ message: 'Failed to adjust count', detail: e.message });
+  }
+});
+
+// ─── DELETE /api/clients/modules/:id ─────────────────────────────────────────
 // ON DELETE SET NULL on led_signs.module_id handles the orphaned links —
 // the signs themselves are preserved, they just become unlinked.
 router.delete('/modules/:id', requireStaff, async (req, res) => {
@@ -623,6 +781,27 @@ router.delete('/modules/:id', requireStaff, async (req, res) => {
   } catch (e) {
     console.error('DELETE /modules/:id:', e);
     res.status(500).json({ message: 'Failed to delete module', detail: e.message });
+  }
+});
+
+// ─── GET /api/clients/led-signs/all ──────────────────────────────────────────
+// Every LED sign with its client name — the sign picker on the /modules
+// page, where the module is chosen first and the sign could belong to anyone.
+router.get('/led-signs/all', requireAuth, async (req, res) => {
+  try {
+    const rows = await query(
+      `SELECT s.id, s.sign_name, s.location, s.pitch, s.module_size,
+              s.client_id, s.module_id,
+              COALESCE(NULLIF(TRIM(c.company), ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', c.fname, c.lname)), '')) AS client_name
+         FROM led_signs s
+         LEFT JOIN clients c ON c.id = s.client_id
+        ORDER BY client_name NULLS LAST, s.sign_name NULLS LAST, s.id`
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /led-signs/all:', e);
+    res.status(500).json({ message: 'Failed to load LED signs', detail: e.message });
   }
 });
 
