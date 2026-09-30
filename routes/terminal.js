@@ -22,7 +22,9 @@ const { requireStaff } = require('../middleware/auth');
 const {
   getStripe, stripeConfigured, isTestMode, terminalLocationId,
 } = require('../lib/stripe-client');
-const { writeBackPayment, qboPreflight, invoiceSummaryForProject } = require('../lib/qbo-terminal-writeback');
+const {
+  writeBackPayment, writeBackOfflinePayment, qboPreflight, invoiceSummaryForProject,
+} = require('../lib/qbo-terminal-writeback');
 
 const router = express.Router();
 
@@ -375,6 +377,89 @@ router.post('/payments/:id/resync', requireStaff, async (req, res) => {
     console.error('[terminal] resync:', err.message);
     res.status(502).json({ error: err.message, setupRequired: !!err.setupRequired });
   }
+});
+
+// ─── POST /api/terminal/offline-payments ─────────────────────────────────────
+// Body: { clientKey, method: 'cash'|'cheque', jobId, amountCents,
+//         subtotalCents?, taxCents?, reference?, description? }
+//
+// Records a cash or cheque payment and posts it to QuickBooks (Undeposited
+// Funds). The money is already in the drawer by the time this is called, so
+// a QuickBooks failure is NOT an error response: the row is kept, the reply
+// carries qbo_error, and the tablet offers Retry. clientKey makes a repeat
+// of the same attempt return the original row instead of a second payment.
+router.post('/offline-payments', requireStaff, async (req, res) => {
+  try {
+    const { clientKey, method, reference, description } = req.body || {};
+    const amount = Number.parseInt(req.body?.amountCents, 10);
+    const subtotalCents = Number.parseInt(req.body?.subtotalCents, 10);
+    const taxCents = Number.parseInt(req.body?.taxCents, 10);
+    const projectId = req.body?.jobId == null ? null : Number.parseInt(req.body.jobId, 10);
+
+    if (!clientKey || typeof clientKey !== 'string' || clientKey.length > 100) {
+      return res.status(400).json({ error: 'clientKey is required' });
+    }
+    if (method !== 'cash' && method !== 'cheque') {
+      return res.status(400).json({ error: 'method must be cash or cheque' });
+    }
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amountCents must be a positive integer' });
+    }
+    const project = Number.isInteger(projectId)
+      ? await queryOne(`SELECT id, client_id, description FROM projects WHERE id = $1`, [projectId])
+      : null;
+    if (projectId != null && !project) {
+      return res.status(404).json({ error: `Job #${projectId} not found` });
+    }
+
+    const desc = (description || project?.description || 'Holm Graphics counter sale')
+      .toString().slice(0, 200);
+    const ref = method === 'cheque' && reference
+      ? String(reference).trim().slice(0, 21) || null
+      : null;
+
+    await query(
+      `INSERT INTO counter_offline_payments
+         (client_key, method, project_id, client_id, description,
+          amount_cents, subtotal_cents, tax_cents, reference, taken_by_emp_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (client_key) DO NOTHING`,
+      [
+        clientKey, method, project?.id ?? null, project?.client_id ?? null, desc,
+        amount,
+        Number.isInteger(subtotalCents) ? subtotalCents : null,
+        Number.isInteger(taxCents) ? taxCents : null,
+        ref, req.user.id,
+      ]
+    );
+    const row = await queryOne(
+      `SELECT * FROM counter_offline_payments WHERE client_key = $1`, [clientKey]
+    );
+
+    try {
+      await writeBackOfflinePayment(row.id);
+    } catch (err) {
+      console.error(`[terminal] offline payment #${row.id} QBO:`, err.message);
+    }
+    res.json(await queryOne(`SELECT * FROM counter_offline_payments WHERE id = $1`, [row.id]));
+  } catch (err) {
+    console.error('[terminal] offline payment:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/terminal/offline-payments/:id/resync ──────────────────────────
+// Retry the QuickBooks post for a cash/cheque payment. A synced row is a no-op.
+router.post('/offline-payments/:id/resync', requireStaff, async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  try {
+    await writeBackOfflinePayment(id);
+  } catch (err) {
+    console.error(`[terminal] offline resync #${id}:`, err.message);
+  }
+  const row = await queryOne(`SELECT * FROM counter_offline_payments WHERE id = $1`, [id]);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  res.json(row);
 });
 
 // ─── POST /api/terminal/payments/:id/refund ──────────────────────────────────
