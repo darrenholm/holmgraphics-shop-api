@@ -191,7 +191,9 @@ async function chargeDetails(pi) {
     // co-branded cards that would otherwise report brand "visa". Check it
     // first — this field is how you tell debit from credit when auditing
     // processing costs later.
-    const present = pmd.interac_present || pmd.card_present || null;
+    // A phone / pay-link payment is a plain `card` charge: same brand and
+    // last4, no EMV block.
+    const present = pmd.interac_present || pmd.card_present || pmd.card || null;
     out.methodType = pmd.type || (pmd.interac_present ? 'interac_present' : null);
     if (present) {
       out.brand = present.brand || null;
