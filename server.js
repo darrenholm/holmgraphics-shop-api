@@ -110,6 +110,8 @@ app.use('/',               telephonyRoutes);
 // stripe-signature header over the raw body IS the authentication.
 app.use('/',               stripeWebhookRoutes);
 app.use('/api/terminal',   terminalRoutes);
+// Public card-payment link page data (token auth). See routes/pay-links.js.
+app.use('/api/pay',        require('./routes/pay-links'));
 app.use('/api/auth',       authRoutes);
 app.use('/api/customer',     customerAuthRoutes);
 app.use('/api/dtf',          dtfConfigRoutes);

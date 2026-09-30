@@ -21,7 +21,9 @@ const { query, queryOne } = require('../db/connection');
 const { requireStaff } = require('../middleware/auth');
 const {
   getStripe, stripeConfigured, isTestMode, terminalLocationId,
+  publishableKey, motoEnabled,
 } = require('../lib/stripe-client');
+const { sendPayLink } = require('../lib/customer-mailer');
 const {
   writeBackPayment, writeBackOfflinePayment, qboPreflight, invoiceSummaryForProject,
 } = require('../lib/qbo-terminal-writeback');
@@ -54,6 +56,9 @@ router.get('/config', requireStaff, (req, res) => {
     // Nothing to connect to without a Location; say so plainly rather than
     // letting discovery come back empty.
     ready:       stripeConfigured() && !!terminalLocationId(),
+    // Phone / pay-link card entry runs Stripe.js in the browser.
+    publishableKey: publishableKey(),
+    moto:        motoEnabled(),
   });
 });
 
@@ -144,7 +149,7 @@ router.post('/payment-intent', requireStaff, requireStripe, async (req, res) => 
     if (projectId) {
       const open = await queryOne(
         `SELECT * FROM terminal_payments
-          WHERE project_id = $1 AND status = 'pending'
+          WHERE project_id = $1 AND status = 'pending' AND channel = 'counter'
           LIMIT 1`,
         [projectId]
       );
@@ -376,6 +381,143 @@ router.post('/payments/:id/resync', requireStaff, async (req, res) => {
   } catch (err) {
     console.error('[terminal] resync:', err.message);
     res.status(502).json({ error: err.message, setupRequired: !!err.setupRequired });
+  }
+});
+
+// ─── POST /api/terminal/card-not-present ─────────────────────────────────────
+// Body: { channel: 'phone'|'link', jobId, amountCents, subtotalCents?,
+//         taxCents?, email? }
+//
+// A card payment that doesn't touch the reader. Either way it is a plain
+// PaymentIntent recorded in terminal_payments first, so the existing
+// payment_intent.succeeded webhook posts it to QuickBooks like any other
+// Stripe sale.
+//
+//   phone → returns { id, clientSecret, publishableKey } for the card box on
+//           the job page. Staff type the card; Stripe.js confirms it.
+//   link  → returns { id, url, emailed } — a /pay/<token> page the customer
+//           opens themselves. Making a new link for a job cancels its older
+//           open ones, so a customer can't pay the same job twice from two
+//           emails.
+//
+// email, when given, is where Stripe sends its card receipt (and, for a
+// link, where the link is emailed).
+const PAY_LINK_BASE = (process.env.PUBLIC_SHOP_URL || 'https://shop.holmgraphics.ca').replace(/\/$/, '');
+
+router.post('/card-not-present', requireStaff, requireStripe, async (req, res) => {
+  const { channel, jobId, description } = req.body || {};
+  const amount = Number.parseInt(req.body?.amountCents, 10);
+  const subtotalCents = Number.parseInt(req.body?.subtotalCents, 10);
+  const taxCents = Number.parseInt(req.body?.taxCents, 10);
+  const email = String(req.body?.email || '').trim().slice(0, 200) || null;
+
+  if (channel !== 'phone' && channel !== 'link') {
+    return res.status(400).json({ error: 'channel must be phone or link' });
+  }
+  if (!Number.isInteger(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'amountCents must be a positive integer number of cents' });
+  }
+  if (amount > MAX_AMOUNT_CENTS) {
+    return res.status(400).json({ error: 'That amount looks like a typo.' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'That email address doesn\'t look right.' });
+  }
+  if (!publishableKey()) {
+    return res.status(503).json({
+      error: 'STRIPE_PUBLISHABLE_KEY is not set in Railway, so the card box can\'t load.',
+    });
+  }
+  const projectId = jobId == null ? null : Number.parseInt(jobId, 10);
+
+  try {
+    const project = Number.isInteger(projectId)
+      ? await queryOne(`SELECT id, client_id, description FROM projects WHERE id = $1`, [projectId])
+      : null;
+    if (projectId != null && !project) {
+      return res.status(404).json({ error: `Job #${projectId} not found` });
+    }
+
+    // One live link per job. Cancel the old PaymentIntent too, so an old
+    // email can't still take money.
+    if (channel === 'link' && project) {
+      const old = await query(
+        `SELECT id, payment_intent_id FROM terminal_payments
+          WHERE project_id = $1 AND channel = 'link' AND status = 'pending'`,
+        [project.id]
+      );
+      for (const o of old) {
+        try { await getStripe().paymentIntents.cancel(o.payment_intent_id); } catch { /* already done */ }
+        await query(
+          `UPDATE terminal_payments SET status = 'canceled', updated_at = NOW() WHERE id = $1`,
+          [o.id]
+        );
+      }
+    }
+
+    const attemptId = crypto.randomBytes(8).toString('hex');
+    const desc = (description || project?.description || 'Holm Graphics')
+      .toString().slice(0, 200);
+    const useMoto = channel === 'phone' && motoEnabled();
+
+    const pi = await getStripe().paymentIntents.create({
+      amount,
+      currency: 'cad',
+      payment_method_types: ['card'],
+      ...(useMoto ? { payment_method_options: { card: { moto: true } } } : {}),
+      description: desc,
+      ...(email ? { receipt_email: email } : {}),
+      metadata: {
+        job_id:  projectId == null ? '' : String(projectId),
+        source:  channel === 'phone' ? 'phone_keyed' : 'pay_link',
+        emp_id:  String(req.user.id),
+        attempt: attemptId,
+      },
+    }, {
+      idempotencyKey: `cnp-${channel}-${projectId ?? 'none'}-${amount}-${attemptId}`,
+    });
+
+    const token = channel === 'link' ? crypto.randomBytes(24).toString('hex') : null;
+    const row = await queryOne(
+      `INSERT INTO terminal_payments
+         (payment_intent_id, attempt_id, project_id, client_id, description,
+          amount_cents, subtotal_cents, tax_cents, currency, status,
+          taken_by_emp_id, channel, pay_token, receipt_email)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'cad', 'pending', $9, $10, $11, $12)
+       RETURNING id`,
+      [
+        pi.id, attemptId, project?.id ?? null, project?.client_id ?? null, desc,
+        amount,
+        Number.isInteger(subtotalCents) ? subtotalCents : null,
+        Number.isInteger(taxCents) ? taxCents : null,
+        req.user.id, channel, token, email,
+      ]
+    );
+
+    if (channel === 'phone') {
+      return res.json({
+        id: row.id,
+        paymentIntentId: pi.id,
+        clientSecret: pi.client_secret,
+        publishableKey: publishableKey(),
+        moto: useMoto,
+      });
+    }
+
+    const url = `${PAY_LINK_BASE}/pay/${token}`;
+    let emailed = null;
+    if (email) {
+      const r = await sendPayLink({
+        email, url, amountCents: amount,
+        projectId: project?.id ?? '', projectName: project?.description || '',
+      });
+      emailed = r.ok ? email : null;
+      if (!r.ok) console.error('[terminal] pay link email failed:', r.error);
+    }
+    res.json({ id: row.id, url, emailed });
+  } catch (err) {
+    console.error('[terminal] card-not-present:', err.message);
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
