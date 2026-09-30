@@ -11,6 +11,7 @@ const projectRoutes      = require('./routes/projects');
 const lookupRoutes       = require('./routes/lookup');
 const quickbooksRoutes   = require('./routes/quickbooks');
 const suppliersRoutes    = require('./routes/suppliers');
+const sinaliteRoutes     = require('./routes/sinalite');
 const catalogRoutes      = require('./routes/catalog');
 const clientsRoutes      = require('./routes/clients');
 const customerAuthRoutes = require('./routes/customer-auth');
@@ -159,6 +160,8 @@ app.use('/api',            lookupRoutes);
 app.use('/api/quickbooks', quickbooksRoutes);
 app.use('/api/qbo-match',  qboMatchRoutes);
 app.use('/api/suppliers',  suppliersRoutes);
+// SinaLite wholesale print price lookups for the quote sheet. Staff-only.
+app.use('/api/sinalite',   sinaliteRoutes);
 app.use('/api/catalog',    catalogRoutes);
 app.use('/api/time',         timeRoutes);
 app.use('/api/pay-periods',  payPeriodsRoutes);
