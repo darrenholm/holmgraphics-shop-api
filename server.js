@@ -110,6 +110,8 @@ app.use('/',               telephonyRoutes);
 // stripe-signature header over the raw body IS the authentication.
 app.use('/',               stripeWebhookRoutes);
 app.use('/api/terminal',   terminalRoutes);
+// Client signatures at pickup, on the WisePOS E. See routes/pickup-signatures.js.
+app.use('/api/pickup-signatures', require('./routes/pickup-signatures'));
 // Public card-payment link page data (token auth). See routes/pay-links.js.
 app.use('/api/pay',        require('./routes/pay-links'));
 app.use('/api/auth',       authRoutes);

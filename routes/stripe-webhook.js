@@ -21,6 +21,7 @@ const { getStripe, stripeConfigured } = require('../lib/stripe-client');
 const { writeBackPayment, writeBackRefund } = require('../lib/qbo-terminal-writeback');
 const { completeIfFullyPaid } = require('../lib/job-completion');
 const { waitForStripeFee } = require('../lib/stripe-fee');
+const { onReaderAction } = require('../lib/pickup-signatures');
 
 const router = express.Router();
 
@@ -92,6 +93,10 @@ async function handleEvent(event) {
     case 'payment_intent.payment_failed': return onPaymentFailed(event.data.object);
     case 'payment_intent.canceled':       return onPaymentCanceled(event.data.object);
     case 'charge.refunded':               return onChargeRefunded(event.data.object);
+    // Pickup signatures (collect_inputs). Card sales don't need these — they
+    // settle off payment_intent.* above — so anything else is ignored inside.
+    case 'terminal.reader.action_succeeded':
+    case 'terminal.reader.action_failed':  return onReaderAction(getStripe(), event.data.object);
     default:
       // Not an error — the endpoint is deliberately subscribed to a narrow
       // set and Stripe will happily send more if someone widens it later.
