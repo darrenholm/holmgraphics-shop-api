@@ -13,6 +13,7 @@ const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireAuth, requireStaff } = require('../middleware/auth');
 const { syncClientPhoneIndexAsync } = require('../lib/phone-index');
+const moduleScan = require('../lib/module-scan');
 
 const router = express.Router();
 
@@ -566,15 +567,19 @@ const MODULE_SIGNS_JSON = `
     '[]'::json
   ) AS signs`;
 
-// Another row already using this part number (ignoring case and spaces at
-// the ends)? Returns it, or null. excludeId skips the row being edited.
+// SQL twin of moduleScan.normalizePartNo: ignore case, all spaces, and
+// round vs curly/square brackets, which look alike on printed stickers.
+const NORM_PART_NO = `REPLACE(UPPER(TRANSLATE(m.module_id_no, '{}[] ', '()()')), ' ', '')`;
+
+// Another row already using this part number? Returns it, or null.
+// excludeId skips the row being edited.
 async function findDuplicateModule(moduleIdNo, excludeId = null) {
   return queryOne(
-    `SELECT id, module_id_no FROM modules
-      WHERE LOWER(TRIM(module_id_no)) = LOWER(TRIM($1))
-        AND ($2::int IS NULL OR id <> $2)
+    `SELECT m.id, m.module_id_no FROM modules m
+      WHERE ${NORM_PART_NO} = $1
+        AND ($2::int IS NULL OR m.id <> $2)
       LIMIT 1`,
-    [moduleIdNo, excludeId]
+    [moduleScan.normalizePartNo(moduleIdNo), excludeId]
   );
 }
 
@@ -618,6 +623,48 @@ router.get('/modules/inventory', requireAuth, async (req, res) => {
   } catch (e) {
     console.error('GET /modules/inventory:', e);
     res.status(500).json({ message: 'Failed to load module inventory', detail: e.message });
+  }
+});
+
+// ─── POST /api/clients/modules/scan ──────────────────────────────────────────
+// { image: <base64 or data: URL>, media_type: 'image/jpeg' }
+// Reads the sticker on a module photo (lib/module-scan.js) and looks the
+// number up in the inventory. Nothing is saved: the page shows the result
+// and staff confirm it before adding or counting.
+//
+// `matches` holds rows whose part number equals the reading. If the reading
+// has unreadable characters ("?"), each one matches any single character,
+// so staff can pick the right row instead of creating a near-duplicate.
+router.post('/modules/scan', requireStaff, async (req, res) => {
+  if (!moduleScan.isConfigured()) {
+    return res.status(503).json({ message: 'Sticker scan is not set up on the server (ANTHROPIC_API_KEY).' });
+  }
+  try {
+    const result = await moduleScan.scanModulePhoto({
+      imageBase64: req.body?.image,
+      mediaType: req.body?.media_type || 'image/jpeg',
+    });
+    let matches = [];
+    const key = moduleScan.normalizePartNo(result.sticker_number);
+    if (key && key.replace(/\?/g, '')) {
+      const like = key.replace(/[\\%_]/g, (c) => '\\' + c).replace(/\?/g, '_');
+      matches = await query(
+        `SELECT ${MODULE_COLS}, ${MODULE_SIGNS_JSON}
+           FROM modules m
+          WHERE ${NORM_PART_NO} LIKE $1
+          ORDER BY m.module_id_no
+          LIMIT 10`,
+        [like]
+      );
+    }
+    const { usage, ...reading } = result;
+    res.json({ ...reading, matches });
+  } catch (e) {
+    if (e.expose) {
+      return res.status(e.status).json({ message: e.message });
+    }
+    console.error('POST /modules/scan:', e.status || '', e.message);
+    res.status(502).json({ message: 'Could not read the photo right now. Try again.', detail: e.message });
   }
 });
 
