@@ -60,8 +60,8 @@ router.post('/projects/:id/quote-sheet', requireStaff, async (req, res, next) =>
     const row = await queryOne(
       `INSERT INTO quote_sheet_items
          (project_id, item, qty, cost_per_unit, markup, sale_per_unit, notes, position)
-       VALUES ($1, $2, COALESCE($3, 1), COALESCE($4, 0), COALESCE($5, 2),
-               COALESCE($6, 0), $7, $8)
+       VALUES ($1, $2, COALESCE($3::numeric, 1), COALESCE($4::numeric, 0), COALESCE($5::numeric, 2),
+               COALESCE($6::numeric, 0), $7, $8)
        RETURNING id, project_id, item, qty, cost_per_unit, markup, sale_per_unit,
                  notes, position, created_at, updated_at`,
       [
