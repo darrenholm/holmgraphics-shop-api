@@ -26,7 +26,7 @@ const { query, queryOne } = require('../db/connection');
 const { requireStaff } = require('../middleware/auth');
 const mailer = require('../lib/customer-mailer');
 const { renderProofPdf } = require('../lib/proof-pdf-renderer');
-const { rasterizePdfPageOne } = require('../lib/proof-pdf-rasterize');
+const { composeProof, MAX_PAGES } = require('../lib/proof-compose');
 
 const router = express.Router();
 
@@ -60,7 +60,7 @@ async function connectFtp(timeoutMs = 30000) {
 // images. Memory storage (Railway has no persistent fs).
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 50 * 1024 * 1024, files: 1 },
+  limits:  { fileSize: 50 * 1024 * 1024, files: MAX_PAGES },
   fileFilter: (req, file, cb) => {
     const ok = /^(image\/(jpeg|jpg|png|webp)|application\/pdf)$/i.test(file.mimetype || '');
     if (!ok) return cb(new Error(`unsupported file type: ${file.mimetype}`));
@@ -80,9 +80,12 @@ function proofPublicUrl(projectId, filename) {
 // Multipart: file (required), approve_status_id (optional int), note (optional)
 // Uploads to WHC, inserts a project_proofs row, emails the customer.
 router.post('/projects/:id/proofs', requireStaff, (req, res, next) => {
-  upload.single('file')(req, res, (err) => {
+  upload.array('file', MAX_PAGES)(req, res, (err) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'File too large (max 50 MB)' });
+      if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+        return res.status(400).json({ message: `Too many files (max ${MAX_PAGES} per proof)` });
+      }
       return res.status(400).json({ message: err.message });
     }
     // Catch the error locally so the staff UI sees the real reason (missing
@@ -101,7 +104,8 @@ router.post('/projects/:id/proofs', requireStaff, (req, res, next) => {
 async function handleProofUpload(req, res) {
   const projectId = parseInt(req.params.id, 10);
   if (!Number.isInteger(projectId)) return res.status(400).json({ message: 'invalid project id' });
-  if (!req.file) return res.status(400).json({ message: 'file field required' });
+  const files = req.files || [];
+  if (!files.length) return res.status(400).json({ message: 'file field required' });
 
   const approveStatusId = req.body.approve_status_id ? parseInt(req.body.approve_status_id, 10) : null;
   const note = (req.body.note || '').toString().trim() || null;
@@ -150,38 +154,29 @@ async function handleProofUpload(req, res) {
   );
   const version = Number(last.v) + 1;
 
-  // Generate token + filename. If a PDF was uploaded we try to rasterize
-  // page 1 to PNG so the customer's email preview and the in-browser
-  // annotation canvas have a real image to display — neither works on
-  // a PDF MIME type. If rasterization isn't available on this host
-  // (cairo/pango missing, etc.), we fall through and store the PDF
-  // as-is; the email link still opens the canvas page (which will show
-  // a broken image but lets the customer download the PDF link).
-  let fileBuffer = req.file.buffer;
-  let fileMime   = req.file.mimetype;
-  let extFromMime = (
-    fileMime === 'application/pdf' ? '.pdf' :
-    fileMime === 'image/png'       ? '.png' :
-    fileMime === 'image/webp'      ? '.webp' :
-    '.jpg'
-  );
-  if (fileMime === 'application/pdf') {
-    const raster = await rasterizePdfPageOne(req.file.buffer);
-    if (raster && raster.buffer) {
-      fileBuffer = raster.buffer;
-      fileMime   = raster.mime;
-      extFromMime = '.png';
-    } else {
-      console.warn(`[project-proofs] PDF rasterize unavailable — storing v${version} as PDF (preview/canvas won't render).`);
-    }
+  // Everything the customer sees is a flat raster: PDFs are rasterized and
+  // several files are stacked into one image (lib/proof-compose.js). The
+  // original PDF is NEVER published — it's the vector artwork, and a
+  // customer with it can take the job to another shop. If a PDF can't be
+  // rasterized we refuse rather than fall back to posting the PDF.
+  let composed;
+  try {
+    composed = await composeProof(files);
+  } catch (e) {
+    return res.status(422).json({ message: `Couldn't make a proof image: ${e.message}` });
+  }
+  const fileBuffer = composed.buffer;
+  const fileMime   = composed.mime;
+  if (!/^image\//.test(fileMime)) {
+    return res.status(422).json({ message: "Couldn't turn that PDF into an image. Send a JPEG or PNG instead." });
   }
   const token = genToken();
-  const origExt = path.extname(req.file.originalname || '').toLowerCase();
-  // If we rasterized a PDF, use .png regardless of the original
-  // filename's extension. Otherwise honour the original extension.
-  const ext = (fileMime === 'image/png' && req.file.mimetype === 'application/pdf')
-    ? '.png'
-    : (origExt || extFromMime);
+  const origExt = files.length === 1 ? path.extname(files[0].originalname || '').toLowerCase() : '';
+  const ext = fileMime === 'image/png'  ? '.png'
+            : fileMime === 'image/webp' ? '.webp'
+            : fileMime === files[0].mimetype && origExt ? origExt
+            : '.jpg';
+  const fileNames = files.map((f) => f.originalname).filter(Boolean);
   // Filename includes token so the file URL is unguessable even though
   // WHC serves the directory publicly.
   const safeFileName = `v${version}-${token.slice(0, 16)}${ext}`;
@@ -233,7 +228,7 @@ async function handleProofUpload(req, res) {
      VALUES ($1, 'staff', $2, $3, $4)`,
     [
       projectId, req.user?.id || null, authorName,
-      `📎 Sent proof v${version} for review${note ? ` — ${note}` : ''}.`,
+      `📎 Sent proof v${version} for review${fileNames.length > 1 ? ` (${fileNames.length} files: ${fileNames.join(', ')})` : ''}${note ? ` — ${note}` : ''}.`,
     ]
   );
 
