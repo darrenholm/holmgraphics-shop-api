@@ -340,8 +340,15 @@ router.delete('/projects/:id/proofs/:proofId', requireStaff, async (req, res, ne
       [proofId, projectId]
     );
     if (!proof) return res.status(404).json({ message: 'proof not found' });
-    if (proof.responded_at) {
-      return res.status(409).json({ message: 'Customer has already responded — keep this version for audit.' });
+    // Once the customer has answered, the row is the approval record, so
+    // keep it — except an admin may force it (?force=1), e.g. to clear a
+    // test proof sent to themselves. The Messages-tab entries stay.
+    const force = req.query.force === '1' && req.user?.role === 'admin';
+    if (proof.responded_at && !force) {
+      return res.status(409).json({
+        message: 'Customer has already responded — keep this version for audit.',
+        can_force: req.user?.role === 'admin',
+      });
     }
     await query(`DELETE FROM project_proofs WHERE id = $1`, [proofId]);
     // Best-effort WHC unlink. Failure doesn't block — the DB row is gone.
