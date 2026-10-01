@@ -174,6 +174,7 @@ router.get('/:id/modules', requireAuth, async (req, res) => {
               m.module_id_no,
               m.starting_inventory,
               m.on_hand,
+              m.bin,
               m.created_at,
               m.updated_at,
               COALESCE(
@@ -536,7 +537,7 @@ router.delete('/wifi/:id', requireStaff, async (req, res) => {
 // The existing GET /clients/:id/modules (above) joins the two to produce
 // the per-client view shown on the Modules tab.
 
-const MODULE_WRITABLE = ['module_id_no', 'starting_inventory', 'on_hand'];
+const MODULE_WRITABLE = ['module_id_no', 'starting_inventory', 'on_hand', 'bin'];
 
 // ─── GET /api/modules ────────────────────────────────────────────────────────
 // Full inventory list — used by the sign→module picker on the LED Signs
@@ -544,7 +545,7 @@ const MODULE_WRITABLE = ['module_id_no', 'starting_inventory', 'on_hand'];
 router.get('/modules/all', requireAuth, async (req, res) => {
   try {
     const rows = await query(
-      `SELECT id, module_id_no, starting_inventory, on_hand, created_at, updated_at
+      `SELECT id, module_id_no, starting_inventory, on_hand, bin, created_at, updated_at
          FROM modules
         ORDER BY module_id_no NULLS LAST, id`
     );
