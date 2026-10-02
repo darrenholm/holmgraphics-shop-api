@@ -627,7 +627,8 @@ router.get('/modules/inventory', requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/clients/modules/scan ──────────────────────────────────────────
-// { image: <base64 or data: URL>, media_type: 'image/jpeg' }
+// { image: <base64 or data: URL>, media_type: 'image/jpeg' }, or up to three
+// angles of the same sticker as { images: [{ image, media_type }, …] }
 // Reads the sticker on a module photo (lib/module-scan.js) and looks the
 // number up in the inventory. Nothing is saved: the page shows the result
 // and staff confirm it before adding or counting.
@@ -640,10 +641,12 @@ router.post('/modules/scan', requireStaff, async (req, res) => {
     return res.status(503).json({ message: 'Sticker scan is not set up on the server (ANTHROPIC_API_KEY).' });
   }
   try {
-    const result = await moduleScan.scanModulePhoto({
-      imageBase64: req.body?.image,
-      mediaType: req.body?.media_type || 'image/jpeg',
-    });
+    // { images: [{ image, media_type }, …] } for several angles of one
+    // sticker, or the original single { image, media_type }.
+    const images = Array.isArray(req.body?.images)
+      ? req.body.images.map((im) => ({ imageBase64: im?.image, mediaType: im?.media_type || 'image/jpeg' }))
+      : [{ imageBase64: req.body?.image, mediaType: req.body?.media_type || 'image/jpeg' }];
+    const result = await moduleScan.scanModulePhoto({ images });
     let matches = [];
     const key = moduleScan.normalizePartNo(result.sticker_number);
     if (key && key.replace(/\?/g, '')) {
