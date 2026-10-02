@@ -14,7 +14,7 @@ const express = require('express');
 const { query, queryOne } = require('../db/connection');
 const { requireStaff } = require('../middleware/auth');
 const { getStripe, stripeConfigured } = require('../lib/stripe-client');
-const { buildCollectInputs, settleFromReader } = require('../lib/pickup-signatures');
+const { buildCollectInputs, settleFromReader, jobSnapshot } = require('../lib/pickup-signatures');
 
 const router = express.Router();
 
@@ -44,6 +44,15 @@ function summary(row) {
     signatureSvg:  row.signature_svg,
     failureMessage: row.failure_message,
     requestedBy:   row.requested_by || null,
+    note:          row.note || '',
+    items:         row.items || [],
+    // null when the job had no price on it at the time.
+    money: row.total_cents == null ? null : {
+      totalCents:   row.total_cents,
+      paidCents:    row.paid_cents,
+      balanceCents: row.balance_cents,
+      source:       row.money_source,
+    },
     createdAt:     row.created_at,
     signedAt:      row.signed_at,
   };
@@ -81,7 +90,7 @@ router.get('/', requireStaff, async (req, res) => {
 });
 
 // ─── POST /api/pickup-signatures ─────────────────────────────────────────────
-// { projectId, readerId? } → puts the name box + signature pad on the reader.
+// { projectId, readerId?, note? } → puts the name box + signature pad on the reader.
 router.post('/', requireStaff, requireStripe, async (req, res) => {
   const projectId = Number.parseInt(req.body?.projectId, 10);
   if (!Number.isInteger(projectId)) return res.status(400).json({ error: 'projectId is required' });
@@ -114,16 +123,25 @@ router.post('/', requireStaff, requireStripe, async (req, res) => {
       [reader.id]
     );
 
+    // What's being signed for, frozen now so a reprint later matches what
+    // the client saw on the reader.
+    const note = String(req.body?.note || '').trim().slice(0, 500);
+    const { items, money } = await jobSnapshot(projectId);
+
     const row = await queryOne(
-      `INSERT INTO pickup_signatures (project_id, reader_id, requested_by_emp_id)
-       VALUES ($1, $2, $3) RETURNING *`,
-      [projectId, reader.id, req.user?.id || null]
+      `INSERT INTO pickup_signatures
+         (project_id, reader_id, requested_by_emp_id, note, items,
+          total_cents, paid_cents, balance_cents, money_source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [projectId, reader.id, req.user?.id || null, note || null, JSON.stringify(items),
+       money?.totalCents ?? null, money?.paidCents ?? null, money?.balanceCents ?? null,
+       money?.source ?? null]
     );
 
     try {
       await stripe.terminal.readers.collectInputs(
         reader.id,
-        buildCollectInputs({ projectId, description: project.description, signatureId: row.id })
+        buildCollectInputs({ projectId, description: project.description, signatureId: row.id, items, note })
       );
     } catch (err) {
       await query(
