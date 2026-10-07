@@ -74,7 +74,8 @@ function docTypesFor(vehicleType) {
 const VEHICLE_COLUMNS = `id, unit_number, type, make, model, year,
   license_plate, vin, serial_number, capacity, hours, hours_at,
   notes, active, created_at, updated_at,
-  registered_gross_weight_kg, inspection_required, inspection_schedule_id`;
+  registered_gross_weight_kg, inspection_required, inspection_schedule_id,
+  inspection_na_groups`;
 
 // Registered gross weight in kg, off the plate permit. Blank clears it.
 function parseRgw(v) {
@@ -389,7 +390,8 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
     let i = 1;
     const fields = ['unit_number', 'type', 'make', 'model', 'year', 'license_plate', 'vin',
                     'serial_number', 'capacity', 'hours', 'notes', 'active',
-                    'registered_gross_weight_kg', 'inspection_schedule_id'];
+                    'registered_gross_weight_kg', 'inspection_schedule_id',
+                    'inspection_na_groups'];
     for (const f of fields) {
       if (b[f] === undefined) continue;
       if (f === 'type' && !VEHICLE_TYPES.includes(b[f])) {
@@ -433,6 +435,29 @@ router.patch('/vehicles/:id', requireStaff, async (req, res, next) => {
           if (!ok) return res.status(400).json({ message: 'inspection schedule not found or not active' });
         }
         sets.push(`${f} = $${i++}`); args.push(sid);
+        continue;
+      }
+      if (f === 'inspection_na_groups') {
+        // Circle-check Parts this unit isn't fitted with (migration 080).
+        // Names must be real Parts on an active schedule, so a typo can't
+        // quietly hide nothing — or hide the wrong thing.
+        const list = b[f] === null ? [] : b[f];
+        if (!Array.isArray(list) || list.some((g) => typeof g !== 'string')) {
+          return res.status(400).json({ message: 'inspection_na_groups must be a list of Part names' });
+        }
+        const uniq = [...new Set(list.map((g) => g.trim()).filter(Boolean))];
+        if (uniq.length) {
+          const known = await query(
+            `SELECT DISTINCT it.group_name
+               FROM inspection_schedule_items it
+               JOIN inspection_schedules s ON s.id = it.schedule_id
+              WHERE s.active = TRUE AND it.active = TRUE AND it.group_name = ANY($1::text[])`,
+            [uniq]);
+          const ok = new Set(known.map((r) => r.group_name));
+          const bad = uniq.filter((g) => !ok.has(g));
+          if (bad.length) return res.status(400).json({ message: `Not a circle-check Part: ${bad.join(', ')}` });
+        }
+        sets.push(`${f} = $${i++}::text[]`); args.push(uniq);
         continue;
       }
       sets.push(`${f} = $${i++}`); args.push(b[f]);

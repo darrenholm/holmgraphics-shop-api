@@ -46,6 +46,7 @@ const FILES = [
   '062_inspection_offline.sql',
   '063_schedule_1_official.sql',
   '071_fleet_equipment.sql',
+  '080_inspection_not_applicable.sql',
 ];
 const sqlFor = (f) => fs.readFileSync(path.join(MIGRATIONS, f), 'utf8');
 
@@ -479,6 +480,8 @@ test('a signed report refuses every edit to its content', async () => {
     ['location',    `UPDATE inspections SET location_text='Somewhere else' WHERE id=${id}`],
     ['carrier',     `UPDATE inspections SET carrier_name='Someone Ltd' WHERE id=${id}`],
     ['completed_at',`UPDATE inspections SET completed_at=NOW() - interval '2 days' WHERE id=${id}`],
+    ['na_groups',   `UPDATE inspections SET na_groups=ARRAY['Tires'] WHERE id=${id}`],
+    ['not_fitted',  `UPDATE inspections SET not_fitted_groups=ARRAY['Tires'] WHERE id=${id}`],
   ]) {
     await refuses(db, sql, 'is immutable');
     void what;
@@ -648,4 +651,21 @@ test('different periods are separate claims', async () => {
       VALUES ('inspection-daily-digest','${key}') ON CONFLICT DO NOTHING RETURNING job_name`);
     assert.equal(r.rows.length, 1, `period ${key} should be claimable`);
   }
+});
+
+// ─── Not applicable Parts (080) ─────────────────────────────────────────────
+
+test('units and reports start with nothing marked not applicable', async () => {
+  const db = await freshDb();
+  const v = await one(db, `SELECT inspection_na_groups FROM vehicles WHERE unit_number='T-02'`);
+  assert.deepEqual(v.inspection_na_groups, []);
+  const { id } = await signedInspection(db);
+  const r = await one(db, `SELECT not_fitted_groups, na_groups FROM inspections WHERE id=${id}`);
+  assert.deepEqual(r.not_fitted_groups, []);
+  assert.deepEqual(r.na_groups, []);
+});
+
+test('080 is re-runnable', async () => {
+  const db = await freshDb();
+  await db.exec(sqlFor('080_inspection_not_applicable.sql'));
 });
