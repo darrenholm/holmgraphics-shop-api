@@ -205,6 +205,53 @@ async function openDefectsForVehicle(vehicleId) {
   );
 }
 
+// ─── Not applicable Parts ──────────────────────────────────────────────
+// Schedule 1 covers every truck, tractor and trailer, so most units carry
+// only some of its Parts. Two ways a Part comes off a check (migration 080):
+//   * not fitted — admin setting on the unit. With a trailer drawn, a Part
+//     is only "not fitted" if NEITHER unit has it.
+//   * N/A        — the driver says so on this check.
+// A Part with a defect recorded on it (including a carried-forward one) is
+// never either: something that has a defect is plainly fitted.
+//
+// Returns { notFitted, na } or { error }.
+async function resolveNaGroups({ scheduleId, vehicleId, towingId, defectGroups, requested }) {
+  const groupRows = await query(
+    `SELECT DISTINCT group_name FROM inspection_schedule_items
+      WHERE schedule_id = $1 AND active = TRUE`,
+    [scheduleId]
+  );
+  const onSchedule = new Set(groupRows.map((r) => r.group_name));
+  const withDefects = new Set(defectGroups);
+
+  const units = await query(
+    `SELECT id, inspection_na_groups FROM vehicles WHERE id = ANY($1::int[])`,
+    [[vehicleId, towingId].filter(Boolean)]
+  );
+  const naFor = (id) => new Set(units.find((u) => u.id === id)?.inspection_na_groups || []);
+  let notFitted = naFor(vehicleId);
+  if (towingId) {
+    const trailerNa = naFor(towingId);
+    notFitted = new Set([...notFitted].filter((g) => trailerNa.has(g)));
+  }
+  const notFittedList = [...notFitted].filter((g) => onSchedule.has(g) && !withDefects.has(g));
+
+  if (requested !== undefined && !Array.isArray(requested)) {
+    return { error: 'na_groups must be a list of Part names.' };
+  }
+  const na = [];
+  for (const g of requested || []) {
+    if (typeof g !== 'string' || !onSchedule.has(g)) {
+      return { error: `"${g}" is not a Part on this unit's schedule.` };
+    }
+    if (withDefects.has(g)) {
+      return { error: `${g} has a defect recorded, so it cannot be marked N/A.` };
+    }
+    if (!notFittedList.includes(g) && !na.includes(g)) na.push(g);
+  }
+  return { notFitted: notFittedList, na };
+}
+
 async function loadInspection(id) {
   return queryOne(
     `SELECT i.*, v.unit_number, v.make, v.model, v.year, v.vin,
@@ -448,6 +495,7 @@ router.get('/fleet/inspections/prefill', requireInspector, async (req, res, next
         vin: vehicle.vin,
         inspection_required: vehicle.inspection_required,
         registered_gross_weight_kg: vehicle.registered_gross_weight_kg,
+        inspection_na_groups: vehicle.inspection_na_groups || [],
       },
       schedule: vehicle.schedule_id ? {
         id: vehicle.schedule_id, name: vehicle.schedule_name,
@@ -467,7 +515,7 @@ router.get('/fleet/inspections/prefill', requireInspector, async (req, res, next
       // Trailers the driver can say they're pulling. Offered on every check
       // because the operator's practice ties checks to towing.
       trailers: await query(
-        `SELECT id, unit_number, license_plate, make, model
+        `SELECT id, unit_number, license_plate, make, model, inspection_na_groups
            FROM vehicles WHERE active = TRUE AND type = 'trailer'
           ORDER BY unit_number`
       ),
@@ -1024,6 +1072,16 @@ router.post('/fleet/inspections/:id/complete', requireInspector, async (req, res
       driverSigAt = new Date();
     }
 
+    // ── Parts that don't apply ──
+    const naRes = await resolveNaGroups({
+      scheduleId: draft.schedule_id,
+      vehicleId: draft.vehicle_id,
+      towingId: draft.towing_vehicle_id,
+      defectGroups: defects.map((d) => d.group_name),
+      requested: b.na_groups,
+    });
+    if (naRes.error) return badRequest(res, naRes.error, { code: 'na_groups_invalid' });
+
     // ── Out of service ──
     // Major on THIS report, or any major still open on the unit from an
     // earlier one. A unit does not come back into service because someone
@@ -1066,6 +1124,8 @@ router.post('/fleet/inspections/:id/complete', requireInspector, async (req, res
               declaration_accepted_at = NOW(),
               warnings                = $14::jsonb,
               status                  = $15,
+              not_fitted_groups       = $16::text[],
+              na_groups               = $17::text[],
               completed_at            = NOW(),
               submitted_at            = NOW()
         WHERE id = $1 AND completed_at IS NULL
@@ -1081,6 +1141,8 @@ router.post('/fleet/inspections/:id/complete', requireInspector, async (req, res
         schedule.declaration_text,
         JSON.stringify(warnings),
         status,
+        naRes.notFitted,
+        naRes.na,
       ]
     );
     if (!upd.rows.length) {
@@ -1317,7 +1379,7 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
     // ── Validate the defect list against the schedule ──
     const rawDefects = Array.isArray(b.defects) ? b.defects : [];
     const items = await query(
-      `SELECT id, item_label, severity FROM inspection_schedule_items
+      `SELECT id, item_label, severity, group_name FROM inspection_schedule_items
         WHERE schedule_id = $1 AND active = TRUE`,
       [vehicle.inspection_schedule_id]
     );
@@ -1334,6 +1396,7 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
       // queued check sat on a phone for hours and is not a trusted source
       // for whether the regulation calls something major.
       d._severity = item.severity;
+      d._group = item.group_name;
     }
     if (rawDefects.some((d) => !['minor', 'major'].includes(d._severity))) {
       return res.status(409).json({
@@ -1347,6 +1410,15 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
         'The report must either list defects or state explicitly that none were found.',
         { code: 'no_defects_statement_required' });
     }
+
+    const naRes = await resolveNaGroups({
+      scheduleId: vehicle.inspection_schedule_id,
+      vehicleId,
+      towingId,
+      defectGroups: rawDefects.map((d) => d._group),
+      requested: b.na_groups,
+    });
+    if (naRes.error) return badRequest(res, naRes.error, { code: 'na_groups_invalid' });
 
     const km = Number.parseInt(b.odometer_km, 10);
     if (!Number.isInteger(km) || km < 0) {
@@ -1463,6 +1535,8 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
               declaration_accepted_at = $2::timestamptz,
               warnings                = $12::jsonb,
               status                  = $13,
+              not_fitted_groups       = $14::text[],
+              na_groups               = $15::text[],
               submitted_at            = NOW()
         WHERE id = $1`,
       [
@@ -1473,6 +1547,8 @@ router.post('/fleet/inspections/sync', requireInspector, async (req, res, next) 
         schedule.declaration_text,
         JSON.stringify(warnings),
         status,
+        naRes.notFitted,
+        naRes.na,
       ]
     );
     await client.query('COMMIT');
@@ -1525,7 +1601,8 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
       query(
         `SELECT v.id, v.unit_number, v.type, v.make, v.model, v.year,
                 v.license_plate, v.plate_jurisdiction, v.inspection_required,
-                v.inspection_policy, v.inspection_schedule_id
+                v.inspection_policy, v.inspection_schedule_id,
+                v.inspection_na_groups
            FROM vehicles v
           WHERE v.active = TRUE AND v.inspection_schedule_id IS NOT NULL
           ORDER BY v.inspection_required DESC, v.unit_number`
@@ -1542,6 +1619,7 @@ router.get('/fleet/inspections/offline-bundle', requireInspector, async (req, re
                 i.inspector_name, i.completed_at, i.valid_until, i.status,
                 i.odometer_km, i.odometer_source, i.location_text,
                 i.no_defects, i.declaration_text, i.declaration_accepted_at,
+                i.not_fitted_groups, i.na_groups,
                 v.unit_number
            FROM inspections i
            JOIN vehicles v ON v.id = i.vehicle_id
