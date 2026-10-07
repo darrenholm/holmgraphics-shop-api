@@ -26,7 +26,9 @@ const crypto  = require('crypto');
 
 const { query, queryOne } = require('../db/connection');
 const { requireStaff, requireAdmin } = require('../middleware/auth');
-const { ingestDocument, runExtraction, upsertStatement } = require('../lib/ap-intake');
+const {
+  ingestDocument, runExtraction, upsertStatement, findDuplicateInvoice, duplicateNote,
+} = require('../lib/ap-intake');
 const { normalizeVendor, linesReconcile } = require('../lib/ap-extract');
 const {
   postBillForDocument, resolveVendor, learnVendorAlias, searchVendors,
@@ -347,6 +349,27 @@ router.patch('/documents/:id', requireStaff, async (req, res) => {
       if (Object.prototype.hasOwnProperty.call(req.body, field)) {
         params.push(req.body[field] === '' ? null : req.body[field]);
         sets.push(`${field} = $${params.length}`);
+      }
+    }
+
+    // Saving a resent invoice as an invoice would hit the vendor + number
+    // unique index and show the reviewer a raw constraint error. Tell them
+    // where the original is instead.
+    const next = await queryOne(
+      `SELECT vendor_qbo_id, COALESCE($2, doc_kind) AS doc_kind,
+              COALESCE($3, doc_number) AS doc_number
+         FROM ap_documents WHERE id = $1`,
+      [req.params.id, req.body.doc_kind || null, req.body.doc_number || null]
+    );
+    if (next.doc_kind === 'invoice') {
+      const original = await findDuplicateInvoice({
+        documentId: Number(req.params.id), vendorQboId: next.vendor_qbo_id, docNumber: next.doc_number,
+      });
+      if (original) {
+        return res.status(409).json({
+          error: `${duplicateNote(next.doc_number, original)} Reject this one.`,
+          duplicate_of: original.id,
+        });
       }
     }
 
